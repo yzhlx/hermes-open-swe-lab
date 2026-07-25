@@ -11,14 +11,15 @@
 | Deterministic validator | DONE | `scripts/validate_smoke_contract.py` |
 | Validator self-test | DONE | 7 scenarios (round-1 + round-2), all assertions hold, exit 0 |
 | Validator CI-mode simulation | DONE | temp git repo: complete contract → PASS (exit 0); extra file → FAIL (exit 1) |
-| CI workflow file | DONE | pushed via PR #1 (`bootstrap-smoke-ci`); Run 30146411330 success; Run 30146077235 retained as initial evidence |
+| Round-2 label gate (orchestrator) | DONE | `scripts/orchestrate_round2.py`; sole label owner + no-degradation; self-test 7/7 in CI (Run `30147269747`) |
+| CI workflow file | DONE | **MERGED to main** via PR #1 (merge `5dba406`); bootstrap self-test Run `30147269747` success; Run `30146077235` retained as initial evidence |
 
 ## What is NOT_TESTED (requires authorization + cloud)
 
 | Item | Blocker |
 | --- | --- |
 | Live Issue → agent → Draft PR loop | GitHub App + cloud control plane |
-| Live deterministic CI run | CI workflow push (workflow scope) |
+| Live deterministic CI run on PR #2+ | GitHub App + cloud control plane (to open a real Issue→PR that triggers the workflow) |
 | Reviewer feedback → rework → re-review | LangSmith sandbox + reviewer agent |
 | End-to-end evidence (trace IDs, PR number) | full live run |
 
@@ -46,6 +47,19 @@ Self-test: ALL PASS
 # round 2: allowed file + both markers                             -> PASS (exit 0)
 # round 2: BASELINE only (missing SECOND_ROUND_FEEDBACK_APPLIED)    -> FAIL (exit 1, feedback_marker)
 ```
+
+## PR #1 merge evidence (2026-07-25)
+
+- PR #1 `bootstrap-smoke-ci` → `main`: **MERGED** by `yzhlx` at 2026-07-25T06:46:48Z.
+- Merge commit / post-merge `main` SHA: `5dba406887ffd1252551d1952d221d1b4c22346f`.
+- Files verified present on `origin/main`: `AGENTS.md`, `README.md`,
+  `scripts/validate_smoke_contract.py`, `scripts/orchestrate_round2.py`,
+  `.github/workflows/smoke-contract.yml`.
+- Bootstrap one-time condition hard-coded to `github.event.pull_request.number == 1`
+  (strict path `!= 1`); PR #2+ can never match → strict contract always applies.
+- Latest workflow run: `30147269747` (bootstrap self-test) → **success**. No new run
+  is triggered by the merge to `main` (workflow triggers on `pull_request` only).
+- Bootstrap branch `bootstrap-smoke-ci` still exists (at `669792b`) — left intact.
 
 ## Interpreting the two-round result
 

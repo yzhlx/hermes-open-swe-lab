@@ -16,6 +16,12 @@ secrets in chat.
 - Provider preflight script authored (no-config run → `NOT_TESTED`, exit 2).
 - Smoke-test repo `yzhlx/hermes-open-swe-smoke-test` created (private) and
   seeded with strict `AGENTS.md`, validator, README.
+- **Smoke-test contract system MERGED to main (PR #1, merge `5dba406`):**
+  validator `scripts/validate_smoke_contract.py`, round-2 label-gate
+  orchestrator `scripts/orchestrate_round2.py`, and CI workflow
+  `.github/workflows/smoke-contract.yml` are all live on `main`; bootstrap
+  self-test Run `30147269747` passed. Strict contract (round 1 baseline, round 2
+  + feedback marker, round-2 label gate) verified.
 - MVP-0 documentation set complete.
 
 **You need to complete:**
@@ -34,14 +40,9 @@ secrets in chat.
    and `OPEN_SWE_OPENAI_API_KEY` to `/opt/hermes-open-swe-lab/.env` on the cloud
    server. Never send these in chat.
 
-4. **`workflow` token scope**: the CI workflow for the smoke-test repo could not
-   be pushed (current `gh` token lacks `workflow` scope). Run, on a machine with
-   the token:
-   ```bash
-   gh auth refresh -s workflow
-   ```
-   then the agent can push `.github/workflows/smoke-contract.yml`. (Or you push
-   it yourself.) This is required for the live deterministic CI.
+4. ~~**`workflow` token scope**~~ — **RESOLVED**: the CI workflow was merged to
+   `main` via PR #1 (the user merged it manually). No further action needed for
+   the workflow file itself.
 
 5. **Cloud server SSH access**: provide/confirm SSH access so the control plane
    can be deployed (Step 10 live run). If you prefer to run the control plane

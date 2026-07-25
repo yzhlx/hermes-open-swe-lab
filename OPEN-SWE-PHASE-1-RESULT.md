@@ -4,11 +4,13 @@
 
 ## Verdict
 
-> **Autonomous preparation: COMPLETE.** Live end-to-end verification:
-> **NOT_TESTED** (blocked by the authorization gate, Step 9, and the missing
-> `workflow` token scope). Cannot declare `PHASE_1_PASS` until live evidence
-> exists. **Go/No-Go: GO to proceed to live once the user completes
-> USER-ACTIONS-REQUIRED.**
+> **Autonomous preparation: COMPLETE.** Smoke-test contract system **MERGED to
+> main** (PR #1, merge `5dba406`); deterministic CI contract is live and its
+> self-tests pass in CI (Run `30147269747`). Live end-to-end verification:
+> **NOT_TESTED** (blocked by the authorization gate, Step 9 — GitHub App,
+> LangSmith, relay creds, cloud server). Cannot declare `PHASE_1_PASS` until
+> live evidence exists. **Go/No-Go: GO to proceed to live once the user
+> completes USER-ACTIONS-REQUIRED (next node: GitHub App).**
 
 ## Definition-of-done checklist (AGENTS.md Section 16)
 
@@ -20,7 +22,7 @@
 | Read-only task verified w/o writes | NOT_TESTED | live run pending |
 | Isolated coding task verified | NOT_TESTED | LangSmith sandbox pending |
 | Draft PR created (smoke-test) | NOT_TESTED | live loop pending |
-| Deterministic CI passed | PARTIAL | validator self-test + CI-mode sim PASS; live CI pending workflow scope |
+| Deterministic CI passed | DONE | validator + orchestrator self-tests PASS in CI (Run `30147269747`); contract live on `main` |
 | Independent reviewer executed | NOT_TESTED | reviewer agent pending |
 | PR feedback resumed coding | NOT_TESTED | live loop pending |
 | Second commit on original PR | NOT_TESTED | live loop pending |
@@ -42,12 +44,21 @@
 ## Blockers to `PHASE_1_PASS`
 
 1. Authorization gate (GitHub App, LangSmith, relay creds) — user action.
-2. `workflow` token scope to push the smoke-test CI workflow — user action
-   (`gh auth refresh -s workflow`).
-3. Cloud-server access to run the control plane — user action / user-run.
+   **Next node: create + install the GitHub App on `yzhlx/hermes-open-swe-smoke-test`.**
+2. Cloud-server access to run the control plane — user action / user-run.
+
+## Merge evidence (2026-07-25)
+
+- PR #1 merged to `main` by `yzhlx` (merge commit / `main` SHA
+  `5dba406887ffd1252551d1952d221d1b4c22346f`).
+- Contract system live on `main`: validator, round-2 label-gate orchestrator,
+  CI workflow. Bootstrap self-test Run `30147269747` → success.
+- Strict contract unchanged for PR #2+ (bootstrap condition hard-coded to PR #1).
 
 ## Recommended next step
 
-User completes USER-ACTIONS-REQUIRED → agent runs Step 10 (test sequence) and
-Step 12 (Draft PR) → re-evaluate this table → declare `PHASE_1_PASS` or
+User completes the **GitHub App** action in USER-ACTIONS-REQUIRED (create + install
+the App on `yzhlx/hermes-open-swe-smoke-test` with `pull_requests: read` + `write`),
+then replies "已完成授权". Agent proceeds with the live test sequence (Step 10) and
+Draft PR delivery (Step 12) → re-evaluate this table → declare `PHASE_1_PASS` or
 `PHASE_1_FAILED` with evidence.

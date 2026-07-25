@@ -19,12 +19,12 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud)
 | 5 | Read-only audit (Step 3) | DONE | `INITIAL-AUDIT.md` |
 | 6 | Upstream baseline pin | DONE | `UPSTREAM-BASELINE.md`; SHA reachable |
 | 7 | Security boundaries doc | DONE | `SECURITY-BOUNDARIES.md` |
-| 8 | Smoke-test repo `yzhlx/hermes-open-swe-smoke-test` | PENDING | Task 5 — to be created private |
-| 9 | Relay adapter (opt-in) | PENDING | Task 3 |
-| 10 | Relay adapter unit tests | PENDING | Task 3 — offline, runnable |
-| 11 | `scripts/provider_preflight.py` | PENDING | Task 4 |
+| 8 | Smoke-test repo `yzhlx/hermes-open-swe-smoke-test` | DONE | private; contract system MERGED to main (PR #1, merge `5dba406`) |
+| 9 | Relay adapter (opt-in) | DONE | `hermes_open_swe_relay/`; 17 offline unit tests PASS |
+| 10 | Relay adapter unit tests | DONE | 17 tests PASS |
+| 11 | `scripts/provider_preflight.py` | DONE | P1–P6; no-config run → NOT_TESTED (exit 2) |
 | 12 | Live provider preflight (P1–P6) | NOT_TESTED | needs relay creds (Step 9) |
-| 13 | GitHub App + webhook | NOT_TESTED | user gate (Step 9) |
+| 13 | GitHub App + webhook | NOT_TESTED | **next authorization node** (Step 9) |
 | 14 | LangSmith sandbox + trace | NOT_TESTED | user gate (Step 9) |
 | 15 | Cloud control plane deploy | NOT_TESTED | needs cloud-server access |
 | 16 | End-to-end loop (Issue→PR→review→rework) | NOT_TESTED | depends on 12–15 |
@@ -58,5 +58,6 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud)
 
 ## Last updated
 
-2026-07-25 — audit + guardrails complete; adapter/preflight/smoke-scaffold pending
-(Tasks 3–5).
+2026-07-25 — smoke-test contract system MERGED to main (PR #1, merge `5dba406`):
+validator + round-2 label-gate orchestrator + CI workflow live on main. Relay
+adapter + provider preflight DONE. **GitHub App is the next authorization node.**
