@@ -20,6 +20,7 @@ from .protocol import SandboxBackend, ExecResult
 
 class EchoSandboxBackend(SandboxBackend):
     def __init__(self, workspace: Optional[str] = None, timeout: int = 1200):
+        self._init_ws = workspace
         self._ws = workspace or tempfile.mkdtemp(prefix="hermes-echo-")
         self._timeout = timeout
         self._created_at = time.time()
@@ -27,6 +28,12 @@ class EchoSandboxBackend(SandboxBackend):
         self._log = []  # records executed commands for test assertions
 
     def create(self) -> str:
+        # Re-initialize after a prior delete() so the backend can be reused
+        # across multiple jobs in a worker loop (mirrors the real Docker
+        # backend, which spins up a fresh container on each create()).
+        if self._ws is None:
+            self._ws = self._init_ws or tempfile.mkdtemp(prefix="hermes-echo-")
+        self._alive = True
         os.makedirs(self._ws, exist_ok=True)
         return self._ws
 

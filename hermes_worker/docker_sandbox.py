@@ -43,6 +43,7 @@ import time
 from typing import Callable, Optional
 
 from .protocol import SandboxBackend, ExecResult
+from .redact import redact as _redact_text
 
 # --- MVP isolation defaults (per architecture decision) --------------------
 DEFAULT_IMAGE = "python:3.11-slim"
@@ -60,38 +61,39 @@ WORKSPACE_MOUNT_TARGET = "/workspace"
 
 
 def _redact(args) -> list:
-    """Return a copy of ``args`` with secret env values replaced by a marker.
+    """Return a copy of ``args`` with any embedded secret replaced by a marker.
 
-    Handles both the ``-e KEY=VALUE`` combined form we emit and the rare
-    standalone ``-e KEY`` + ``VALUE`` form. The token VALUE itself is never
-    stored; only the key name is preserved for debugging.
+    Covers two forms:
+    - ``-e KEY=VALUE`` / ``-e KEY`` + ``VALUE`` for known secret env vars
+      (``GITHUB_TOKEN`` etc.) — the value is hard-redacted.
+    - Any other argument (notably the command string passed to ``bash -lc``,
+      e.g. ``git push https://TOKEN@github.com/...``) is passed through the
+      generic ``redact()`` so credentials/keys embedded in commands are
+      scrubbed too (D3 hardening, item 5).
     """
     out: list = []
     prev = None
     for a in args:
         if prev in ("-e", "--env"):
-            if a in SECRET_ENV_KEYS:
-                out.append(a)          # keep key name
+            if "=" in a:
+                k, _, v = a.partition("=")
+                if k in SECRET_ENV_KEYS:
+                    out.append(f"{k}=***REDACTED***")
+                else:
+                    out.append(f"{k}={_redact_text(v)}")
+            else:
+                # value is the next argument (standalone ``-e KEY``)
+                out.append(a)
                 prev = "__SECRET_VAL__"
                 continue
-            if "=" in a and a.split("=", 1)[0] in SECRET_ENV_KEYS:
-                k = a.split("=", 1)[0]
-                out.append(f"{k}=***REDACTED***")
-                prev = a
-                continue
-            out.append(a)
             prev = a
             continue
         if prev == "__SECRET_VAL__":
             out.append("***REDACTED***")
             prev = a
             continue
-        if "=" in a and a.split("=", 1)[0] in SECRET_ENV_KEYS:
-            k = a.split("=", 1)[0]
-            out.append(f"{k}=***REDACTED***")
-            prev = a
-            continue
-        out.append(a)
+        # Any other argument (command strings included) is generic-redacted.
+        out.append(_redact_text(a))
         prev = a
     return out
 

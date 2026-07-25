@@ -25,15 +25,25 @@ class ControlPlaneError(Exception):
 
 class ControlPlane:
     def __init__(self, db_path: str, now: Optional[callable] = None,
-                 lease_seconds: int = 1200):
+                 lease_seconds: int = 1200,
+                 allowed_token_hashes: Optional[set] = None,
+                 replay_window: int = 300):
         self.db_path = db_path
         self._now = now or time.time
         self.lease_seconds = lease_seconds
+        # Server-side worker allowlist (D3 hardening, item 1). When set (non-
+        # empty), only these token hashes may register. ``None`` = allow all
+        # (local/offline test convenience only; production MUST pass it).
+        self.allowed_token_hashes = set(allowed_token_hashes) if allowed_token_hashes else None
+        # Replay-protection window in seconds (D3 hardening, item 3).
+        self.replay_window = replay_window
         self.conn = init_db(db_path)
 
     # ---------------- workers ----------------
     def register(self, token: str, name: str = None, capabilities: str = None) -> dict:
         h = hash_token(token)
+        if self.allowed_token_hashes is not None and h not in self.allowed_token_hashes:
+            raise ControlPlaneError("worker_not_allowlisted")
         row = self.conn.execute(
             "SELECT worker_id FROM workers WHERE token_hash=?", (h,)).fetchone()
         if row:
@@ -48,6 +58,31 @@ class ControlPlane:
                 (h, wid, name, capabilities, self._now(), self._now()))
         self.conn.commit()
         return {"ok": True, "worker_id": wid}
+
+    def check_replay(self, nonce: str, ts) -> None:
+        """Enforce request freshness + nonce uniqueness (item 3).
+
+        Raises ``ControlPlaneError`` for missing/stale/duplicate requests.
+        A fresh nonce is recorded with a TTL = replay_window; expired nonces
+        are purged on each call.
+        """
+        if not nonce:
+            raise ControlPlaneError("missing_nonce")
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            raise ControlPlaneError("bad_timestamp")
+        now = self._now()
+        if abs(now - ts) > self.replay_window:
+            raise ControlPlaneError("stale_request")
+        self.conn.execute("DELETE FROM nonces WHERE expires < ?", (now,))
+        try:
+            self.conn.execute(
+                "INSERT INTO nonces(nonce, expires) VALUES (?,?)",
+                (nonce, now + self.replay_window))
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            raise ControlPlaneError("replay_detected")
 
     def _check_token(self, token: str) -> str:
         h = hash_token(token)
@@ -78,6 +113,24 @@ class ControlPlane:
         self.conn.commit()
         return {"ok": True, "reaped": reaped}
 
+    def keepalive(self, token: str, job_id: int) -> dict:
+        """Extend the lease of an owned, active job (item 4: mid-job keepalive).
+
+        Long-running agent steps call this periodically so the lease does not
+        expire mid-job and the job is not reaped/re-queued underneath them.
+        """
+        h = self._check_token(token)
+        job = self._get_job(job_id)
+        if job["worker_token_hash"] != h:
+            raise ControlPlaneError("job_not_owned_by_worker")
+        if job["state"] not in ("claimed", "running"):
+            raise ControlPlaneError("job_not_active")
+        self.conn.execute(
+            "UPDATE jobs SET lease_expires=? WHERE id=?",
+            (self._now() + self.lease_seconds, job_id))
+        self.conn.commit()
+        return {"ok": True, "lease_expires": self._now() + self.lease_seconds}
+
     def reap_expired_leases(self, now: Optional[float] = None) -> int:
         now = now if now is not None else self._now()
         cur = self.conn.execute(
@@ -91,6 +144,7 @@ class ControlPlane:
     def claim(self, token: str) -> dict:
         h = self._check_token(token)
         self.reap_expired_leases()
+        # 1) Re-claim an already-owned (claimed/running) job — idempotent.
         cur = self.conn.execute(
             "SELECT id FROM jobs WHERE state IN ('claimed','running') "
             "AND worker_token_hash=? LIMIT 1", (h,))
@@ -105,17 +159,21 @@ class ControlPlane:
             return {"job_id": job["id"],
                     "payload": json.loads(job["payload"] or "{}"),
                     "already_claimed": True}
+        # 2) Atomic claim of a pending job (item 6: no TOCTOU).
+        #    A single UPDATE...RETURNING is serialized by SQLite's write lock,
+        #    so two concurrent workers can never grab the same pending job.
+        lease = self._now() + self.lease_seconds
         cur = self.conn.execute(
-            "SELECT id FROM jobs WHERE state='pending' ORDER BY created_at ASC LIMIT 1")
+            """UPDATE jobs SET state='running', worker_token_hash=?, lease_expires=?, started_at=?
+               WHERE id = (SELECT id FROM jobs WHERE state='pending'
+                           ORDER BY created_at ASC LIMIT 1)
+               RETURNING id""",
+            (h, lease, self._now()))
         row = cur.fetchone()
         if not row:
             return {"empty": True}
-        jid = row["id"]
-        lease = self._now() + self.lease_seconds
-        self.conn.execute(
-            "UPDATE jobs SET state='running', worker_token_hash=?, lease_expires=?, "
-            "started_at=? WHERE id=?", (h, lease, self._now(), jid))
         self.conn.commit()
+        jid = row["id"]
         job = self._get_job(jid)
         return {"job_id": jid, "payload": json.loads(job["payload"] or "{}"),
                 "lease_expires": lease}
