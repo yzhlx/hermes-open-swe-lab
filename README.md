@@ -16,7 +16,7 @@ End-to-end closed loop:
 ```text
 GitHub Issue
   → Open SWE coding agent
-  → isolated LangSmith sandbox
+  → isolated local Docker sandbox (LangSmith retired — see ADR-002)
   → draft pull request (on smoke-test repo)
   → independent code reviewer
   → PR comment feedback
@@ -49,9 +49,11 @@ until approved.
 ## Status
 
 MVP-0 implementation, documentation, and offline test scaffolding are in
-progress on the `phase-1-smoke` branch. Live verification (provider preflight
-against the real relay, GitHub App webhook, LangSmith sandbox, reviewer loop)
-is tracked under `NOT_TESTED` until the required authorizations are granted.
+progress on the `phase-d0-d1` branch. D0 (LangSmith removal), D1 (cloud
+control plane + local worker protocol, offline), and D2 (local Docker sandbox
+backend, real-daemon validated) are complete. Live verification (GitHub App
+webhook, real Issue→PR loop, reviewer loop) is tracked under `NOT_TESTED`
+until D3 authorizations are granted.
 
 See [`USER-ACTIONS-REQUIRED.md`](./USER-ACTIONS-REQUIRED.md) for the
 list of user-authorization steps that must be completed before live testing.
