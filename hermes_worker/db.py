@@ -59,9 +59,22 @@ CREATE TABLE IF NOT EXISTS workers (
     last_heartbeat  REAL,
     created_at      REAL
 );
+-- Replay-protection nonces (worker API). One row per accepted request nonce,
+-- expired after the replay window. A reused nonce fails the UNIQUE constraint.
+CREATE TABLE IF NOT EXISTS nonces (
+    nonce   TEXT PRIMARY KEY,
+    expires REAL
+);
+-- Webhook delivery dedup (GitHub X-GitHub-Delivery). Reused id -> no new job.
+CREATE TABLE IF NOT EXISTS deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    ts          REAL
+);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id);
 CREATE INDEX IF NOT EXISTS idx_workers_hb ON workers(last_heartbeat);
+CREATE INDEX IF NOT EXISTS idx_nonces_exp ON nonces(expires);
+CREATE INDEX IF NOT EXISTS idx_deliveries_ts ON deliveries(ts);
 """
 
 

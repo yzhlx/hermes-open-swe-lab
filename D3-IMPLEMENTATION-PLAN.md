@@ -279,3 +279,37 @@ immediately zeroized in the Control Plane after delivery.
   on-demand refresh at push time.
 - **Reviewer model:** which model backs the Independent Reviewer (reuse the
   relay adapter; must remain isolated from the coding Agent process).
+
+---
+
+## 11. Security hardening implemented (2026-07-25) — reviewer non-blocking → hard gates
+
+The D2 independent reviewer raised 6 non-blocking items. Per user decision they
+are **promoted to deployment hard gates** and implemented on branch `d3-design`
+(Draft PR vs `phase-1-smoke`). Each is validated **offline** (fake webhook
+secret, fake GitHub token, localhost servers, no real webhook, no smoke-test
+repo write, no relay call).
+
+| # | Gate | File(s) | Offline test |
+| --- | --- | --- | --- |
+| 1 | Worker register allowlist | `control_plane.register`, `worker_api_server.run_server(allowed_tokens=)`, `ALLOWED_WORKER_TOKENS` | `test_01_*`, `test_01b` |
+| 2 | HTTPS required (real deploy) | `worker.__init__` (`insecure_local_ok` gate) | `test_02` |
+| 3 | Replay protection (Worker + Webhook) | `control_plane.check_replay`, `webhook_receiver.verify_signature` + `deliveries` dedup | `test_03a`–`test_03h` |
+| 4 | Mid-job lease keepalive | `control_plane.keepalive`, `worker._keepalive_loop` | `test_04a`, `test_04b` |
+| 5 | Command-embedded secret redaction | `hermes_worker/redact.py`, `docker_sandbox._redact`, `worker` event/result `command` | `test_05a`, `test_redact.py` |
+| 6 | Atomic claim (no TOCTOU) | `control_plane.claim` `UPDATE…RETURNING` | `test_06` (12 jobs × 4 workers concurrency) |
+
+**Result:** `tests/test_d3_security.py` = 15/15 OK. Full baseline (adapter 12 +
+D1 7 + D2 11 + redact 10 + D3 15) = **55 tests OK**.
+
+**Not done (by design):** webhook NOT enabled; no real webhook secret; smoke-test
+repo untouched; relay model not called; `yzhlx/hermes-learning-os` untouched;
+no merge. Only a DRAFT PR is opened for review + user acceptance.
+
+**Files changed:** `hermes_worker/control_plane.py`, `hermes_worker/db.py`
+(`nonces`/`deliveries` tables), `hermes_worker/worker_api_server.py`,
+`hermes_worker/worker.py`, `hermes_worker/docker_sandbox.py`,
+`hermes_worker/echo_sandbox.py` (create/delete lifecycle fix), new
+`hermes_worker/redact.py`, new `hermes_worker/webhook_receiver.py`, tests
+`test_d3_security.py`, `test_redact.py`, `test_d1_offline.py` (opt-in
+`insecure_local_ok` for offline), plus `SECURITY-BOUNDARIES.md` (B17–B22).

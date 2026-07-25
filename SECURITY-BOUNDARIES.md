@@ -26,6 +26,12 @@ single source of truth for "stop and report" conditions. (AGENTS.md Sections 2, 
 | B14 | User contact only at gates | contact only for auth/web-auth/secret/payment/decision/incident/accept | none |
 | B15 | Local Worker pull model | Worker connects OUT to cloud via HTTPS only; **no inbound ports**, **no Docker socket exposed to cloud**, **no public SSH**; cloud never reaches the local machine | `SECURITY_BOUNDARY_VIOLATION` |
 | B16 | Workspace containment | Sandbox mounts ONLY the task workdir (`/workspace`); `write_file`/`read_file`/`edit_file` reject `..`/absolute paths that escape it (host FS escape guard `_safe_path()`). Verified real in D2.5 | `SECURITY_BOUNDARY_VIOLATION` |
+| B17 | Worker registration allowlist | `ControlPlane.register()` rejects any token whose sha256 is not in the server-side `allowed_token_hashes` set (prod feeds it from `ALLOWED_WORKER_TOKENS`). Stop-the-line gate for D3. | `worker_not_allowlisted` (HTTP 400) |
+| B18 | HTTPS-only Worker control plane | `HermesWorker.__init__` raises `ValueError` on a plaintext `http://` `base_url`. The ONLY escape is `insecure_local_ok=True`, which is reserved for offline tests and must never be set in production. | worker refuses to start |
+| B19 | Replay protection (Worker API + Webhook) | Every Worker API request carries a unique `X-Nonce` + `X-Timestamp` validated server-side (TTL `nonces` table; reuse ⇒ `replay_detected`). Webhook verifies GitHub `X-Hub-Signature-256` via constant-time HMAC and dedupes by `X-GitHub-Delivery` (`deliveries` table). | `replay_detected` / `bad_signature` / dedup (HTTP 400/401/403) |
+| B20 | Mid-job lease keepalive | `ControlPlane.keepalive()` extends an owned active job's lease; the Worker spawns a daemon keepalive thread during `_run_job` so long agent steps are not reaped underneath it. | none (liveness) |
+| B21 | Command-embedded secret redaction | `hermes_worker.redact` scrubs `ghp_`/`github_pat_`/`Authorization: Bearer`/`sk-`/URL-embedded creds. `HermesDockerSandboxBackend._redact` + Worker event/result `command` route through it. Replaces the weaker relay redactor (which missed GitHub tokens). | `SECURITY_BOUNDARY_VIOLATION` (via B5/B11) |
+| B22 | Atomic claim (no TOCTOU) | `ControlPlane.claim()` uses a single `UPDATE … RETURNING` serialized by SQLite's write lock, so two concurrent workers can never grab the same pending job. Covered by concurrency regression test `test_06`. | none (correctness invariant) |
 
 ## Stop-and-report conditions (from AGENTS.md Section 15)
 
@@ -78,3 +84,29 @@ tests, bypass review, change the target repo, or use production Hermes, the agen
 - D1 offline implementation (`hermes_worker/`, CLI scripts, 7 tests) + D2 offline
   (11 tests) verify protocol/queue/Worker API/observability + isolation flags.
 - No violation detected during the read-only audit.
+
+---
+
+## D3 security hardening (2026-07-25) — reviewer non-blocking notes promoted to hard gates
+
+The independent D2 reviewer raised six non-blocking items. They are now
+**deployment hard gates (B17–B22)** and are implemented + offline-validated
+in branch `d3-design` (Draft PR against `phase-1-smoke`):
+
+1. **B17** Worker registration server-side allowlist (`ALLOWED_WORKER_TOKENS`).
+2. **B18** Real deployments must use HTTPS (Worker refuses `http://` unless
+   `insecure_local_ok=True`, offline tests only).
+3. **B19** Replay protection: Worker API `X-Nonce`/`X-Timestamp` + Webhook
+   HMAC `X-Hub-Signature-256` + delivery dedup.
+4. **B20** Mid-job lease keepalive (Worker daemon thread + `keepalive()`).
+5. **B21** Command-embedded secret redaction (`hermes_worker.redact`,
+   replaces weaker relay redactor).
+6. **B22** Atomic claim (no TOCTOU) via `UPDATE … RETURNING`.
+
+All six are covered by `tests/test_d3_security.py` (15 offline tests) and the
+prior baseline (adapter 12 + D1 7 + D2 11 + redact 10 = 40) — **55 tests green**.
+
+**Explicitly NOT done (per user instruction):** no real Webhook is enabled; no
+real Webhook secret is generated/transmitted; the smoke-test repo is not
+modified; the relay model is not called; `yzhlx/hermes-learning-os` is not
+accessed; no PR is merged. Only a DRAFT PR is opened for review.

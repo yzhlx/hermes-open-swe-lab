@@ -21,18 +21,25 @@ across threads.
 from __future__ import annotations
 
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .control_plane import ControlPlane, ControlPlaneError
+from .db import hash_token
 
 
-def make_handler(db_path: str):
+def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
+                lease_seconds: int = 1200):
+    allowed_hashes = {hash_token(t) for t in (allowed_tokens or [])} or None
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def _cp(self) -> ControlPlane:
-            return ControlPlane(db_path)
+            return ControlPlane(db_path, allowed_token_hashes=allowed_hashes,
+                                replay_window=replay_window,
+                                lease_seconds=lease_seconds)
 
         def _send(self, code, obj):
             body = json.dumps(obj).encode("utf-8")
@@ -55,6 +62,10 @@ def make_handler(db_path: str):
         def do_POST(self):
             cp = self._cp()  # fresh per-request connection (thread-safe)
             try:
+                # Replay protection (item 3): every request must carry a fresh,
+                # unique nonce within the replay window.
+                cp.check_replay(self.headers.get("X-Nonce"),
+                                self.headers.get("X-Timestamp"))
                 path = urlparse(self.path).path
                 body = self._body()
                 tok = self._token()
@@ -68,6 +79,9 @@ def make_handler(db_path: str):
                 elif path.startswith("/worker/jobs/") and path.endswith("/events"):
                     jid = int(path.split("/")[-2])
                     res = cp.post_events(tok, jid, body.get("events", []))
+                elif path.startswith("/worker/jobs/") and path.endswith("/keepalive"):
+                    jid = int(path.split("/")[-2])
+                    res = cp.keepalive(tok, jid)
                 elif path.startswith("/worker/jobs/") and path.endswith("/complete"):
                     jid = int(path.split("/")[-2])
                     res = cp.complete(tok, jid, body.get("result"))
@@ -91,7 +105,8 @@ def make_handler(db_path: str):
     return Handler
 
 
-def run_server(host="0.0.0.0", port=8080, db_path="runtime/events.db"):
+def run_server(host="0.0.0.0", port=8080, db_path="runtime/events.db",
+               allowed_tokens=None, replay_window=300, lease_seconds=1200):
     """Create and return the Worker API server WITHOUT blocking.
 
     The caller is responsible for starting the serve loop (e.g. in a daemon
@@ -99,7 +114,9 @@ def run_server(host="0.0.0.0", port=8080, db_path="runtime/events.db"):
     split keeps ``run_server`` usable as a library function and avoids the
     historical bug where it blocked forever and the test harness never returned.
     """
-    return ThreadingHTTPServer((host, port), make_handler(db_path))
+    return ThreadingHTTPServer(
+        (host, port),
+        make_handler(db_path, allowed_tokens, replay_window, lease_seconds))
 
 
 def main():
@@ -108,8 +125,14 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--db", default="runtime/events.db")
+    ap.add_argument("--replay-window", type=int, default=300)
     args = ap.parse_args()
-    srv = run_server(args.host, args.port, args.db)
+    # Production MUST supply ALLOWED_WORKER_TOKENS (whitespace/comma separated).
+    # If unset, the control plane allows any registered token (local/test only).
+    allowed = [t for t in (os.environ.get("ALLOWED_WORKER_TOKENS") or "").split(",")
+               if t.strip()]
+    srv = run_server(args.host, args.port, args.db,
+                     allowed_tokens=allowed, replay_window=args.replay_window)
     print(f"Hermes Worker API listening on {args.host}:{args.port} (db={args.db})",
           flush=True)
     srv.serve_forever()
