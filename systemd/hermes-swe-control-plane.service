@@ -1,0 +1,45 @@
+[Unit]
+Description=Hermes Open SWE Control Plane (MVP-0)
+Documentation=https://github.com/yzhlx/hermes-open-swe-lab/blob/phase-1-smoke/docs/deployment/CLOUD-DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Hard gate: the Control Plane must NEVER run as root.
+User=hermes-swe
+Group=hermes-swe
+WorkingDirectory=/opt/hermes-open-swe-lab
+
+# Non-secret deployment config. Secrets are loaded by the app from a separate
+# restricted file (mode 600), never from this EnvironmentFile.
+EnvironmentFile=/opt/hermes-open-swe-lab/systemd/hermes-swe-control-plane.env
+
+# Fail-closed pre-flight: if config check exits non-zero, the start is aborted
+# and systemd records a failed start (no partial/insecure run).
+ExecStartPre=/opt/hermes-open-swe-lab/scripts/check_config.sh
+
+# Launched via the managed venv; PYTHONPATH lets `deploy` and `hermes_worker`
+# import as packages.
+ExecStart=/opt/hermes-open-swe-lab/venv/bin/python -m deploy.cloud.control_plane_app
+
+# Auto-restart + bounded startup.
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+# Process hardening (defense in depth; does not relax the code-level gates).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+# The app writes only to its runtime DB and logs; everything else is read-only.
+ReadWritePaths=/opt/hermes-open-swe-lab/runtime /opt/hermes-open-swe-lab/logs
+# Do not expose any socket to the host beyond the loopback bind performed by
+# the app itself. The Docker socket is intentionally NOT mounted/accessible.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
