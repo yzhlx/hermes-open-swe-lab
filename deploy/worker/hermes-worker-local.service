@@ -1,0 +1,18 @@
+[Unit]
+Description=Hermes Open SWE local Worker (user)
+Documentation=https://github.com/yzhlx/hermes-open-swe-lab/blob/phase-1-smoke/docs/deployment/LOCAL-WORKER.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The Worker runs as the local user; it never needs root.
+WorkingDirectory=__INSTALL_ROOT__
+Environment=HERMES_CLOUD_URL=https://__CLOUD_DOMAIN__
+EnvironmentFile=%h/.hermes/worker.env
+ExecStart=/usr/bin/python3 -m deploy.worker.worker_runner
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
