@@ -27,14 +27,14 @@
 | 15 | 末附节七/节八验收结果模板 | 用户指令 |
 
 **执行者身份**：具有 `sudo` 的运维账号（操作员）。**应用进程**一律以 `hermes-swe` 运行，操作员本人不得用 root 直接起应用（`guard_startup` 会拒绝，exit 2）。
-**代码来源**：从 `origin` 检出 `d3-integration` 的已知集成提交 `932dcd7ef9d584955d316a3ddfca25c69f7dd6e3`（detached HEAD），**不 merge 任何 PR**。
+**代码来源**：从 `origin` 检出已知**运行时代码提交** `932dcd7ef9d584955d316a3ddfca25c69f7dd6e3`（变量 `RUNTIME_CODE_SHA`，detached HEAD；这是最后一个运行时代码提交，不随本仓库的文档提交变化），**不 merge 任何 PR**。
 **全局变量**（在云端 shell 中 export 一次）：
 
 ```bash
 export APP_HOME=/opt/hermes-open-swe-lab
 export SRC=/opt/src/hermes-open-swe-lab
 export SERVICE_USER=hermes-swe
-export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD（完整 40 位），执行前强制相等判断
+export RUNTIME_CODE_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 最后一个运行时代码提交（完整 40 位）；执行前强制相等判断（注：PR #5 的 HEAD 可能含其后的文档提交，与 RUNTIME_CODE_SHA 不同属正常，不以 PR HEAD 作为相等判据）
 ```
 
 ---
@@ -49,19 +49,19 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
   git -C "$SRC" remote -v
   actual=$(git -C "$SRC" rev-parse HEAD)
   echo "actual_HEAD=$actual"
-  echo "expect_HEAD=$DEPLOY_SHA"
+  echo "expect_HEAD=$RUNTIME_CODE_SHA"
   # 自动相等判断：不一致立即失败停止
-  if [ "$actual" != "$DEPLOY_SHA" ]; then
-    echo "STATUS: SHA_MISMATCH actual=$actual expect=$DEPLOY_SHA"
+  if [ "$actual" != "$RUNTIME_CODE_SHA" ]; then
+    echo "STATUS: SHA_MISMATCH actual=$actual expect=$RUNTIME_CODE_SHA"
     exit 1
   fi
   echo "SHA_MATCH=OK"
   ```
 - **预期输出**：`origin` 指向 `github.com/yzhlx/hermes-open-swe-lab.git`；`SHA_MATCH=OK`。
-- **PASS 判据**：remote URL 仅含 `hermes-open-swe-lab`，**不含** `hermes-learning-os`；且 `actual == $DEPLOY_SHA`（脚本已 `exit 1` 强制拦截不一致）。
+- **PASS 判据**：remote URL 仅含 `hermes-open-swe-lab`，**不含** `hermes-learning-os`；且 `actual == $RUNTIME_CODE_SHA`（脚本已 `exit 1` 强制拦截不一致）。
 - **失败停止条件**：
   - 出现 `hermes-learning-os` → **立即停止，禁止自动删除**；执行安全隔离（见回滚命令），绝不继续。
-  - `SHA_MISMATCH` → 立即停止，复核 `DEPLOY_SHA` 或重新 `git fetch`。
+  - `SHA_MISMATCH` → 立即停止，复核 `RUNTIME_CODE_SHA` 或重新 `git fetch`。
 - **回滚命令（安全隔离，非删除）**：发现错误仓库时**不执行 `rm -rf`**，改为隔离等待人工确认：
   ```bash
   sudo mkdir -p /opt/quarantine
@@ -107,15 +107,23 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 - **失败停止条件**：磁盘剩余 < 2GB → 停止。
 - **回滚命令**：无需回滚（只读）。
 
-### A5. 端口与现存服务（确认无公网监听、服务未运行）
+### A5. 端口与 Hermes 服务占用检查（仅阻塞条件：8080 被占用 或 Hermes 异常 active）
 - **执行命令**：
   ```bash
-  sudo ss -tlnp 2>/dev/null | grep -E ':8080|:80 |:443 ' || echo "NO_LISTEN_ON_8080_80_443"
-  systemctl is-active hermes-swe-control-plane.service 2>/dev/null || echo "SERVICE_INACTIVE"
+  # 仅检查 Hermes 目标端口 8080 是否被占用（任何监听者都算冲突，需先解决）
+  sudo ss -tlnp 2>/dev/null | grep -E ':8080\b' || echo "PORT_8080_FREE"
+  # 仅检查 Hermes 服务是否处于非预期 active（异常运行）
+  systemctl is-active hermes-swe-control-plane.service 2>/dev/null || echo "HERMES_SERVICE_INACTIVE"
+  # 既有 80/443/Nginx 公网服务仅记录，不做阻塞判据（其前后快照见 A5b）
+  sudo ss -tlnp 2>/dev/null | grep -E ':80 |:443 ' || echo "NO_PUBLIC_PORTS_RECORDED"
+  systemctl is-active nginx 2>/dev/null || echo "NGINX_STATE_RECORDED"
   ```
-- **预期输出**：`NO_LISTEN_ON_8080_80_443`（或仅 127.0.0.1 既有监听，记录下来）；`SERVICE_INACTIVE`（或 `unknown`）。
-- **PASS 判据**：8080 未被 Hermes 占用；无 `0.0.0.0`/`公网 IP` 监听；Hermes 服务非 active。
-- **失败停止条件**：已有 `0.0.0.0:*` 公网监听或 Hermes 服务 active 且非本次预期 → 停止，先排查占用（注意：既有 127.0.0.1 监听可能是其他服务，仅记录，不处理）。
+- **预期输出**：`PORT_8080_FREE`；`HERMES_SERVICE_INACTIVE`（或 `unknown`）；既有 80/443/nginx 状态仅记录（可能为 active，正常）。
+- **PASS 判据**：8080 空闲（无 `:8080` 监听）；Hermes 服务非 active。
+- **失败停止条件（仅以下两项阻塞部署）**：
+  - `:8080` 已被占用 → 停止，先排查并释放占用进程（不得 kill 无关 PID）；
+  - Hermes 服务处于 `active`（异常运行）→ 停止，先 `sudo systemctl stop hermes-swe-control-plane.service` 再评估。
+  - **既有 80/443/Nginx 公网服务仅记录、不阻塞、不停止**：其存在不是预检失败条件（E2 差异比对会确认 Hermes 未新增公网监听）。
 - **回滚命令**：无需回滚（只读）；若误启动，见 Phase F。
 
 ### A5b. 部署前快照既有端口/Nginx 状态（用于部署后差异比对）
@@ -179,15 +187,47 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 
 > 本阶段真正写盘并启动服务，但**仅绑定 127.0.0.1、不启公网、不启 Webhook、不触碰既有服务**。任意硬门 FAIL → 停服务 → 回滚。
 
-### C1. 修正 .env 权限与属主（在 deploy / check_config 之前）[仅当 .env 存在]
-> ⚠️ **绝不**在 Runbook / 聊天 / 日志中写入真实密钥，只用占位符。`.env` 由运维通过安全通道写入 `$APP_HOME/.env`。
-> 此步必须在运行 `deploy_control_plane.sh`（其 `check_config.sh` 与 re-pin 逻辑）之前完成。
+### C1. 运行幂等部署脚本（先跑，HERMES_AUTOSTART=0，由脚本创建 hermes-swe）[纠正旧版顺序]
+> ⚠️ **正确首次部署顺序**：先部署（本步）→ 再放置 .env（C2）→ 再校验 .env 权限（C3）→ 最后启动（C4）。
+> 部署脚本会幂等创建 `hermes-swe` 系统用户、拷贝源码、运行 `check_config.sh`，随后将服务置为 DISABLED。
+> **`check_config` 不依赖 Provider `.env`**：它仅校验 `HERMES_*` 非密配置与 loopback 绑定（见 `scripts/check_config.sh`），不读取 `OPEN_SWE_OPENAI_*`，因此部署可在 .env 放置之前安全执行。
+- **执行命令**：
+  ```bash
+  export HERMES_APP_HOME="$APP_HOME"
+  export HERMES_DEPLOY_SRC="$SRC"
+  export HERMES_SERVICE_USER="$SERVICE_USER"
+  export HERMES_AUTOSTART=0          # 关键：不自动启动
+  sudo -E bash "$SRC/scripts/deploy_control_plane.sh"
+  ```
+- **预期输出**：`[deploy] creating service user hermes-swe` → `[deploy] copying source ...` → `check_config: OK` → `service left DISABLED (default)` → `deploy complete -> /opt/hermes-open-swe-lab`。
+- **PASS 判据**：`hermes-swe` 用户已存在（或已存在）；`check_config: OK`；`service left DISABLED`；脚本 exit 0。
+- **失败停止条件**：`check_config` 失败（fail-closed）或脚本非零退出 → 停止，查看 stderr，进入 Phase F。
+- **回滚命令**：`sudo bash "$SRC/scripts/rollback_control_plane.sh"`（见 Phase F）。
+
+### C2. 放置 / 修正 .env（部署后，运维经安全通道写入）[不打印真实值]
+> ⚠️ **绝不**在 Runbook / 聊天 / 日志中写入真实密钥，只用占位符。`.env` 在部署完成后、服务启动前，由运维通过安全通道写入 `$APP_HOME/.env`。
 - **执行命令**（运维在服务器本地执行，内容用占位符示意）：
   ```bash
-  # 仅示意结构，真实值经安全通道写入，禁止打印：
+  # 真实值经安全通道写入，禁止打印：
   #   OPEN_SWE_OPENAI_BASE_URL=<RELWAY_BASE_URL>
   #   OPEN_SWE_OPENAI_API_KEY=<RELWAY_API_KEY>
   #   OPEN_SWE_OPENAI_MODEL=<RELWAY_MODEL>
+  # 写入后仅确认存在，绝不 cat
+  if [ -f "$APP_HOME/.env" ]; then
+    echo "ENV_PRESENT"
+  else
+    echo "ENV_ABSENT: 未完成 .env 写入（节八将 BLOCKED）"
+  fi
+  ```
+- **预期输出**：`ENV_PRESENT`（运维已写入）；或 `ENV_ABSENT`（跳过，节八将 BLOCKED）。
+- **PASS 判据**：`.env` 存在（内容经安全通道）；不存在=记录"凭证缺失→节八将 BLOCKED"。
+- **失败停止条件**：无（本步仅放置；权限校验在 C3）。
+- **回滚命令**：无需（仅写入；若误写，用安全通道重写，**禁止**在会话中回显）。
+
+### C3. 校验并修正 .env 权限与属主（部署后、启动前）[纠正旧版顺序]
+> ⚠️ 此步现在在**部署之后、启动之前**（旧版放在部署前是错误的）。确保 `.env` 为 `600`、`hermes-swe:hermes-swe`。
+- **执行命令**：
+  ```bash
   if [ -f "$APP_HOME/.env" ]; then
     sudo chown "$SERVICE_USER":"$SERVICE_USER" "$APP_HOME/.env"
     sudo chmod 600 "$APP_HOME/.env"
@@ -201,21 +241,7 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 - **失败停止条件**：存在但权限 ≠ 600 或属主错误且无法修正 → 停止。
 - **回滚命令**：无需回滚（仅修正权限）；若误写错误内容，用安全通道重写，**禁止**在会话中回显。
 
-### C2. 运行幂等部署脚本（不自动启动）
-- **执行命令**：
-  ```bash
-  export HERMES_APP_HOME="$APP_HOME"
-  export HERMES_DEPLOY_SRC="$SRC"
-  export HERMES_SERVICE_USER="$SERVICE_USER"
-  export HERMES_AUTOSTART=0          # 关键：不自动启动
-  sudo -E bash "$SRC/scripts/deploy_control_plane.sh"
-  ```
-- **预期输出**：`[deploy] copying source ...` → `check_config: OK` → `service left DISABLED (default)` → `deploy complete -> /opt/hermes-open-swe-lab`。
-- **PASS 判据**：`check_config: OK` 且 `service left DISABLED`；脚本 exit 0。
-- **失败停止条件**：`check_config` 失败（fail-closed）或脚本非零退出 → 停止，查看 stderr，进入 Phase F。
-- **回滚命令**：`sudo bash "$SRC/scripts/rollback_control_plane.sh"`（见 Phase F）。
-
-### C3. 启动控制面（以 hermes-swe 运行，systemd 保证非 root）
+### C4. 启动控制面（以 hermes-swe 运行，systemd 保证非 root）
 - **执行命令**：
   ```bash
   sudo systemctl daemon-reload
@@ -224,11 +250,11 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
   systemctl is-active hermes-swe-control-plane.service
   ```
 - **预期输出**：`active`。
-- **PASS 判据**：`active`；且进程有效用户为 `hermes-swe`（见 C5）。
+- **PASS 判据**：`active`；且进程有效用户为 `hermes-swe`（见 C6）。
 - **失败停止条件**：`failed` 或启动即退（guard_startup 拒 root/非loopback）→ `journalctl -u hermes-swe-control-plane -n 50` 排查，停止并回滚。
 - **回滚命令**：`sudo systemctl stop hermes-swe-control-plane.service`（见 Phase F）。
 
-### C4. 验证健康检查（仅 loopback）
+### C5. 验证健康检查（仅 loopback）
 - **执行命令**：
   ```bash
   curl -s -o /tmp/h.json -w "HTTP %{http_code}\n" http://127.0.0.1:8080/healthz && cat /tmp/h.json; echo
@@ -239,7 +265,7 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 - **失败停止条件**：非 200 或超时 → 停止，查 `journalctl`，进入 Phase F。
 - **回滚命令**：`sudo systemctl stop hermes-swe-control-plane.service`。
 
-### C5. 验证进程用户非 root + 仅绑定 127.0.0.1（Hermes 新增监听）
+### C6. 验证进程用户非 root + 仅绑定 127.0.0.1（Hermes 新增监听）
 - **执行命令**：
   ```bash
   pid=$(pgrep -f "deploy.cloud.control_plane_app" | head -1); echo "PID=$pid"
@@ -251,14 +277,14 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 - **失败停止条件**：用户为 root 或绑定 `0.0.0.0`/公网 → 立即停止（安全违规），进入 Phase F。
 - **回滚命令**：`sudo systemctl stop hermes-swe-control-plane.service`。
 
-### C6. 复核 .env 权限（若 C1 已存在 .env）
+### C7. 复核 .env 权限（若 C3 已放置 .env）
 - **执行命令**：`stat -c '%a %U:%G' "$APP_HOME/.env" 2>/dev/null || echo "ENV_ABSENT"`
 - **预期输出**：`600 hermes-swe:hermes-swe`（或 `ENV_ABSENT`）。
 - **PASS 判据**：`600 hermes-swe:hermes-swe` 或 `ENV_ABSENT`。
-- **失败停止条件**：权限放宽 → 重新 C1 修正。
+- **失败停止条件**：权限放宽 → 重新 C3 修正。
 - **回滚命令**：重新 `chmod 600`。
 
-### C7. 验证 Webhook OFF / 无新增公网端口 / 不触碰既有 Nginx
+### C8. 验证 Webhook OFF / 无新增公网端口 / 不触碰既有 Nginx
 - **执行命令**：
   ```bash
   # 仅核对 Hermes 本次新增的 127.0.0.1:8080；不处理、不停止任何其他服务
@@ -279,7 +305,8 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 ### D1. 凭证齐全性检查（不读取值）
 - **执行命令**：
   ```bash
-  sudo -u "$SERVICE_USER" bash -c '
+  # 显式传入 APP_HOME（sudo 默认不保留操作员环境变量，避免 $APP_HOME 在子 shell 中为空）
+  sudo -u "$SERVICE_USER" env APP_HOME="$APP_HOME" bash -c '
     set -a; [ -f "$APP_HOME/.env" ] && . "$APP_HOME/.env"; set +a
     for v in OPEN_SWE_OPENAI_BASE_URL OPEN_SWE_OPENAI_API_KEY OPEN_SWE_OPENAI_MODEL; do
       if [ -z "${!v:-}" ]; then echo "MISSING:$v"; fi
@@ -319,7 +346,8 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
   > 说明：`pyproject.toml` 仅声明 `relay = ["openai>=1.30"]`（浮动下界，**非锁定**），仓库无 lock 文件 → 实际将触发 `HARNESS_DEPENDENCY_MISSING` 并停止，**绝不**执行 `pip install openai`。
 - **执行命令**（依赖就绪后以 hermes-swe 运行，结果落日志目录，禁止回显密钥）：
   ```bash
-  sudo -u "$SERVICE_USER" bash -c '
+  # 显式传入 APP_HOME（sudo 默认不保留操作员环境变量，避免 $APP_HOME 在子 shell 中为空）；禁止回显密钥
+  sudo -u "$SERVICE_USER" env APP_HOME="$APP_HOME" bash -c '
     set -a; [ -f "$APP_HOME/.env" ] && . "$APP_HOME/.env"; set +a
     cd "$APP_HOME"
     "$APP_HOME/venv/bin/python" scripts/provider_preflight.py \
@@ -360,19 +388,26 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 - **失败停止条件**：无法停止 → `systemctl status` 排查。
 - **回滚命令**：无需（这是收口动作）。
 
-### E2. 部署前后端口差异复核（仅关闭本次 Hermes，不 kill 其他 PID / 不碰 nginx）
+### E2. 部署前后端口差异复核（用 comm -13 提取真实新增；E1 已停 Hermes，新增必须为空）
 - **执行命令**：
   ```bash
   sudo ss -tlnp 2>/dev/null | grep -E ':80 |:443 |:8080' > /tmp/after_ports.txt || true
   echo "=== 部署前（既有）==="; cat /tmp/before_ports.txt
   echo "=== 部署后（当前）==="; cat /tmp/after_ports.txt
-  # 差异：仅允许新增 127.0.0.1:8080（Hermes 本次验证）；任何 0.0.0.0/公网新增 = 违规
-  diff <(sort /tmp/before_ports.txt) <(sort /tmp/after_ports.txt) > /tmp/ports_diff.txt || true
-  echo "=== 新增监听（应为空或仅 127.0.0.1:8080）==="; cat /tmp/ports_diff.txt
+  # comm -13 = 出现在 after 但不在 before 中的行 = 本次部署"真实新增"的监听
+  sort /tmp/before_ports.txt > /tmp/before_ports.sorted.txt 2>/dev/null || : > /tmp/before_ports.sorted.txt
+  sort /tmp/after_ports.txt  > /tmp/after_ports.sorted.txt  2>/dev/null || : > /tmp/after_ports.sorted.txt
+  comm -13 /tmp/before_ports.sorted.txt /tmp/after_ports.sorted.txt > /tmp/new_listeners.txt
+  echo "=== 真实新增监听（E1 已停 Hermes，必须为空）==="; cat /tmp/new_listeners.txt
+  # 兜底：确认 8080 已无任何残留监听（含 127.0.0.1:8080）
+  sudo ss -tlnp 2>/dev/null | grep -E ':8080\b' && echo "WARN: 8080 STILL LISTENING" || echo "PORT_8080_CLEAR"
   ```
-- **预期输出**：差异仅含 `127.0.0.1:8080`（属 Hermes，且 E1 已停服收口）；无 `0.0.0.0`/公网新增。
-- **PASS 判据**：无新增公网监听；既有 80/443/其他服务（含 nginx）状态未被本 Runbook 改变。
-- **失败停止条件**：`ports_diff.txt` 出现 `0.0.0.0`/公网 IP 新增项 → 立即 `sudo systemctl stop hermes-swe-control-plane.service`，报告 `STATUS: SECURITY_BOUNDARY_VIOLATION`。**禁止 `kill` 不属于本次验证的 PID，禁止停止既有 nginx。**
+- **预期输出**：`new_listeners.txt` 为空（无新增监听）；`PORT_8080_CLEAR`（8080 无残留，含 127.0.0.1:8080）。
+- **PASS 判据**：`new_listeners.txt` 为空（无 `0.0.0.0`/公网、也无 `127.0.0.1:8080` 新增）；既有 80/443/其他服务（含 nginx）状态未被本 Runbook 改变。
+- **失败停止条件**：
+  - `new_listeners.txt` 非空（出现任何新增监听）→ 立即排查；若含 `0.0.0.0`/公网 IP → `sudo systemctl stop hermes-swe-control-plane.service` 并报告 `STATUS: SECURITY_BOUNDARY_VIOLATION`。
+  - `8080 STILL LISTENING`（8080 残留，含 127.0.0.1:8080）→ 说明 E1 未真正停服，重新执行 E1 后再复核。
+  - **禁止 `kill` 不属于本次验证的 PID，禁止停止既有 nginx。**
 - **回滚命令**：仅 `sudo systemctl stop hermes-swe-control-plane.service`（Hermes 本服务）；其他服务一律不动。
 
 ---
@@ -389,7 +424,7 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 - **预期输出**：`[rollback] target = <SHA>` → `deploy complete -> /opt/hermes-open-swe-lab`。
 - **PASS 判据**：回滚脚本 exit 0；`$APP_HOME/DEPLOYED_SHA` 更新为目标 SHA。
 - **失败停止条件**：目标 SHA 非法或 checkout 失败 → 脚本自身 fail-closed 退出，报告 `STATUS: ROLLBACK_FAILED`。
-- **回滚命令**：回滚即恢复动作；若仍失败，手动 `git -C "$SRC" checkout 932dcd7ef9d584955d316a3ddfca25c69f7dd6e3` 后重跑 deploy。
+- **回滚命令**：回滚即恢复动作；若仍失败，手动 `git -C "$SRC" checkout "$RUNTIME_CODE_SHA"` 后重跑 deploy。
 
 ### F2. SQLite 恢复（当需回退数据）
 - **执行命令**（先停服务）：
@@ -417,26 +452,28 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 - 执行日期：YYYY-MM-DD
 - 执行人：<运维账号，非 root>
 - 目标仓库：yzhlx/hermes-open-swe-lab（✅ 非 hermes-learning-os）
-- 集成提交 SHA：932dcd7ef9d584955d316a3ddfca25c69f7dd6e3（git rev-parse 复核：<一致/不一致>）
+- 运行时代码提交 SHA (RUNTIME_CODE_SHA)：932dcd7ef9d584955d316a3ddfca25c69f7dd6e3（git rev-parse 复核：<一致/不一致>）
+- PR #5 HEAD（执行时读取）：<`gh pr view 5 --json headRefOid -q .headRefOid`；可与 RUNTIME_CODE_SHA 不同，因 PR HEAD 可能含其后的文档提交，属正常>
 - 云服务器：Ubuntu 24.04 / 2CPU / 4GB
 
 ## 节七 云端受限真实部署验证
 | 项 | 结果 | 证据 |
 |----|------|------|
-| A1 代码来源+SHA相等 | PASS/FAIL | remote 仅含 hermes-open-swe-lab; SHA_MATCH=OK |
+| A1 代码来源+SHA相等 | PASS/FAIL | remote 仅含 hermes-open-swe-lab; SHA_MATCH=OK（对照 RUNTIME_CODE_SHA） |
 | A2 OS/资源 | PASS/FAIL | Ubuntu 24.04, nproc, RAM |
-| A3 端口/服务空闲 | PASS/FAIL | NO_LISTEN_ON_8080_80_443 |
+| A5 端口/Hermes 占用 | PASS/FAIL | PORT_8080_FREE / HERMES_SERVICE_INACTIVE（既有 80/443/nginx 仅记录） |
 | A4 安装目录/磁盘 | PASS/FAIL | df 剩余 ≥2GB（APP_HOME 或 /opt） |
 | A5b 部署前快照 | PASS/FAIL | before_ports.txt / before_nginx.txt 已存 |
 | B1 SQLite 备份 | PASS/SKIP | BACKUP OK / BACKUP SKIP（EXIT=0） |
-| C1 .env 权限修复(部署前) | PASS/SKIP | chmod 600, chown hermes-swe |
-| C2 部署脚本(check_config) | PASS/FAIL | check_config: OK |
-| C3 服务启动(hermes-swe) | PASS/FAIL | systemctl active |
-| C4 /healthz + /readyz | PASS/FAIL | HTTP 200 两次 |
-| C5 非 root + 仅 127.0.0.1 | PASS/FAIL | user=hermes-swe, bind=127.0.0.1:8080 |
-| C6 .env 600 hermes-swe | PASS/ABSENT | stat 600 hermes-swe:hermes-swe |
-| C7 Webhook OFF/无公网 | PASS/FAIL | 仅 127.0.0.1:8080; nginx 未改动 |
-| E 收口(停服/差异无公网新增) | PASS/FAIL | SERVICE_STOPPED; ports_diff 仅 127.0.0.1:8080 |
+| C1 部署脚本(先跑,check_config) | PASS/FAIL | check_config: OK; service left DISABLED |
+| C2 放置/修正 .env(部署后) | PASS/SKIP | ENV_PRESENT（安全通道） |
+| C3 .env 权限校验(部署后,启动前) | PASS/SKIP | chmod 600, chown hermes-swe |
+| C4 服务启动(hermes-swe) | PASS/FAIL | systemctl active |
+| C5 /healthz + /readyz | PASS/FAIL | HTTP 200 两次 |
+| C6 非 root + 仅 127.0.0.1 | PASS/FAIL | user=hermes-swe, bind=127.0.0.1:8080 |
+| C7 复核 .env 权限 | PASS/ABSENT | stat 600 hermes-swe:hermes-swe |
+| C8 Webhook OFF/无公网 | PASS/FAIL | 仅 127.0.0.1 曾出现但 E1 已停; nginx 未改动 |
+| E 收口(停服/新增监听为空) | PASS/FAIL | SERVICE_STOPPED; new_listeners.txt 为空 |
 
 **节七结论**：PASS / FAIL / NOT_TESTED
 **节七 STATUS**：（无安全违规则为 OK；出现 0.0.0.0 监听或 root 运行 → STATUS: SECURITY_BOUNDARY_VIOLATION）
@@ -480,7 +517,7 @@ export DEPLOY_SHA=932dcd7ef9d584955d316a3ddfca25c69f7dd6e3   # 集成分支 HEAD
 ## 附：常见停止信号速查
 - `STATUS: ENV_PREFLIGHT_FAILED` — Phase A 失败，未改动。
 - `STATUS: SQLITE_BACKUP_FAILED` — Phase B 完整性失败（退出码 1）。
-- `STATUS: SHA_MISMATCH` — 检出 SHA 与 DEPLOY_SHA 不一致，已自动停止。
+- `STATUS: SHA_MISMATCH` — 检出 SHA 与 RUNTIME_CODE_SHA 不一致，已自动停止。
 - `WRONG_REPO_QUARANTINED` — 误拉到非目标仓库，已隔离至 /opt/quarantine，等待人工确认（未删除）。
 - `STATUS: SECURITY_BOUNDARY_VIOLATION` — 出现 root 运行 / 非 loopback 绑定 / 公网端口新增 / 触碰 hermes-learning-os → 立即停服并报告。
 - `PROVIDER_LIVE_BLOCKED_BY_CREDENTIALS` — 节八凭证缺失，不得伪造 PASS。
