@@ -36,7 +36,7 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud) 
 | 19 | Phase D1: SQLite task queue + Worker API + local Worker + `EchoSandboxBackend` | DONE | `hermes_worker/` package; **7 offline unit tests PASS**; server+worker+CLI integration smoke PASS (see ADR-002 §7) |
 | 20 | Phase D1: observability CLI (`task_status.py`, `export_run_evidence.py`) | DONE | run against `events.db` / `runs`; no secrets logged |
 | 21 | Phase D2: `HermesDockerSandboxBackend` | DONE | `hermes_worker/docker_sandbox.py` implemented via docker CLI subprocess; MVP isolation defaults (cpus=1, mem=2GB, pids=256, net=bridge, no privileged, no docker.sock, --rm, single workdir mount). **10 offline unit tests PASS** (injectable fake runner; assert isolation flags + security + token scoping). Real container lifecycle NOT_TESTED (no Docker daemon in sandbox). |
-| 21b | Phase D2.5: real Docker container lifecycle (local daemon) | **BLOCKED** | Docker Desktop **installed but daemon NOT running**: both `default` (`npipe://./pipe/docker_engine`) and `desktop-linux` (`npipe://./pipe/dockerDesktopLinuxEngine`) contexts unreachable; no `dockerd`/`com.docker` process. `USER_ACTION_REQUIRED` — user must start Docker Desktop (or enable WSL Docker integration). **Not bypassed**: no cloud Docker, no remote socket, no privileged container, no Open SWE built-in `local` backend. D2 completion NOT claimed; D3 NOT entered until D2.5 real smoke PASSES. |
+| 21b | Phase D2.5: real Docker container lifecycle (local daemon) | **DONE** | Real daemon (Docker Desktop 4.63.0, Engine 29.2.1, `desktop-linux`, linux/amd64) validated full lifecycle: create→health→execute→write/read/edit→git clone/status/diff/commit→push to LOCAL bare remote→stop→delete. `docker inspect` confirms REAL limits: cpus=1 (NanoCpus=1e9), mem=2GB, pids=256, privileged=false, net=bridge, single workdir bind mount, auto-remove. Security/failure scenarios PASS (no docker.sock/SSH/.env visible; failed exec→exit code; timeout→124 + cleaned; path-escape rejected; no secret in logs; 0 residual containers). Harness: `runtime/d2-real-smoke/run_real_smoke.py`; image `hermes-d2-smoke:local` (python:3.11-slim+git). **18/18 offline + real smoke PASS.** |
 | 22 | Phase D3: smoke-test repo + GitHub App short token + Draft PR + CI + Reviewer + round-2 | PENDING | no access to `hermes-learning-os` |
 
 ---
@@ -132,3 +132,25 @@ web UI; the residual risk (remote Key valid until its original 90-day expiry) is
   entered. Once the user starts Docker Desktop (or enables WSL Docker integration)
   and the daemon is reachable, the full lifecycle (create→…→delete + `docker inspect`
   limits + security/failure scenarios) runs automatically. No code change this turn.
+
+## D2.5 real Docker lifecycle — PASS (this turn, 19:3x)
+
+- User started Docker Desktop; daemon reachable (Engine 29.2.1, `desktop-linux`).
+- Built local image `hermes-d2-smoke:local` (FROM python:3.11-slim + `git`, via
+  configured DaoCloud mirror — no GitHub, no cloud Docker, no privileged). digest
+  `sha256:f32d6f5fe9900b6d06f6eb46e0e8625f3a801a93c46f42d5093292225a0bdb3c`.
+- Harness `runtime/d2-real-smoke/run_real_smoke.py` drives the REAL backend
+  (runner=None → live `docker` CLI). Full lifecycle PASS. `docker inspect` proves
+  REAL limits: cpus=1.0 (NanoCpus=1e9), memory=2147483648, pids_limit=256,
+  privileged=false, network_mode=bridge, auto_remove=true, **single** bind mount
+  (workdir→/workspace). push to LOCAL bare remote received commit `c974e59` on `main`.
+- **Security/failure scenarios PASS**: container cannot see docker.sock / SSH /
+  .env; failed exec records exit code (7); timeout→124 + container cleaned;
+  path-escape rejected (host FS escape guard added to backend `write_file/read_file/
+  edit_file`); no token/PEM/Authorization in `_calls`; **0 residual containers**;
+  runtime 12.08s.
+- **Real-test-driven fix**: added `_safe_path()` containment guard to
+  `HermesDockerSandboxBackend` (rejects `..` / absolute paths outside the workspace,
+  preventing host FS escape) + regression test `test_d2_sandbox.py::test_11`.
+- D1 7/7 + D2 offline 11/11 = **18/18 PASS**; D2 real Docker smoke **PASS** → D2
+  completion now CLAIMED for the real-lifecycle criterion. D3 may proceed.

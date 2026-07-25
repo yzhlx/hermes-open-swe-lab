@@ -25,6 +25,7 @@ single source of truth for "stop and report" conditions. (AGENTS.md Sections 2, 
 | B13 | Evidence required | every PASS links to commit/PR/check/trace/SHA; else `NOT_TESTED` | none |
 | B14 | User contact only at gates | contact only for auth/web-auth/secret/payment/decision/incident/accept | none |
 | B15 | Local Worker pull model | Worker connects OUT to cloud via HTTPS only; **no inbound ports**, **no Docker socket exposed to cloud**, **no public SSH**; cloud never reaches the local machine | `SECURITY_BOUNDARY_VIOLATION` |
+| B16 | Workspace containment | Sandbox mounts ONLY the task workdir (`/workspace`); `write_file`/`read_file`/`edit_file` reject `..`/absolute paths that escape it (host FS escape guard `_safe_path()`). Verified real in D2.5 | `SECURITY_BOUNDARY_VIOLATION` |
 
 ## Stop-and-report conditions (from AGENTS.md Section 15)
 
@@ -67,8 +68,13 @@ tests, bypass review, change the target repo, or use production Hermes, the agen
 - B7 (custom sandbox backend only), B8 (cloud = control plane only), B11
   (secret-free observability), B15 (local Worker pull model): documented as the
   required configuration for D2/D3. LangSmith sandbox/trace is **RETIRED** (ADR-002);
-  the Open SWE built-in `local` backend remains forbidden. Live confirmation is
-  `NOT_TESTED` until the cloud server + local Docker Worker run the loop.
-- D1 offline implementation (`hermes_worker/`, CLI scripts, 7 tests) verifies the
-  protocol, queue, Worker API, and observability shape without Docker/GitHub.
+  the Open SWE built-in `local` backend remains forbidden.
+- **D2.5 real-daemon validation (2026-07-25): B7/B15/B16 confirmed REAL**, not just
+  asserted. Against the user's local Docker Desktop (Engine 29.2.1), `docker inspect`
+  proved: cpus=1, mem=2GB, pids=256, privileged=false, net=bridge (not host),
+  auto-remove, **single** workdir bind mount; container cannot see docker.sock /
+  SSH / `.env`; timeout→124 + cleaned; 0 residual; `_calls` log has no token/PEM/
+  Auth. Harness: `runtime/d2-real-smoke/run_real_smoke.py`.
+- D1 offline implementation (`hermes_worker/`, CLI scripts, 7 tests) + D2 offline
+  (11 tests) verify protocol/queue/Worker API/observability + isolation flags.
 - No violation detected during the read-only audit.

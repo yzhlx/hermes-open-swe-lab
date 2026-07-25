@@ -177,6 +177,21 @@ class D2SandboxTest(unittest.TestCase):
         self.assertIsNotNone(rm, "expected docker rm -f")
         self.assertFalse(os.path.isdir(ws), "workdir should be wiped on delete")
 
+    def test_11_path_escape_rejected(self):
+        self.backend.create()
+        # absolute path outside workspace
+        with self.assertRaises(PermissionError):
+            self.backend.write_file("/etc/passwd", "x")
+        # parent traversal escapes the mounted workdir (host FS escape)
+        with self.assertRaises(PermissionError):
+            self.backend.write_file("../../escape.txt", "x")
+        with self.assertRaises(PermissionError):
+            self.backend.read_file("../secrets.txt")
+        # legitimate in-workspace path still works
+        self.backend.write_file("automation-smoke-test/README.md", "ok")
+        self.assertEqual(
+            self.backend.read_file("automation-smoke-test/README.md"), "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

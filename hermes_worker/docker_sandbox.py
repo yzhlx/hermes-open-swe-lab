@@ -179,14 +179,31 @@ class HermesDockerSandboxBackend(SandboxBackend):
                  self._container, "bash", "-lc", command]
         return self._docker(args, timeout=timeout)
 
+    def _safe_path(self, path: str) -> str:
+        """Resolve ``path`` against the workspace and reject any escape.
+
+        Prevents ``../`` traversal or absolute paths from writing/reading
+        outside the mounted task workdir (host FS escape). This is the
+        host-side complement to the single-bind-mount isolation enforced by
+        Docker: even if the agent emits a malicious relative path, it cannot
+        reach files outside ``self._ws``.
+        """
+        if not path:
+            raise ValueError("empty path")
+        full = os.path.normpath(os.path.join(self._ws, path))
+        ws = os.path.normpath(self._ws)
+        if full != ws and not full.startswith(ws + os.sep):
+            raise PermissionError(f"path escapes workspace: {path!r}")
+        return full
+
     def write_file(self, path: str, content: str) -> None:
-        full = os.path.join(self._ws, path)
+        full = self._safe_path(path)
         os.makedirs(os.path.dirname(full) or self._ws, exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             f.write(content)
 
     def read_file(self, path: str) -> str:
-        with open(os.path.join(self._ws, path), "r", encoding="utf-8") as f:
+        with open(self._safe_path(path), "r", encoding="utf-8") as f:
             return f.read()
 
     def edit_file(self, path: str, old: str, new: str) -> None:
