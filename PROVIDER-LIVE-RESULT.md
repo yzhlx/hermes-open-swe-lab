@@ -123,14 +123,21 @@
 
 ## 9. 独立 Reviewer 结论
 
-见提交后的更新（本线路运行独立 Reviewer，仅修 blocking 问题，不扩大 scope 至 D3/部署）。
+**VERDICT: APPROVE（无 blocking 问题）。**
+- 独立 Reviewer（general-purpose agent，只读审查）确认：`pytest tests/` → **58 passed**；scope 仅触及 `hermes_open_swe_relay/` + `tests/test_provider_live.py` + `PROVIDER-LIVE-RESULT.md`，未触碰 `hermes_worker/control_plane.py`、D3、`deploy/`、中央 README、共享架构文档。
+- 安全：无密钥提交；`wss://` 在边界被拒（官方 WebSocket Responses 硬编码路径不可达）；`LANGSMITH_GATEWAY_ENABLED=true` 被拒；`redact()` 应用于错误/重试耗尽信息。
+- 正确性：重试/退避（429/5xx/timeout、Retry-After、`RelayRetryExhaustedError`、SDK `max_retries=0`）、流式累积（tool_calls 按 index、finish_reason、usage）、`validate_response()`、wss 防护均正确。
+- 测试完整性：23 个 provider 测试均断言真实行为，非侥幸通过。
+- 上游对齐：文档声明（HTTPS Chat Completions；wss 边界禁用）与代码一致。
+
+**非阻塞建议（未实施，遵循"仅修 blocking"）：** `_with_retry` 对非可重试 SDK 错误的重抛出可再包一层 `redact()` 做纵深防御（openai 错误本身不回显 key，风险低）。已记录，留待 integration 统一处理。
 
 ---
 
 ## 10. Commit / Draft PR
 
-- Commit SHA：见提交后更新。
-- Draft PR：`base=phase-1-smoke`，不合并。链接见提交后更新。
+- Commit SHA：`6868f7301cc8059cdb2ba84d1375f6ecd810f822`（短 `6868f73`）
+- Draft PR：https://github.com/yzhlx/hermes-open-swe-lab/pull/3 （`base=phase-1-smoke`，**不合并**）
 
 ---
 
