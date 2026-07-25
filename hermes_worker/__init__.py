@@ -10,5 +10,9 @@ ADR-002-REMOVE-LANGSMITH.md:
 
 The Open SWE agent runs *through* the SandboxBackend protocol instead of being
 bypassed. D1 ships the fake EchoSandboxBackend for offline protocol testing;
-D2 adds the real HermesDockerSandboxBackend.
+D2 adds the real HermesDockerSandboxBackend (Docker CLI subprocess, MVP
+isolation defaults, injectable runner for offline tests).
 """
+
+from .docker_sandbox import HermesDockerSandboxBackend  # noqa: F401
+from .echo_sandbox import EchoSandboxBackend  # noqa: F401

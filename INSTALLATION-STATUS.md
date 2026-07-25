@@ -28,14 +28,14 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud) 
 | 13 | GitHub App (create + install + scope) | DONE | App `4389778`; installed on smoke-test only; Install ID `148886992` (read-only App auth); scope verified (lab+learning-os 404) |
 | 13b | GitHub App key landing on server | DONE | `hermes-swe` svc user created; key at `/etc/.../secrets/github-app-private-key.pem` (hermes-swe:hermes-swe 600); SHA-256 MATCH; `.env` written; server-side auth verify PASS |
 | 13c | Webhook | OFF | intentionally disabled in MVP; no secret/URL configured |
-| 14 | LangSmith Service Key landing + tracing | **RETIRED_BY_ARCHITECTURE_DECISION** | Removed from MVP-0 by `ADR-002-REMOVE-LANGSMITH.md` (2026-07-25): org-level Sandboxes feature disabled → `SANDBOX_ACCOUNT_ENABLEMENT_REQUIRED`; user has no card to enable. **Secret purge is HELD** on the user revoking the LangSmith Service Key from the web UI (see ADR-002 §3). Historical evidence kept in `LANGSMITH-SETUP.md`. No LangSmith feature ever passed. |
+| 14 | LangSmith Service Key + tracing | **RETIRED_BY_ARCHITECTURE_DECISION** (runtime removed; local + server Key copies deleted) | Removed from MVP-0 by `ADR-002-REMOVE-LANGSMITH.md`. Local temp key file + server `.env` LangSmith vars deleted 2026-07-25 (user chose NOT to revoke the remote Service Key; residual risk accepted; Key expires at its original validity end). Suggested statuses: `LOCAL_LANGSMITH_CREDENTIALS_DELETED`, `REMOTE_SERVICE_KEY_NOT_REVOKED_ACCEPTED_RISK`, `LANGSMITH_RUNTIME_REMOVED`. **Revoking the Key is no longer a gate for any phase.** No LangSmith feature ever passed. |
 | 15 | Cloud control plane deploy | NOT_TESTED | needs cloud-server access |
 | 16 | End-to-end loop (Issue→PR→review→rework) | NOT_TESTED | depends on 12–15 + D2/D3 |
 | 17 | Draft PR to lab repo | PENDING | Step 12 — after live loop |
 | 18 | Cloud server health monitor | NOT_TESTED | needs cloud-server access |
 | 19 | Phase D1: SQLite task queue + Worker API + local Worker + `EchoSandboxBackend` | DONE | `hermes_worker/` package; **7 offline unit tests PASS**; server+worker+CLI integration smoke PASS (see ADR-002 §7) |
 | 20 | Phase D1: observability CLI (`task_status.py`, `export_run_evidence.py`) | DONE | run against `events.db` / `runs`; no secrets logged |
-| 21 | Phase D2: `HermesDockerSandboxBackend` | PENDING | container lifecycle vs local non-sensitive repo (no GitHub) |
+| 21 | Phase D2: `HermesDockerSandboxBackend` | DONE | `hermes_worker/docker_sandbox.py` implemented via docker CLI subprocess; MVP isolation defaults (cpus=1, mem=2GB, pids=256, net=bridge, no privileged, no docker.sock, --rm, single workdir mount). **10 offline unit tests PASS** (injectable fake runner; assert isolation flags + security + token scoping). Real container lifecycle NOT_TESTED (no Docker daemon in sandbox). |
 | 22 | Phase D3: smoke-test repo + GitHub App short token + Draft PR + CI + Reviewer + round-2 | PENDING | no access to `hermes-learning-os` |
 
 ---
@@ -48,10 +48,13 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud) 
   passwordless `sudo`); reachable at `129.211.0.213:22`. Dedicated Open SWE
   service user `hermes-swe` (uid 996, system, nologin, no sudo/docker) CREATED —
   the App key is now landed under `/etc/hermes-open-swe-lab/secrets/` owned by it.
-- GitHub App key is landed on the server. The LangSmith Service Key was previously
-  landed but is now **RETIRED**: its secret values remain in `/opt/hermes-open-swe-lab/.env`
-  **only until the user revokes the Key from the web UI**, after which the agent will
-  purge the 8 LangSmith vars and the local temp key file (HELD — not yet deleted).
+- GitHub App key is landed on the server. The LangSmith Service Key + all LangSmith
+  config were **RETIRED and removed** (2026-07-25): the LangSmith vars were deleted from
+  `/opt/hermes-open-swe-lab/.env` (owner/mode preserved: `hermes-swe:hermes-swe 600`),
+  the local temp key file was permanently deleted (incl. Recycle Bin), and the LangSmith
+  CLI on the server was removed. The **remote** Service Key was NOT actively revoked
+  (user choice; residual risk accepted; it expires at its original validity end).
+  Revoking it is no longer a gate for any phase.
 - The cloud server is control-plane only and no longer needs LangSmith.
 
 ## What is safe to do now (autonomous)
@@ -66,14 +69,31 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud) 
 - ~~Create the dedicated Open SWE service user~~ — **DONE**: `hermes-swe` (uid 996,
   system, nologin, no sudo/docker) created; App key landed under
   `/etc/hermes-open-swe-lab/secrets/` owned by it. Do NOT reuse Hermes user `ubuntu`.
-- ~~Create LangSmith Service Key + land it~~ — **RETIRED** by architecture decision
-  (`ADR-002`); do NOT re-enable, do NOT self-upgrade billing, do NOT create snapshots.
-  **Remaining gate:** the user must **revoke the LangSmith Service Key from the web UI**;
-  only after that confirmation will the agent purge the server `.env` LangSmith vars
-  and the local temp key file.
+- ~~Create LangSmith Service Key + land it~~ — **RETIRED + removed** by architecture
+  decision (`ADR-002`); do NOT re-enable, do NOT self-upgrade billing, do NOT create
+  snapshots. **Local + server Key copies already deleted** (2026-07-25). The remote
+  Service Key was intentionally NOT revoked (accepted residual risk); **this is no
+  longer a gate** for any phase.
 - Write relay Base URL / model / key to `/opt/hermes-open-swe-lab/.env`.
 - Any billing/payment action.
 - Cloud-server SSH access to run the control plane.
+
+## LangSmith cleanup status (2026-07-25, 18:48)
+
+Per the user's explicit decision, the LangSmith Service Key is **not** revoked from the
+web UI; the residual risk (remote Key valid until its original 90-day expiry) is
+**accepted**. The project records the removal as:
+
+- `LOCAL_LANGSMITH_CREDENTIALS_DELETED` — local temp key file permanently deleted (incl.
+  Recycle Bin); server `.env` LangSmith vars removed (GitHub App + relay config untouched;
+  owner/mode `hermes-swe:hermes-swe 600` preserved).
+- `REMOTE_SERVICE_KEY_NOT_REVOKED_ACCEPTED_RISK` — remote Service Key intentionally NOT
+  revoked; no card/billing action taken; expected to expire at its original validity end.
+- `LANGSMITH_RUNTIME_REMOVED` — no code path calls LangSmith; Open SWE runs through the
+  custom `HermesDockerSandboxBackend` (now implemented in D2; D1 shipped the `EchoSandboxBackend`
+  fake); observability is the SQLite Event Store.
+
+**Revoking the remote Key is no longer a gate for any phase** (D1/D2/D3 proceed without it).
 
 ## Last updated
 
@@ -90,4 +110,10 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud) 
 - Phase D1 implemented in `hermes_worker/` (db, protocol, control_plane,
   worker_api_server, worker, echo_sandbox, docker_sandbox stub) + `scripts/` CLIs +
   `tests/test_d1_offline.py`. **7 offline tests PASS**; integration smoke PASS.
-- LangSmith secret purge **HELD** pending user revocation of the Service Key.
+- LangSmith secret purge **DONE** (local + server copies deleted 18:48; remote Key
+  intentionally NOT revoked — accepted residual risk; no longer a gate).
+- **Phase D2 implemented** `HermesDockerSandboxBackend` (real Docker backend) in
+  `hermes_worker/docker_sandbox.py`; `tests/test_d2_sandbox.py` added — **10 offline
+  tests PASS** (isolation flags, no privileged/docker.sock, single workdir mount,
+  token scoped to push only + redacted in logs). Real `docker run`/`exec`/`rm`
+  lifecycle NOT_TESTED (no Docker daemon in this sandbox). D3 next.

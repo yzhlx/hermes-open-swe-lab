@@ -23,7 +23,7 @@ single source of truth for "stop and report" conditions. (AGENTS.md Sections 2, 
 | B11 | Secret-free observability | Event Store (`runtime/events.db`) + `runtime/runs/*.jsonl` MUST NOT contain API Key, GitHub Token, PEM, Auth header, full `.env`, or suspected secrets; only `worker_token_hash` (sha256) is stored | `SECURITY_BOUNDARY_VIOLATION` |
 | B12 | Concurrency fixed at 1 | coding=1, reviewer=1, sandbox=1 | none |
 | B13 | Evidence required | every PASS links to commit/PR/check/trace/SHA; else `NOT_TESTED` | none |
-| B14 | User contact only at gates | contact only for auth/web-auth/secret/LangSmith-purge/payment/decision/incident/accept | none |
+| B14 | User contact only at gates | contact only for auth/web-auth/secret/payment/decision/incident/accept | none |
 | B15 | Local Worker pull model | Worker connects OUT to cloud via HTTPS only; **no inbound ports**, **no Docker socket exposed to cloud**, **no public SSH**; cloud never reaches the local machine | `SECURITY_BOUNDARY_VIOLATION` |
 
 ## Stop-and-report conditions (from AGENTS.md Section 15)

@@ -55,21 +55,26 @@ This decision **overrides ALL prior** LangSmith Sandbox / Trace / Snapshot requi
 - All requirements that the cloud control plane spawn a LangSmith sandbox.
 - The implicit dependency on card-binding / billing to enable the loop.
 
-### Secret purge — HELD (gated on user revocation)
+### Secret purge — COMPLETED (local + server copies)
 
-The LangSmith secrets/config on the server `.env` and the local temp key file are
-**not yet deleted**, because the LangSmith Service Key has **not yet been revoked**
-from the web UI by the user. Deletion is gated on the user's confirmation of
-revocation and must not happen while the Key is still live. After revocation the agent
-will:
+The LangSmith secrets/config have been removed (2026-07-25, per user decision):
 
-1. Safely delete the 8 LangSmith vars from `/opt/hermes-open-swe-lab/.env`
-   (`LANGSMITH_API_KEY`, `LANGSMITH_WORKSPACE_ID`, `LANGSMITH_ENDPOINT`,
-   `LANGSMITH_URL_PROD`, `LANGSMITH_TENANT_ID_PROD`, `LANGSMITH_TRACING_PROJECT_ID_PROD`,
-   `DEFAULT_SANDBOX_SNAPSHOT_ID`, `SANDBOX_TYPE=langsmith`) — as `hermes-swe`, never
-   printing the old value or full `.env`.
-2. Safely delete the local temp file
-   `C:\Users\user\.secrets\langsmith\langsmith-api-key.txt`.
+1. The LangSmith vars were deleted from `/opt/hermes-open-swe-lab/.env` as `hermes-swe`
+   (owner/mode preserved: `hermes-swe:hermes-swe 600`); GitHub App + relay config
+   untouched. The vars actually present were `SANDBOX_TYPE=langsmith`,
+   `LANGCHAIN_TRACING_V2`, `LANGCHAIN_PROJECT` (no `LANGSMITH_API_KEY` line remained in
+   that file — the live secret lived only in the local temp file).
+2. The local temp file `C:\Users\user\.secrets\langsmith\langsmith-api-key.txt` was
+   **permanently deleted** (including from the Recycle Bin); the now-empty directory was
+   removed. The GitHub App key directory was not touched.
+3. The LangSmith CLI on the server (`/var/lib/hermes-swe/.local/bin/langsmith`) was
+   removed; no LangSmith cache remained.
+
+The **remote** Service Key was intentionally **NOT revoked** from the web UI — the user
+accepted the residual risk (remote Key valid until its original 90-day expiry). No
+card/billing action was taken. **Revoking the remote Key is no longer a gate for any
+phase.** Suggested statuses: `LOCAL_LANGSMITH_CREDENTIALS_DELETED`,
+`REMOTE_SERVICE_KEY_NOT_REVOKED_ACCEPTED_RISK`, `LANGSMITH_RUNTIME_REMOVED`.
 
 ---
 
