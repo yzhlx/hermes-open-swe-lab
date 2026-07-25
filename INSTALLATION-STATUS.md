@@ -36,6 +36,7 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud) 
 | 19 | Phase D1: SQLite task queue + Worker API + local Worker + `EchoSandboxBackend` | DONE | `hermes_worker/` package; **7 offline unit tests PASS**; server+worker+CLI integration smoke PASS (see ADR-002 §7) |
 | 20 | Phase D1: observability CLI (`task_status.py`, `export_run_evidence.py`) | DONE | run against `events.db` / `runs`; no secrets logged |
 | 21 | Phase D2: `HermesDockerSandboxBackend` | DONE | `hermes_worker/docker_sandbox.py` implemented via docker CLI subprocess; MVP isolation defaults (cpus=1, mem=2GB, pids=256, net=bridge, no privileged, no docker.sock, --rm, single workdir mount). **10 offline unit tests PASS** (injectable fake runner; assert isolation flags + security + token scoping). Real container lifecycle NOT_TESTED (no Docker daemon in sandbox). |
+| 21b | Phase D2.5: real Docker container lifecycle (local daemon) | **BLOCKED** | Docker Desktop **installed but daemon NOT running**: both `default` (`npipe://./pipe/docker_engine`) and `desktop-linux` (`npipe://./pipe/dockerDesktopLinuxEngine`) contexts unreachable; no `dockerd`/`com.docker` process. `USER_ACTION_REQUIRED` — user must start Docker Desktop (or enable WSL Docker integration). **Not bypassed**: no cloud Docker, no remote socket, no privileged container, no Open SWE built-in `local` backend. D2 completion NOT claimed; D3 NOT entered until D2.5 real smoke PASSES. |
 | 22 | Phase D3: smoke-test repo + GitHub App short token + Draft PR + CI + Reviewer + round-2 | PENDING | no access to `hermes-learning-os` |
 
 ---
@@ -117,3 +118,17 @@ web UI; the residual risk (remote Key valid until its original 90-day expiry) is
   tests PASS** (isolation flags, no privileged/docker.sock, single workdir mount,
   token scoped to push only + redacted in logs). Real `docker run`/`exec`/`rm`
   lifecycle NOT_TESTED (no Docker daemon in this sandbox). D3 next.
+
+## D2.5 real Docker lifecycle — BLOCKED (this turn, 19:16)
+
+- Pre-check: Docker **client** v29.2.1 present (context `desktop-linux`), but the
+  **daemon** is NOT running. `docker version`/`docker info` fail to connect on both
+  `default` (`npipe://./pipe/docker_engine`) and `desktop-linux`
+  (`npipe://./pipe/dockerDesktopLinuxEngine`); no `dockerd`/`com.docker` process in
+  tasklist. `STATUS: USER_ACTION_REQUIRED`.
+- Per D2.5 gate, did NOT bypass: no cloud Docker install, no remote socket exposed,
+  no privileged container, no Open SWE built-in `local` backend.
+- D2 completion intentionally NOT claimed for the real-lifecycle criterion; D3 NOT
+  entered. Once the user starts Docker Desktop (or enables WSL Docker integration)
+  and the daemon is reachable, the full lifecycle (create→…→delete + `docker inspect`
+  limits + security/failure scenarios) runs automatically. No code change this turn.
