@@ -26,11 +26,30 @@ never merged automatically.
 7. Mark PR ready for review.
 8. Independent reviewer.
 9. Reviewer comment requests feedback marker.
-10. Original agent amends same branch/PR (sandbox).
-11. CI re-runs.
+9b. **Round-2 label gate (orchestrator-owned):** the test orchestrator — and
+    only the orchestrator — adds the `round-2` label to the original PR and
+    reads the labels back to confirm presence. If the add FAILED, the read
+    FAILED, or the label is ABSENT, **stop immediately** (status
+    `ROUND_2_LABEL_GATE_FAILED`); do **not** fall back to round 1 and do **not**
+    post the rework comment. Otherwise proceed.
+10. Original agent amends same branch/PR (sandbox) to add
+    `SECOND_ROUND_FEEDBACK_APPLIED`.
+11. CI re-runs with `--round 2` (driven by the `round-2` label).
 12. Reviewer re-reviews new head SHA.
 13. Keep PR unmerged.
 14. Generate final evidence report.
+
+### GitHub App minimal permissions (round-2 label gate)
+
+The orchestrator uses a GitHub App installation token scoped **only** to
+`yzhlx/hermes-open-swe-smoke-test`:
+
+- `pull_requests: read` — read PR labels (to confirm the gate).
+- `pull_requests: write` — add the `round-2` label.
+
+No other repository (not `yzhlx/hermes-open-swe-lab`, not
+`yzhlx/hermes-learning-os`) and no other permission is required. The coding
+agent and CI must never add the label.
 
 ## Retry budget (MVP-0 Step 15)
 
@@ -51,6 +70,9 @@ No unlimited loops. After the budget, stop and preserve evidence.
 - `WEBHOOK_FAILED` — webhook not delivering.
 - `AGENT_FAILED` — coding agent exhausted attempts.
 - `CI_FAILED` — contract unfixable within `ci_fix_rounds`.
+- `ROUND_2_LABEL_GATE_FAILED` — round-2 label add/read failed or label absent
+  after the flow entered FEEDBACK_REQUESTED/REWORK_RUNNING; round 2 must stop,
+  never degrade to round 1.
 - `REVIEW_FAILED` — reviewer loop exhausted.
 - `SANDBOX_ACCESS_REQUIRED` — LangSmith sandbox unavailable.
 - `SERVER_RESOURCE_LIMIT` — Hermes health at risk.
