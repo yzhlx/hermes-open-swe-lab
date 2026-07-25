@@ -23,27 +23,17 @@ secrets in chat.
   self-test Run `30147269747` passed. Strict contract (round 1 baseline, round 2
   + feedback marker, round-2 label gate) verified.
 - MVP-0 documentation set complete.
-- **GitHub App DONE**: App `4389778` created + installed on smoke-test only;
-  Installation ID `148886992` obtained via read-only App auth; install scope
-  verified (lab + learning-os both 404, no `SECURITY_BOUNDARY_VIOLATION`).
+- **GitHub App DONE (incl. server landing)**: App `4389778` created + installed on
+  smoke-test only; Installation ID `148886992` obtained via read-only App auth;
+  install scope verified (lab + learning-os not in scope). Dedicated svc user
+  `hermes-swe` (uid 996, system, nologin, no sudo/docker) created; App key landed at
+  `/etc/hermes-open-swe-lab/secrets/github-app-private-key.pem` (hermes-swe:hermes-swe
+  600, SHA-256 MATCH vs local); `/opt/hermes-open-swe-lab/.env` written (non-secret
+  only); server-side read-only auth verify PASS (allowed repo list == smoke-test only).
   Webhook intentionally OFF. Key-file adapter added (`scripts/load_github_app_key.py`).
-- **BLOCKER**: the dedicated Open SWE service user does not exist on the cloud
-  server, so the App private key cannot yet be landed (`/etc/hermes-open-swe-lab/secrets/`).
-  Must NOT reuse the Hermes service user `ubuntu`.
 
-**Immediate next action (blocking):**
-
-1. **Create the dedicated Open SWE service user on the cloud server.**
-   - The existing Hermes runtime runs as `ubuntu` (and partially `root`); per the
-     security rule we must NOT reuse `ubuntu` as the GitHub App key-file owner.
-   - Proposed name: `hermes-swe`. On the cloud host (`129.211.0.213:22`, reachable
-     as `ubuntu` with passwordless sudo):
-     ```bash
-     sudo useradd --system --create-home --shell /usr/sbin/nologin hermes-swe
-     ```
-   - Reply with the username you created (or confirm `hermes-swe`). The agent then
-     lands the App private key under `/etc/hermes-open-swe-lab/secrets/` (700/600,
-     owned by that user) and writes the non-secret `/opt/hermes-open-swe-lab/.env`.
+**GitHub App service user + key landing: DONE.** `hermes-swe` created; key landed;
+`.env` written; server-side auth verify PASS. (Recorded in `GITHUB-APP-SETUP.md`.)
 
 **Still required before the live loop (Step 10):**
 
@@ -60,10 +50,11 @@ secrets in chat.
    the workflow file itself.
 
 5. ~~**Cloud server SSH access**~~ — **CONFIRMED**: SSH to `129.211.0.213:22` as
-   `ubuntu` (key `~/.ssh/id_rsa`, passwordless sudo) works from this sandbox. The
-   control-plane deploy now only waits on the service user (above) + LangSmith +
-   relay creds. If you prefer to run the control plane yourself, that is also
-   acceptable — the agent only needs the resulting evidence.
+   `ubuntu` (key `~/.ssh/id_rsa`, passwordless sudo) works from this sandbox; the
+   dedicated `hermes-swe` service user is now created and the App key is landed.
+   The control-plane deploy now waits on LangSmith + relay creds. If you prefer to
+   run the control plane yourself, that is also acceptable — the agent only needs
+   the resulting evidence.
 
 6. **Billing/payment**: if any provider, LangSmith, or sandbox incurs cost,
    approve it explicitly. The agent will stop before any charge.

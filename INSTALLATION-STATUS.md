@@ -25,7 +25,7 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud)
 | 11 | `scripts/provider_preflight.py` | DONE | P1–P6; no-config run → NOT_TESTED (exit 2) |
 | 12 | Live provider preflight (P1–P6) | NOT_TESTED | needs relay creds (Step 9) |
 | 13 | GitHub App (create + install + scope) | DONE | App `4389778`; installed on smoke-test only; Install ID `148886992` (read-only App auth); scope verified (lab+learning-os 404) |
-| 13b | GitHub App key landing on server | BLOCKED | dedicated service user missing (must NOT reuse Hermes user `ubuntu`) — see GITHUB-APP-SETUP.md |
+| 13b | GitHub App key landing on server | DONE | `hermes-swe` svc user created; key at `/etc/.../secrets/github-app-private-key.pem` (hermes-swe:hermes-swe 600); SHA-256 MATCH; `.env` written; server-side auth verify PASS |
 | 13c | Webhook | OFF | intentionally disabled in MVP; no secret/URL configured |
 | 14 | LangSmith sandbox + trace | NOT_TESTED | user gate (Step 9) |
 | 15 | Cloud control plane deploy | NOT_TESTED | needs cloud-server access |
@@ -40,8 +40,9 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud)
 - OS: Windows (Git Bash) — **local control/authoring only**, not the cloud server.
 - `gh` authenticated as `yzhlx` (repo scope).
 - SSH access to the cloud Ubuntu host EXISTS (user `ubuntu`, key `~/.ssh/id_rsa`,
-  passwordless `sudo`); reachable at `129.211.0.213:22`. A dedicated Open SWE
-  service user does NOT exist yet — required before the App key can be landed.
+  passwordless `sudo`); reachable at `129.211.0.213:22`. Dedicated Open SWE
+  service user `hermes-swe` (uid 996, system, nologin, no sudo/docker) CREATED —
+  the App key is now landed under `/etc/hermes-open-swe-lab/secrets/` owned by it.
 - No real relay API key / GitHub App / LangSmith key present → live runs blocked
   by design until authorization.
 
@@ -54,9 +55,9 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud)
 
 ## What requires the authorization gate (Step 9)
 
-- Create the dedicated Open SWE service user on the cloud server (proposed
-  `hermes-swe`); do NOT reuse the Hermes service user `ubuntu`. After that, the
-  agent lands the App private key under `/etc/hermes-open-swe-lab/secrets/`.
+- ~~Create the dedicated Open SWE service user~~ — **DONE**: `hermes-swe` (uid 996,
+  system, nologin, no sudo/docker) created; App key landed under
+  `/etc/hermes-open-swe-lab/secrets/` owned by it. Do NOT reuse Hermes user `ubuntu`.
 - Create LangSmith API key + confirm sandbox permission + create snapshot.
 - Write relay Base URL / model / key to `/opt/hermes-open-swe-lab/.env`.
 - Any billing/payment action.
@@ -64,8 +65,9 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud)
 
 ## Last updated
 
-2026-07-25 — GitHub App created (`4389778`), installed on smoke-test only,
-Installation ID `148886992` obtained via read-only App auth, install scope
-verified (lab + learning-os both 404). **BLOCKER: dedicated Open SWE service
-user not yet created** (cannot land key on server without it; must NOT reuse
-Hermes user `ubuntu`). SSH to cloud host confirmed reachable. Webhook OFF.
+2026-07-25 — GitHub App `4389778` fully landed: dedicated svc user `hermes-swe`
+created (uid 996, system, nologin, no sudo/docker); App key at
+`/etc/hermes-open-swe-lab/secrets/github-app-private-key.pem` (hermes-swe 600);
+SHA-256 MATCH vs local; `/opt/hermes-open-swe-lab/.env` written (non-secret only);
+server-side read-only auth verify PASS (Install ID `148886992`, allowed repo list
+== smoke-test only via installation token, no 404 probing). Webhook OFF.

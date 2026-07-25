@@ -1,13 +1,14 @@
 # GITHUB-APP-SETUP.md — GitHub App for the smoke-test loop
 
-**Status:** PARTIAL — App created & installed on **only** `yzhlx/hermes-open-swe-smoke-test`;
-Installation ID obtained via read-only App auth; install scope verified (lab + learning-os
-are **not** in scope). **Server-side key landing is BLOCKED** on creating the dedicated
-Open SWE service user (must **not** reuse the existing Hermes service user `ubuntu`).
+**Status:** DONE — App created & installed on **only** `yzhlx/hermes-open-swe-smoke-test`;
+Installation ID obtained via read-only App auth; install scope verified; dedicated
+service user `hermes-swe` created; App key landed on server; `.env` written;
+server-side read-only auth verify PASS. Webhook OFF.
 
 **Scope rule:** the App is installed on **only** `yzhlx/hermes-open-swe-smoke-test`.
-Verified: `GET /repos/{repo}/installation` → smoke-test `200`, lab `404`, learning-os `404`.
-No `SECURITY_BOUNDARY_VIOLATION`.
+Verified via the installation's allowed-repo list (installation token, read-only):
+the single allowed repository is `yzhlx/hermes-open-swe-smoke-test`. No other repo
+is in scope; `yzhlx/hermes-learning-os` is **not** accessible. No `SECURITY_BOUNDARY_VIOLATION`.
 
 > These are instructions for the user and the agent. The agent never prints, logs, or
 > commits the private key, JWT, installation token, or webhook secret. Do **not** paste
@@ -53,17 +54,20 @@ file path.
 - If `GITHUB_APP_PRIVATE_KEY_PATH` is unset → no-op, so the upstream default (reading
   `GITHUB_APP_PRIVATE_KEY` directly) is preserved.
 
-## Server-side key landing (AGENT — BLOCKED on dedicated service user)
+## Server-side key landing (AGENT — DONE)
 
-Do **not** proceed until a dedicated Open SWE service user exists (see blocker below).
-Then, as that user (never `ubuntu`):
+Executed as user `ubuntu` over SSH (with `sudo`), targeting the dedicated
+`hermes-swe` service user for ownership. Never `ubuntu`, never a Hermes user.
 
-1. `sudo install -d -m 700 -o <svc> -g <svc> /etc/hermes-open-swe-lab/secrets`
+1. Created `hermes-swe` (system user, uid 996, `--user-group`, home
+   `/var/lib/hermes-swe`, shell `/usr/sbin/nologin`, no sudo/docker).
+2. `sudo install -d -m 700 -o hermes-swe -g hermes-swe /etc/hermes-open-swe-lab/secrets`
    (outside any git repo; not under `/opt/hermes-open-swe-lab`'s tracked tree).
-2. `scp` the `.pem` → `/etc/hermes-open-swe-lab/secrets/github-app-private-key.pem`,
-   then `chmod 600`, `chown <svc>:<svc>`.
-3. SHA-256 verify local file == server file (compare hashes; never print key content).
-4. Write `/opt/hermes-open-swe-lab/.env` (gitignored, non-secret only):
+3. `scp` `.pem` → `/tmp/github-app-private-key.pem.tmp` (`chmod 600`), then
+   `sudo install -o hermes-swe -g hermes-swe -m 600` →
+   `/etc/hermes-open-swe-lab/secrets/github-app-private-key.pem`; temp securely removed.
+4. SHA-256 verify: **MATCH** (local file == server file; only prefix shown internally).
+5. Wrote `/opt/hermes-open-swe-lab/.env` (gitignored, non-secret only, hermes-swe 600):
 
    ```bash
    GITHUB_APP_ID=4389778
@@ -73,23 +77,26 @@ Then, as that user (never `ubuntu`):
    # GITHUB_WEBHOOK_SECRET is NOT set — webhook stays OFF (MVP)
    ```
 
-   The PEM **text** is never written here; the adapter bridges the path → env at runtime.
+   The PEM **text** is never written to `.env`; the adapter bridges the path → env at runtime.
 
-## Verification (actual results so far)
+## Verification (actual results)
 
 - App auth (read-only) → Installation ID `148886992`, account `yzhlx`. ✅
-- Install scope: smoke-test `200`; `yzhlx/hermes-open-swe-lab` `404`;
-  `yzhlx/hermes-learning-os` `404`. ✅ (no other repo accessible)
+- Key landing: `/etc/hermes-open-swe-lab/secrets/github-app-private-key.pem`
+  (`hermes-swe:hermes-swe`, `600`); `openssl pkey -check` → valid; SHA-256 MATCH. ✅
+- Scope (read-only, via installation's allowed-repo list, **no 404 probing**):
+  the single allowed repository is `yzhlx/hermes-open-swe-smoke-test`
+  (total_count 1). `yzhlx/hermes-learning-os` is **not** accessible. ✅
+- Server-side read-only auth verify (App JWT signed from the server key path):
+  App identity valid, Install ID `148886992` valid, allowed repo list == smoke-test
+  only → PASS. ✅
 - Webhook: **OFF** (no webhook secret, no webhook URL configured). ✅
 
-## Blocker (user action required)
+## Next (user action required)
 
-- **Dedicated Open SWE service user does not exist on the cloud server.**
-  The existing Hermes runtime runs as `ubuntu` (and partially `root`); per the
-  security rule we must **not** reuse `ubuntu` as the key-file owner.
-- **Next user action:** create the dedicated service user (proposed name
-  `hermes-swe`) on the cloud server, or tell the agent which username to use.
-  After that, the agent performs the server-side key landing above.
+- The App key is landed; the next authorization gates are **LangSmith sandbox** and
+  **relay credentials** (see `LANGSMITH-SETUP.md` and `USER-ACTIONS-REQUIRED.md`).
+- Webhook stays OFF until you explicitly enable it.
 
 ## Security notes
 
