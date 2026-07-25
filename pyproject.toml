@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-open-swe-relay"
+version = "0.1.0"
+description = "Optional OpenAI-compatible relay adapter for Open SWE (MVP-0)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+relay = ["openai>=1.30"]
+
+[tool.setuptools.packages.find]
+include = ["hermes_open_swe_relay*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
