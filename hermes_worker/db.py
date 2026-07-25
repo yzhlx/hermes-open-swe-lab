@@ -20,11 +20,13 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id         TEXT,
+    repo            TEXT,
     issue_number    INTEGER,
     pr_number       INTEGER,
     state           TEXT NOT NULL DEFAULT 'pending',
     role            TEXT,
     model           TEXT,
+    round           INTEGER DEFAULT 0,
     token_usage     INTEGER,
     tool_calls      INTEGER,
     container_id    TEXT,
@@ -75,6 +77,16 @@ CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id);
 CREATE INDEX IF NOT EXISTS idx_workers_hb ON workers(last_heartbeat);
 CREATE INDEX IF NOT EXISTS idx_nonces_exp ON nonces(expires);
 CREATE INDEX IF NOT EXISTS idx_deliveries_ts ON deliveries(ts);
+-- Task idempotency: one job per (repo, issue_number). A second webhook for the
+-- same issue hits the UNIQUE constraint and is collapsed onto the existing job
+-- (no duplicate task, no duplicate PR — D3 requirement #25).
+CREATE TABLE IF NOT EXISTS issue_tasks (
+    repo          TEXT NOT NULL,
+    issue_number  INTEGER NOT NULL,
+    job_id        INTEGER NOT NULL,
+    created_at    REAL,
+    PRIMARY KEY (repo, issue_number)
+);
 """
 
 
@@ -87,13 +99,24 @@ def init_db(path: str) -> sqlite3.Connection:
     os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    # Autocommit (isolation_level=None) so every statement is its own
+    # transaction. This avoids the deferred read-transaction -> write-upgrade
+    # stall that makes concurrent claims pathologically slow under WAL, and
+    # keeps the single-statement atomic claims truly atomic.
+    conn.isolation_level = None
     conn.execute("PRAGMA journal_mode=WAL;")
+    # Concurrent writers (MVP concurrency = 1 per type, but the control plane
+    # still services several short-lived writer connections, and the offline
+    # concurrency test stresses many) must WAIT for the write lock instead of
+    # failing with "database is locked". 15s absorbs brief WAL handoff bursts.
+    conn.execute("PRAGMA busy_timeout=15000;")
     conn.executescript(SCHEMA)
-    conn.commit()
     return conn
 
 
 def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.isolation_level = None
+    conn.execute("PRAGMA busy_timeout=15000;")
     return conn

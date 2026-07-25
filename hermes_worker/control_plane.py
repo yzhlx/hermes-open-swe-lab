@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import time
 import sqlite3
+import functools
 from typing import Optional
 
 from .db import init_db, hash_token
@@ -21,6 +22,31 @@ from .db import init_db, hash_token
 
 class ControlPlaneError(Exception):
     pass
+
+
+def _retry_on_locked(func):
+    """Retry a mutating method when SQLite raises a transient 'database is locked'.
+
+    Under short-lived multi-writer contention (e.g. the concurrency test, or a
+    control plane servicing several workers) a write can still surface a lock
+    error despite ``busy_timeout``. Retrying keeps the operation correct instead
+    of crashing the calling worker. Permanent errors (constraint violations,
+    bad SQL) are re-raised immediately.
+    """
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        last = None
+        for _ in range(300):
+            try:
+                return func(self, *args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "database is locked" in str(exc).lower():
+                    last = exc
+                    time.sleep(0.005)
+                    continue
+                raise
+        raise last
+    return wrapper
 
 
 class ControlPlane:
@@ -94,15 +120,112 @@ class ControlPlane:
 
     # ---------------- jobs ----------------
     def create_job(self, payload: dict, task_id=None, issue_number=None,
-                   pr_number=None, role=None, model=None) -> int:
+                   pr_number=None, role=None, model=None, repo=None) -> int:
         cur = self.conn.execute(
-            """INSERT INTO jobs(task_id, issue_number, pr_number, state, role, model,
+            """INSERT INTO jobs(task_id, repo, issue_number, pr_number, state, role, model,
                payload, retries, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (task_id, issue_number, pr_number, "pending", role, model,
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (task_id, repo, issue_number, pr_number, "pending", role, model,
              json.dumps(payload), 0, self._now()))
         self.conn.commit()
         return cur.lastrowid
+
+    def record_delivery(self, delivery_id: str, now=None) -> bool:
+        """Record a webhook delivery id.
+
+        Returns ``True`` if this is a new delivery (accept), ``False`` if it was
+        seen before (duplicate → caller should treat as idempotent no-op). This
+        is the GitHub ``X-GitHub-Delivery`` dedup store (D3 requirement #3).
+        """
+        try:
+            self.conn.execute(
+                "INSERT INTO deliveries(delivery_id, ts) VALUES (?,?)",
+                (delivery_id, now or self._now()))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def get_job_by_issue(self, repo: str, issue_number: int) -> Optional[int]:
+        """Return the job id bound to ``(repo, issue_number)`` or ``None``.
+
+        Used to enforce one-task-per-issue idempotency (D3 requirement #25).
+        """
+        row = self.conn.execute(
+            "SELECT job_id FROM issue_tasks WHERE repo=? AND issue_number=?",
+            (repo, issue_number)).fetchone()
+        return row["job_id"] if row else None
+
+    def get_job_by_pr(self, repo: str, pr_number: int) -> Optional[int]:
+        """Return the job id for a known PR number, or ``None``."""
+        row = self.conn.execute(
+            "SELECT id FROM jobs WHERE repo=? AND pr_number=?",
+            (repo, pr_number)).fetchone()
+        return row["id"] if row else None
+
+    def create_issue_task(self, repo: str, issue_number: int, payload: dict,
+                          role=None, model=None, task_id=None) -> tuple:
+        """Idempotently bind one job to ``(repo, issue_number)``.
+
+        Returns ``(job_id, created)``. If a task already exists for this issue,
+        the existing ``job_id`` is returned with ``created=False`` (no duplicate
+        task, no duplicate PR). Otherwise a fresh job + ``issue_tasks`` row is
+        created atomically.
+        """
+        existing = self.get_job_by_issue(repo, issue_number)
+        if existing is not None:
+            return existing, False
+        try:
+            cur = self.conn.execute(
+                """INSERT INTO jobs(repo, issue_number, state, role, model,
+                   payload, retries, created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (repo, issue_number, "pending", role, model,
+                 json.dumps(payload), 0, self._now()))
+            jid = cur.lastrowid
+            self.conn.execute(
+                "INSERT INTO issue_tasks(repo, issue_number, job_id, created_at) "
+                "VALUES (?,?,?,?)",
+                (repo, issue_number, jid, self._now()))
+            self.conn.commit()
+            return jid, True
+        except sqlite3.IntegrityError:
+            # Race: another writer inserted the issue_tasks row first.
+            self.conn.rollback()
+            return self.get_job_by_issue(repo, issue_number), False
+
+    def update_job(self, job_id: int, **fields) -> None:
+        """Update arbitrary scalar columns on a job (pr_number, round, ci_status, ...)."""
+        if not fields:
+            return
+        set_cols = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(
+            f"UPDATE jobs SET {set_cols} WHERE id=?",
+            list(fields.values()) + [job_id])
+        self.conn.commit()
+
+    def set_state(self, job_id: int, state: str) -> None:
+        """Move a job to an explicit state (agent_done / in_review / await_user / escalated)."""
+        self.conn.execute("UPDATE jobs SET state=? WHERE id=?", (state, job_id))
+        self.conn.commit()
+
+    def store_agent_result(self, job_id: int, result: dict) -> None:
+        """Record agent output fields without finalizing the job (allows rework).
+
+        List/dict fields (``modified_files``, ``token_usage``) are JSON-encoded
+        because the ``jobs`` columns are TEXT.
+        """
+        upd = {}
+        for k in ("modified_files", "token_usage", "tool_calls", "container_id",
+                  "command", "commit_sha", "ci_status", "model", "role", "pr_number",
+                  "round"):
+            if k in result and result[k] is not None:
+                v = result[k]
+                if k in ("modified_files", "token_usage") and not isinstance(v, str):
+                    v = json.dumps(v)
+                upd[k] = v
+        if upd:
+            self.update_job(job_id, **upd)
 
     def heartbeat(self, token: str, job_id: Optional[int] = None) -> dict:
         h = self._check_token(token)
@@ -131,8 +254,19 @@ class ControlPlane:
         self.conn.commit()
         return {"ok": True, "lease_expires": self._now() + self.lease_seconds}
 
+    @_retry_on_locked
     def reap_expired_leases(self, now: Optional[float] = None) -> int:
         now = now if now is not None else self._now()
+        # Read-first: only take a write lock when there is actually something to
+        # reap. On every claim (which calls reap), fresh leases mean nothing is
+        # expired -> the hot path stays a read and never contends on the write
+        # lock. This is what keeps concurrent claim() fast under WAL.
+        probe = self.conn.execute(
+            "SELECT 1 FROM jobs WHERE state IN ('claimed','running') "
+            "AND lease_expires IS NOT NULL AND lease_expires < ? LIMIT 1",
+            (now,)).fetchone()
+        if not probe:
+            return 0
         cur = self.conn.execute(
             """UPDATE jobs SET state='pending', worker_token_hash=NULL, lease_expires=NULL
                WHERE state IN ('claimed','running') AND lease_expires IS NOT NULL
@@ -141,17 +275,20 @@ class ControlPlane:
         self.conn.commit()
         return cur.rowcount
 
+    @_retry_on_locked
     def claim(self, token: str) -> dict:
         h = self._check_token(token)
         self.reap_expired_leases()
-        # 1) Re-claim an already-owned (claimed/running) job — idempotent.
+        # 1) Re-claim an already-owned (claimed/running/agent_done) job — idempotent.
+        #    'agent_done' is re-claimable so a round-2 rework can pick the same
+        #    task back up after the scheduler signals rework.
         cur = self.conn.execute(
-            "SELECT id FROM jobs WHERE state IN ('claimed','running') "
+            "SELECT id FROM jobs WHERE state IN ('claimed','running','agent_done') "
             "AND worker_token_hash=? LIMIT 1", (h,))
         row = cur.fetchone()
         if row:
             job = self._get_job(row["id"])
-            if job["state"] == "claimed":
+            if job["state"] != "running":
                 self.conn.execute(
                     "UPDATE jobs SET state='running', started_at=COALESCE(started_at,?) "
                     "WHERE id=?", (self._now(), row["id"]))
@@ -159,13 +296,13 @@ class ControlPlane:
             return {"job_id": job["id"],
                     "payload": json.loads(job["payload"] or "{}"),
                     "already_claimed": True}
-        # 2) Atomic claim of a pending job (item 6: no TOCTOU).
+        # 2) Atomic claim of a pending (or agent_done, for rework) job (item 6).
         #    A single UPDATE...RETURNING is serialized by SQLite's write lock,
         #    so two concurrent workers can never grab the same pending job.
         lease = self._now() + self.lease_seconds
         cur = self.conn.execute(
             """UPDATE jobs SET state='running', worker_token_hash=?, lease_expires=?, started_at=?
-               WHERE id = (SELECT id FROM jobs WHERE state='pending'
+               WHERE id = (SELECT id FROM jobs WHERE state IN ('pending','agent_done')
                            ORDER BY created_at ASC LIMIT 1)
                RETURNING id""",
             (h, lease, self._now()))
@@ -206,6 +343,26 @@ class ControlPlane:
             seq += 1
         self.conn.commit()
         return {"ok": True, "accepted": accepted}
+
+    def append_event(self, job_id: int, event: dict) -> None:
+        """Internal event append (no worker-auth) for routing follow-ups.
+
+        Used by the event router to attach an ``issue_comment`` follow-up to an
+        existing issue task. Idempotent by ``event["id"]`` (duplicate comment →
+        no-op). Does NOT require a worker token (it is control-plane-internal).
+        """
+        job = self._get_job(job_id)
+        etype = event.get("type")
+        eid = event.get("id")
+        payload = json.dumps(event.get("payload", {}))
+        try:
+            self.conn.execute(
+                "INSERT INTO events(job_id, event_type, seq, event_id, ts, payload) "
+                "VALUES (?,?,?,?,?,?)",
+                (job_id, etype, 0, eid, self._now(), payload))
+        except sqlite3.IntegrityError:
+            pass  # duplicate follow-up id -> idempotent no-op
+        self.conn.commit()
 
     def _finish(self, token, job_id, final_state, updates: dict) -> dict:
         h = self._check_token(token)

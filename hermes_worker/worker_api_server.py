@@ -30,7 +30,7 @@ from .db import hash_token
 
 
 def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
-                lease_seconds: int = 1200):
+                lease_seconds: int = 1200, broker=None):
     allowed_hashes = {hash_token(t) for t in (allowed_tokens or [])} or None
 
     class Handler(BaseHTTPRequestHandler):
@@ -88,6 +88,19 @@ def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
                 elif path.startswith("/worker/jobs/") and path.endswith("/fail"):
                     jid = int(path.split("/")[-2])
                     res = cp.fail(tok, jid, body.get("error"))
+                elif path.startswith("/internal/task/") and path.endswith("/token"):
+                    jid = int(path.split("/")[-2])
+                    if broker is None:
+                        self._send(501, {"error": "token_broker_unavailable"})
+                        return
+                    # Lease-gated token delivery (D3 requirement #7). The broker
+                    # verifies the worker owns the job lease and the repo is
+                    # allowlisted; the token is returned in-memory only.
+                    try:
+                        token = broker.get_token_for_job(cp, jid, tok)
+                        self._send(200, {"token": token})
+                    except ControlPlaneError as e:
+                        self._send(400, {"error": str(e)})
                 else:
                     self._send(404, {"error": "not_found"})
                     return
@@ -106,7 +119,8 @@ def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
 
 
 def run_server(host="0.0.0.0", port=8080, db_path="runtime/events.db",
-               allowed_tokens=None, replay_window=300, lease_seconds=1200):
+               allowed_tokens=None, replay_window=300, lease_seconds=1200,
+               broker=None):
     """Create and return the Worker API server WITHOUT blocking.
 
     The caller is responsible for starting the serve loop (e.g. in a daemon
@@ -116,7 +130,7 @@ def run_server(host="0.0.0.0", port=8080, db_path="runtime/events.db",
     """
     return ThreadingHTTPServer(
         (host, port),
-        make_handler(db_path, allowed_tokens, replay_window, lease_seconds))
+        make_handler(db_path, allowed_tokens, replay_window, lease_seconds, broker))
 
 
 def main():

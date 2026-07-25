@@ -113,7 +113,7 @@ def test_worker_reconnect_backoff(tmp_path):
 
     stop = threading.Event()
     worker = HermesWorker(f"http://127.0.0.1:{port}", "test-worker-token",
-                          backend=EchoSandboxBackend())
+                          backend=EchoSandboxBackend(), insecure_local_ok=True)
 
     def last_hb():
         import sqlite3
