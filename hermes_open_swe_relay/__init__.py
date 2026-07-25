@@ -11,17 +11,42 @@ No relay URL, key, or model is ever hard-coded here. All values come from
 environment variables (see :mod:`hermes_open_swe_relay.config`).
 """
 
-from .client import RelayClient
-from .config import RelayConfig, RelayConfigError, load_relay_config
+from .client import (
+    DEFAULT_BACKOFF_BASE,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT,
+    RelayClient,
+)
+from .config import (
+    RelayConfig,
+    RelayConfigError,
+    RelayError,
+    RelayInvalidResponseError,
+    RelayRequestError,
+    RelayRetryExhaustedError,
+    RelayTimeoutError,
+    load_relay_config,
+)
 from .redact import redact, redact_headers
+from .streaming import StreamAccumulator, accumulate_chat_stream
 
 __all__ = [
     "RelayConfig",
     "RelayConfigError",
+    "RelayError",
+    "RelayRequestError",
+    "RelayTimeoutError",
+    "RelayRetryExhaustedError",
+    "RelayInvalidResponseError",
     "load_relay_config",
     "RelayClient",
+    "DEFAULT_TIMEOUT",
+    "DEFAULT_MAX_RETRIES",
+    "DEFAULT_BACKOFF_BASE",
     "redact",
     "redact_headers",
+    "StreamAccumulator",
+    "accumulate_chat_stream",
     "build_relay_client",
 ]
 
