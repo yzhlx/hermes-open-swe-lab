@@ -27,7 +27,7 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud)
 | 13 | GitHub App (create + install + scope) | DONE | App `4389778`; installed on smoke-test only; Install ID `148886992` (read-only App auth); scope verified (lab+learning-os 404) |
 | 13b | GitHub App key landing on server | DONE | `hermes-swe` svc user created; key at `/etc/.../secrets/github-app-private-key.pem` (hermes-swe:hermes-swe 600); SHA-256 MATCH; `.env` written; server-side auth verify PASS |
 | 13c | Webhook | OFF | intentionally disabled in MVP; no secret/URL configured |
-| 14 | LangSmith sandbox + trace | NOT_TESTED | user gate (Step 9) |
+| 14 | LangSmith Service Key landing + tracing | PARTIAL | `LANGSMITH_API_KEY` written to server `.env` (hermes-swe 600); read-only auth PASS; exactly 1 workspace `6fa1ef37-…` (Workspace 1 scope); **BLOCKER: Sandboxes API returns HTTP 403** → `STATUS: SANDBOX_ACCESS_REQUIRED` (no snapshot/loop until granted); `LANGSMITH_TENANT_ID_PROD` intentionally unset (orgs endpoint not reliably resolvable for this service key — code tolerates absence; trace URL optional) |
 | 15 | Cloud control plane deploy | NOT_TESTED | needs cloud-server access |
 | 16 | End-to-end loop (Issue→PR→review→rework) | NOT_TESTED | depends on 12–15 |
 | 17 | Draft PR to lab repo | PENDING | Step 12 — after live loop |
@@ -43,8 +43,9 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud)
   passwordless `sudo`); reachable at `129.211.0.213:22`. Dedicated Open SWE
   service user `hermes-swe` (uid 996, system, nologin, no sudo/docker) CREATED —
   the App key is now landed under `/etc/hermes-open-swe-lab/secrets/` owned by it.
-- No real relay API key / GitHub App / LangSmith key present → live runs blocked
-  by design until authorization.
+- GitHub App key + LangSmith Service Key are NOW landed on the server (non-secret
+  `.env` at `/opt/hermes-open-swe-lab/.env`, hermes-swe 600); live runs still blocked
+  on: (a) **Sandboxes API 403** for the LangSmith key, (b) relay creds not yet written.
 
 ## What is safe to do now (autonomous)
 
@@ -58,16 +59,20 @@ Legend: `DONE` · `IN_PROGRESS` · `PENDING` · `NOT_TESTED` (needs auth/cloud)
 - ~~Create the dedicated Open SWE service user~~ — **DONE**: `hermes-swe` (uid 996,
   system, nologin, no sudo/docker) created; App key landed under
   `/etc/hermes-open-swe-lab/secrets/` owned by it. Do NOT reuse Hermes user `ubuntu`.
-- Create LangSmith API key + confirm sandbox permission + create snapshot.
+- ~~Create LangSmith Service Key + land it~~ — **DONE** (credential landed,
+  read-only auth PASS, single workspace `6fa1ef37-…`). **BLOCKER: Sandboxes API
+  HTTP 403** for this key — grant Sandboxes permission (LangSmith plan / workspace
+  setting), then create the sandbox snapshot (`scripts/create_sandbox_snapshot.py`).
 - Write relay Base URL / model / key to `/opt/hermes-open-swe-lab/.env`.
 - Any billing/payment action.
 - Cloud-server SSH access to run the control plane.
 
 ## Last updated
 
-2026-07-25 — GitHub App `4389778` fully landed: dedicated svc user `hermes-swe`
-created (uid 996, system, nologin, no sudo/docker); App key at
-`/etc/hermes-open-swe-lab/secrets/github-app-private-key.pem` (hermes-swe 600);
-SHA-256 MATCH vs local; `/opt/hermes-open-swe-lab/.env` written (non-secret only);
-server-side read-only auth verify PASS (Install ID `148886992`, allowed repo list
-== smoke-test only via installation token, no 404 probing). Webhook OFF.
+2026-07-25 — LangSmith Service Key landed: `LANGSMITH_API_KEY` written to
+`/opt/hermes-open-swe-lab/.env` (hermes-swe 600, merged with GitHub App config,
+no dups); read-only auth PASS (workspaces API → exactly 1 workspace
+`6fa1ef37-de45-4c81-92d4-810d00d58327` = Workspace 1 scope; orgs boundary OK).
+**BLOCKER: Sandboxes API returns HTTP 403** → `STATUS: SANDBOX_ACCESS_REQUIRED`;
+no snapshot/loop until permission granted. Webhook OFF. GitHub App fully landed
+earlier (svc user `hermes-swe`, key at `/etc/.../secrets/`, SHA MATCH).

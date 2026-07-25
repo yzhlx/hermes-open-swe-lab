@@ -32,13 +32,28 @@ secrets in chat.
   only); server-side read-only auth verify PASS (allowed repo list == smoke-test only).
   Webhook intentionally OFF. Key-file adapter added (`scripts/load_github_app_key.py`).
 
+- **LangSmith Service Key landed (auth PASS, Sandboxes BLOCKED)**: key
+  `LANGSMITH_API_KEY` written to server `.env` (hermes-swe 600, merged with the
+  GitHub App config, no duplicate keys); read-only auth PASS — `GET /api/v1/workspaces`
+  returned **exactly 1 workspace** `6fa1ef37-de45-4c81-92d4-810d00d58327` (= Workspace 1
+  scope). **BLOCKER: the Sandboxes API returned HTTP 403** on `GET /v2/sandboxes/boxes`
+  and `GET /v2/sandboxes` → `STATUS: SANDBOX_ACCESS_REQUIRED`. No snapshot or live loop
+  until Sandboxes permission is granted. Webhook OFF.
+
 **GitHub App service user + key landing: DONE.** `hermes-swe` created; key landed;
 `.env` written; server-side auth verify PASS. (Recorded in `GITHUB-APP-SETUP.md`.)
 
 **Still required before the live loop (Step 10):**
 
-2. **LangSmith**: create API key, confirm sandbox permission, build a sandbox
-   snapshot from the pinned Open SWE baseline, set `SANDBOX_TYPE=langsmith`.
+2. **LangSmith Sandboxes permission — BLOCKER (`STATUS: SANDBOX_ACCESS_REQUIRED`)**:
+   the Service Key is created + landed and read-only auth PASSED, but the Sandboxes
+   API returned **HTTP 403**. You must enable Sandboxes access for this key/workspace
+   (the LangSmith plan tier or workspace setting that grants the `sandboxes` scope),
+   then reply `已完成授权`. After permission, the agent builds the snapshot from the
+   pinned baseline (`scripts/create_sandbox_snapshot.py`, image
+   `johanneslangchain/open-swe-sandbox:gh-cli-amd64`) and sets
+   `DEFAULT_SANDBOX_SNAPSHOT_ID`; tracing is already configured
+   (`SANDBOX_TYPE=langsmith`, `LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_PROJECT=open-swe-agent`).
    - → see `LANGSMITH-SETUP.md`.
 
 3. **Relay credentials**: write `OPEN_SWE_OPENAI_BASE_URL`, `OPEN_SWE_OPENAI_MODEL`,
