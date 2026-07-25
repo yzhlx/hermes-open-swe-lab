@@ -1,0 +1,25 @@
+# ============================================================
+# Secrets & credentials (AGENTS.md Section 7)
+# ============================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+
+# ============================================================
+# Local WorkBuddy memory (not project content, not for commit)
+# ============================================================
+.workbuddy/
+
+# ============================================================
+# Session / build artifacts
+# ============================================================
+hermes-eng-auto-architect.zip
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
