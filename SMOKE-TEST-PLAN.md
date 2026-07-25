@@ -20,7 +20,7 @@ The agent creates `automation-smoke-test/README.md`:
 ```markdown
 # Hermes Open SWE Smoke Test
 
-<!-- baseline: round-1 -->
+BASELINE_AUTOMATION_PASSED
 
 <brief description of what this smoke test validates>
 ```
@@ -30,7 +30,7 @@ The independent reviewer comments requesting a confirmation marker. The agent
 amends the same PR's branch to also include:
 
 ```markdown
-<!-- feedback: round-2 -->
+SECOND_ROUND_FEEDBACK_APPLIED
 
 <brief note that the reviewer's feedback was addressed>
 ```
@@ -43,14 +43,25 @@ amends the same PR's branch to also include:
 | Only that file changed | no other file added/modified/deleted |
 | No workflow change | nothing under `.github/workflows/` |
 | First line | `# Hermes Open SWE Smoke Test` |
-| Baseline marker | `<!-- baseline: round-1 -->` |
-| Feedback marker | `<!-- feedback: round-2 -->` |
+| Baseline marker | `BASELINE_AUTOMATION_PASSED` |
+| Feedback marker | `SECOND_ROUND_FEEDBACK_APPLIED` (round 2 only) |
+
+Round model:
+
+- **Round 1** (default): the agent creates the file from the Issue. CI requires
+  the baseline marker only; the feedback marker is **not** forced yet. A plain
+  Draft PR therefore passes before reviewer feedback.
+- **Round 2**: after the reviewer requests the feedback marker, the agent amends
+  the same PR. CI enforces **both** markers. In the smoke-test workflow this is
+  triggered by adding the PR label `round-2` (graceful default to round 1 if the
+  label or `gh` is unavailable).
 
 Run locally or in CI:
 
 ```bash
 python scripts/validate_smoke_contract.py --self-test                 # offline
-python scripts/validate_smoke_contract.py --root . --base B --head H  # CI
+python scripts/validate_smoke_contract.py --root . --base B --head H  # CI (round 1)
+python scripts/validate_smoke_contract.py --root . --base B --head H --round 2  # CI (round 2)
 ```
 
 The CI workflow (`.github/workflows/smoke-contract.yml`) runs on
