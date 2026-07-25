@@ -1,7 +1,22 @@
 # LANGSMITH-SETUP.md — LangSmith sandbox & trace for MVP-0
 
-**Status:** USER ACTION REQUIRED · NOT_TESTED
-**Rule:** `SANDBOX_TYPE=langsmith` is mandatory; `SANDBOX_TYPE=local` is forbidden.
+> ## ⚠️ RETIRED_BY_ARCHITECTURE_DECISION
+> LangSmith has been **removed** from MVP-0 (see `ADR-002-REMOVE-LANGSMITH.md`,
+> 2026-07-25). The org-level Sandboxes feature was disabled
+> (`SANDBOX_ACCOUNT_ENABLEMENT_REQUIRED`) and the user has no payment card to enable
+> it, so the project must not depend on a card-gated execution environment. This file
+> is kept **only as historical evidence** — do not follow these steps. The replacement
+> is the local `HermesDockerSandboxBackend` + SQLite Event Store; see
+> `MVP-0-ARCHITECTURE.md`.
+> **No LangSmith feature was ever verified as "passed" in MVP-0.**
+>
+> **Cleanup done (2026-07-25):** the server `.env` LangSmith vars were deleted, the
+> local temp key file was permanently removed (incl. Recycle Bin), and the LangSmith CLI
+> was removed from the server. The remote Service Key was intentionally NOT revoked
+> (accepted residual risk); revoking it is no longer a gate for any phase.
+
+**(Historical) Status:** USER ACTION REQUIRED · NOT_TESTED
+**(Historical) Rule:** `SANDBOX_TYPE=langsmith` was mandatory; `SANDBOX_TYPE=local` forbidden.
 
 > Instructions for the user. The agent never creates the LangSmith account,
 > holds the API key, or provisions the sandbox. Do **not** paste the key into

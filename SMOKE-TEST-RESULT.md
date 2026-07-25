@@ -73,3 +73,68 @@ The contract uses a round model enforced by the validator's `--round` flag:
   the same PR to also add `SECOND_ROUND_FEEDBACK_APPLIED`. CI (round 2) requires
   **both** markers and **fails** if the feedback marker is missing. Only then is
   the two-round contract fully satisfied. `main` is never merged in MVP-0.
+
+---
+
+## D2.5 — HermesDockerSandboxBackend real Docker daemon validation (2026-07-25)
+
+**Scope:** validate the FULL container lifecycle of `HermesDockerSandboxBackend`
+against the user's LOCAL Docker daemon. No GitHub, no real token, no webhook, no
+relay model, no remote repos, no cloud Docker, no privileged, no Open SWE `local`
+backend.
+
+**Environment**
+- Docker Desktop 4.63.0 (220185); Engine 29.2.1; context `desktop-linux`
+  (Docker Desktop Linux VM, linux/amd64). `DockerRootDir` = `/var/lib/docker`.
+- Test image: `hermes-d2-smoke:local` — `FROM python:3.11-slim` + `git` (+ca-certificates),
+  built locally via the configured DaoCloud mirror. digest
+  `sha256:f32d6f5fe9900b6d06f6eb46e0e8625f3a801a93c46f42d5093292225a0bdb3c`.
+- Harness: `runtime/d2-real-smoke/run_real_smoke.py` (drives the REAL backend,
+  `runner=None` → live `docker` CLI). Report: `runtime/d2-real-smoke/REPORT.json`.
+
+**REAL `docker inspect` limits (proven, not asserted from command strings)**
+| Limit | Value |
+| --- | --- |
+| CPUs | 1.0 (daemon stores as `NanoCpus=1000000000`) |
+| Memory | 2147483648 (2 GB) |
+| PidsLimit | 256 |
+| Privileged | false |
+| NetworkMode | bridge (NOT host) |
+| AutoRemove | true |
+| Mounts | exactly ONE bind: `<workdir> → /workspace` (rw) |
+
+**Lifecycle results (real exit codes)**
+| Step | Result |
+| --- | --- |
+| create | container `hermes-hermes-docker-…` (redacted prefix) |
+| health_check | true |
+| execute | exit 0 (bash 5.2.37, git 2.47.3 present) |
+| write_file / read_file / edit_file | round-trip OK (edited content confirmed) |
+| verify script | exit 0 (`bash repo/verify.sh`) |
+| git_clone (local bare) | exit 0 |
+| git_status / git_diff | exit 0 |
+| git_commit | exit 0 (root-commit on `main`) |
+| git_push → local bare remote | exit 0 (`* [new branch] main -> main`) |
+| bare remote received commit | `c974e59 add README and verify script` (rc 0) |
+| stop | container removed (auto_remove) |
+| delete | `_container` → None; workdir wiped |
+
+**Security / failure scenarios (real)**
+- Container cannot see host docker.sock, SSH keys, or `.env`
+  (`ls /var/run/docker.sock`, `/root/.ssh` → No such file).
+- Failed exec records exit code (`sys.exit(7)` → 7).
+- Timeout command killed (host-side subprocess timeout) → exit 124; container
+  still cleaned on `delete()` (no residual).
+- Path escape (`../../escape.txt`) **rejected** by backend `_safe_path()` guard
+  (host FS escape prevention).
+- `_calls` log contains no `GITHUB_TOKEN=` / `.pem` / `Authorization`.
+- **Residual containers after run: 0.**
+- Runtime: 12.08 s.
+
+**Regression fix from this test**
+- `HermesDockerSandboxBackend._safe_path()` added: rejects `..` / absolute paths
+  that escape the workspace (write/read/edit). Regression test:
+  `tests/test_d2_sandbox.py::test_11_path_escape_rejected`.
+
+**Test result:** D1 7/7 + D2 offline 11/11 = **18/18 PASS**; D2 real Docker smoke
+**PASS**. D2 completion CLAIMED for the real-lifecycle criterion.

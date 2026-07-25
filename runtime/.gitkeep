@@ -1,0 +1,4 @@
+# Runtime artifacts directory.
+# events.db (SQLite task queue + Event Store) and runs/*.jsonl are generated at
+# runtime and are git-ignored (see .gitignore). This file keeps the directory
+# in version control.

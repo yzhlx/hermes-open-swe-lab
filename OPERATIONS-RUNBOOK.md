@@ -11,9 +11,10 @@ never merged automatically.
    - control-plane process up; webhook receiving pings.
 2. **Trigger** a run by opening a GitHub Issue on `yzhlx/hermes-open-swe-smoke-test`
    describing the required file change.
-3. **Observe** via LangSmith traces + the smoke-test repo PR/Checks.
-4. **Collect evidence**: PR number, check-run result, trace IDs, head SHAs,
-   changed-file list.
+3. **Observe** via the SQLite Event Store (`runtime/events.db`) + the smoke-test
+   repo PR/Checks. (LangSmith is RETIRED — ADR-002; observability is the Event Store.)
+4. **Collect evidence**: PR number, check-run result, worker/event trace IDs,
+   head SHAs, changed-file list.
 
 ## Test sequence (must not skip steps — MVP-0 Step 10)
 
@@ -74,14 +75,16 @@ No unlimited loops. After the budget, stop and preserve evidence.
   after the flow entered FEEDBACK_REQUESTED/REWORK_RUNNING; round 2 must stop,
   never degrade to round 1.
 - `REVIEW_FAILED` — reviewer loop exhausted.
-- `SANDBOX_ACCESS_REQUIRED` — LangSmith sandbox unavailable.
+- `SANDBOX_ACCESS_REQUIRED` — Docker sandbox unavailable (daemon down / container
+  launch failed). (LangSmith sandbox is RETIRED — ADR-002.)
 - `SERVER_RESOURCE_LIMIT` — Hermes health at risk.
 - `SECURITY_BOUNDARY_VIOLATION` — any boundary breach.
 
 ## Logs & traces
 
 - Control-plane logs: `/opt/hermes-open-swe-lab/logs/` (no secrets).
-- LangSmith traces: project `hermes-open-swe-mvp0`.
+- Observability: SQLite Event Store (`runtime/events.db`) + `runtime/runs/*.jsonl`
+  (no secrets; LangSmith RETIRED per ADR-002).
 - Evidence report: `OPEN-SWE-PHASE-1-RESULT.md` (updated each run).
 
 ## Shutdown
@@ -89,3 +92,46 @@ No unlimited loops. After the budget, stop and preserve evidence.
 - Stop the control-plane process; close the ngrok tunnel.
 - Leave the Draft PR open/unmerged; do not delete the branch.
 - No production Hermes component is touched.
+
+---
+
+## D2.5 — local Docker sandbox validation (no GitHub / no token)
+
+Run this on the operator's LOCAL machine with Docker Desktop running. It
+validates the real container lifecycle of `HermesDockerSandboxBackend` end to
+end using only a local bare git remote — no GitHub, no real token, no webhook,
+no relay model, no remote repo.
+
+**Prereqs**
+- Docker Desktop started (daemon reachable: `docker info` returns Server).
+- Local image with `bash` + `git`: `docker build -t hermes-d2-smoke:local
+  -f runtime/d2-smoke-Dockerfile runtime/` (FROM `python:3.11-slim` + `git`).
+- Never bypass via cloud Docker, remote socket, privileged, or Open SWE `local`.
+
+**Run**
+```bash
+python runtime/d2-real-smoke/run_real_smoke.py
+# -> runtime/d2-real-smoke/REPORT.json  (pass: true expected)
+```
+
+**What it proves (real `docker inspect`, not just command strings)**
+- Limits: cpus=1, mem=2GB, pids=256, privileged=false, net=bridge, auto-remove,
+  single workdir bind mount.
+- Lifecycle: create→health→execute→write/read/edit→git clone/status/diff/
+  commit→push to local bare→stop→delete.
+- Security: no docker.sock/SSH/.env visible; failed exec records exit code;
+  timeout→124 + cleaned; `../` path escape rejected; no token/PEM/Auth in logs;
+  0 residual containers.
+
+**Troubleshoot**
+- `USER_ACTION_REQUIRED` if `docker info` cannot reach the daemon → start Docker
+  Desktop (or enable WSL Docker integration). Do NOT install Docker on the cloud
+  server or expose the socket.
+- A `../` path or absolute path to `write_file`/`read_file`/`edit_file` raises
+  `PermissionError` (host FS escape guard) — this is expected and correct.
+- Commit needs staging: the protocol `commit()` is a thin wrapper; the agent
+  stages via `execute("git -C <repo> add -A")` first (mirrored in the harness).
+
+**Cleanup**
+- The harness deletes every container it creates and wipes the host workdir.
+- Verify `docker ps -a --filter name=hermes-` is empty after the run.

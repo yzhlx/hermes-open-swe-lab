@@ -39,6 +39,16 @@
 - Relay adapter + 17 offline tests PASS.
 - Provider preflight script (graceful `NOT_TESTED` without creds).
 - Smoke-test repo created (private) + strict contract + verified validator.
+- **Phase D0/D1: cloud control plane + local Worker + `EchoSandboxBackend`** —
+  7 offline tests PASS.
+- **Phase D2: `HermesDockerSandboxBackend`** — 11 offline tests PASS; **D2.5 real
+  Docker daemon validation PASS** (2026-07-25): full container lifecycle against
+  the user's local Docker Desktop (Engine 29.2.1), `docker inspect` proves REAL
+  limits (cpus=1, mem=2GB, pids=256, privileged=false, net=bridge, auto-remove,
+  single workdir mount), local bare-remote push received commit `c974e59`, 0
+  residual containers, no secret in logs. Real-test-driven fix: `_safe_path()`
+  workspace-containment guard (+ regression test). D1 7/7 + D2 offline 11/11 +
+  D2 real smoke all PASS.
 - Full MVP-0 documentation set (16+ docs).
 
 ## Blockers to `PHASE_1_PASS`
