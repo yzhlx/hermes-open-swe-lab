@@ -47,11 +47,11 @@ V1 工作空间由 6 个逻辑层组成。每一层都有明确的职责边界�
 ### 1.2 `Hermes Engineering Controller` —— 工程控制层（权威大脑）
 
 **职责 ( owns ):**
-- `Master` 决策（对应角色 `Hermes Master / Boss`）
-- `Scheduler`（对应角色 `Planner / Scheduler`，与 `constants.py` 的 `ROLE_SCHEDULER` 对齐）
+- `Hermes Master / Boss` 顶层决策（对应角色 `Hermes Master / Boss`）
+- `Planner / Scheduler` 调度（对应角色 `Planner / Scheduler`，与 `constants.py` 的 `ROLE_SCHEDULER` 对齐）
 - 权限 (`permissions`) 与授权门禁 (`authorization gates`)
 - 状态机 (`state machine`)：任务生命周期、返工循环
-- `Reviewer` 循环（对应角色 `Independent Reviewer`，与 `constants.py` 的 `ROLE_REVIEWER` 对齐；`MAX_ROUNDS=2`、`ROUND2_LABEL="round-2"`）
+- `Independent Reviewer` 循环（对应角色 `Independent Reviewer`，与 `constants.py` 的 `ROLE_REVIEWER` 对齐；`MAX_ROUNDS=2`、`ROUND2_LABEL="round-2"`）
 - 返工 (`rework`) 编排
 - 证据门禁 (`evidence gates`)：每次 PASS 必须可追溯到 GitHub 记录/SHA/check-run
 - 人工介入中心 (`intervention center`)：创建并绑定 `USER_ACTION_REQUIRED` 请求（见 `ACTIVITY-AND-INTERVENTION-EVENT-MODEL.md`）
@@ -110,7 +110,7 @@ V1 工作空间由 6 个逻辑层组成。每一层都有明确的职责边界�
 
 ```text
 Human Owner ──授权/验收──▶ Hermes Engineering Controller
-                                │ (Master/Scheduler/Reviewer/Rework/Evidence Gate)
+                                │ (Hermes Master / Boss / Planner / Scheduler / Independent Reviewer / Rework / Evidence Gate)
                                 │
             ┌───────────────────┼───────────────────────────┐
             ▼                   ▼                            ▼
@@ -136,7 +136,7 @@ Human Owner ──授权/验收──▶ Hermes Engineering Controller
 | # | V1 能力 | 主负责层 | 协作层 | 说明 |
 |---|---------|---------|--------|------|
 | 1 | 人类与多个 Agent 共用工作空间 | `Buzz Workspace` + `Hermes Engineering Controller` | `Human Owner` | 人类与 Agent 在同一频道/Canvas 协作；权威角色定义仍在 Hermes 控制层 |
-| 2 | Agent Persona 与 Agent Team 角色分工 | `Hermes Engineering Controller`（权威定义） | `Buzz Workspace`（仅展示/运行容器） | Persona/Team 是展示与运行容器；`ROLE-AND-PERMISSION-MODEL.md` 定义权威 13 字段 |
+| 2 | Agent Persona 与 Agent Team 角色分工 | `Hermes Engineering Controller`（权威定义） | `Buzz Workspace`（仅展示/运行容器） | Persona/Team 是展示与运行容器；`ROLE-AND-PERMISSION-MODEL.md` 定义权威 14 字段（见其 §2 字段规范 #1–#14） |
 | 3 | `Agent Activity Feed` | `Hermes Engineering Controller`（事件生产/存储） | `Buzz Workspace`（展示） | 21 类事件模型见 `ACTIVITY-AND-INTERVENTION-EVENT-MODEL.md` |
 | 4 | 人工介入与授权中心 | `Hermes Engineering Controller`（控制） | `Buzz Workspace`（显示/通知） | `USER_ACTION_REQUIRED` 模型；GitHub/Hermes 为权威 |
 | 5 | `Canvas` 共享动态文档 | `Hermes Engineering Controller`（内容权威/可重建） | `Buzz Workspace`（展示） | Canvas 12 字段模板见路线文档；不得为唯一证据源 |

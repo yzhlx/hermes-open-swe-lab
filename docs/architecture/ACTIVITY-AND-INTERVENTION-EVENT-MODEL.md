@@ -62,9 +62,19 @@
 | 18 | `REVIEW_PASSED` | 审查通过 | `success` | `review` |
 | 19 | `USER_ACTION_REQUIRED` | 需人工介入（见 §2 原因枚举） | `blocked` | 视原因（`pr`/`issue`/—） |
 | 20 | `TASK_BLOCKED` | 任务阻塞（无法自动继续） | `blocked` | `issue` |
-| 21 | `TASK_COMPLETED` | 任务达终态（含待用户验收） | `success` | `pr`/`issue` |
+| 21 | `TASK_COMPLETED` | 任务达终态（须 `FINAL_ACCEPTANCE` 完成后方可触发/归档，不得早于最终验收） | `success` | `pr`/`issue` |
 
 > 说明：事件名的英文原名原样保留；中文注释仅作说明。`REWORK` 复用 `ROUND2_LABEL="round-2"` 信号（仅 `Planner / Scheduler` 可加标签）。
+
+### 1.2.1 统一任务生命周期 (Canonical Task Lifecycle)
+
+全系统唯一遵循的任务生命周期（任何角色/文档不得改写顺序）：
+
+`Issue → Plan → Code/Test → Commit → controlled delivery (push + Draft PR via `DeliveryController.deliver()`) → CI → Independent Review → rework on same PR (若 `REQUEST_CHANGES`，受 `MAX_ROUNDS=2`) → FINAL_ACCEPTANCE (Human Owner) → TASK_COMPLETED`
+
+- **Draft PR 的唯一负责方是 `DeliveryController.deliver()`（受控交付）。** `Coding Worker` 触发受控交付；`Release Agent` 编排交付但**不得重复声明创建 Draft PR**。
+- `Independent Review` 必须在既有 Draft PR 上进行（Review 不先于 PR 存在）。
+- `TASK_COMPLETED` 只能在 `FINAL_ACCEPTANCE` 完成后触发（见 §1.2 #21）。
 
 ### 1.3 默认展示策略 (Default Display Policy)
 

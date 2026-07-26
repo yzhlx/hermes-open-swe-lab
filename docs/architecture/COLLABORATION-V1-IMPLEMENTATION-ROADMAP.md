@@ -44,6 +44,7 @@
 - **回滚:** 文档未提交，删除即可。
 - **是否需要用户操作:** 否（仅评审）。
 - **是否阻塞下一阶段:** 是。
+- **本 PR 定位:** 本批 5 份文档（PR #8）即 **Phase A 的交付物**（协作外壳静态设计）。评审通过并合并后 Phase A 视为完成；**下一阶段为 Phase B**（Hermes 控制层 Scheduler/Reviewer/Rework 闭环实现），不在本 PR 内开展 Phase B。
 
 ### `Phase B` — Hermes 控制层 Scheduler / Reviewer / Rework 闭环
 
@@ -60,14 +61,26 @@
 ### `Phase C` — Buzz 工作空间适配器
 
 - **目标:** 实现 Buzz 作为交互/展示层适配器，承载频道、角色展示、Activity Feed 显示、Canvas 展示、搜索聚合、通知（见 `BUZZ-INTEGRATION-BOUNDARY.md` §2）。
-- **修改范围:** 新增 Buzz 适配器模块（仅接口/订阅/渲染）；**不安装/不运行/不 Fork Buzz 后端**，仅完成边界与契约；借鉴 Buzz"分支即频道"的交互设计但**不作为权威状态**。
+- **修改范围:** 新增 Buzz 适配器模块（仅接口/订阅/渲染）；**不安装/不运行/不 Fork Buzz 后端**，仅完成边界与契约（contract-only）；借鉴 Buzz"分支即频道"的交互设计但**不作为权威状态**。真实 Buzz 实例的部署/账号/连接由独立的 **Buzz 接入门禁** 控制（见下文）。
 - **前置条件:** Phase A 展示契约定稿；Buzz 边界文档确认。
 - **验收标准:** Buzz 仅展示来自 Hermes 控制层/GitHub 的权威数据；不持有凭据；不引入第二事实源；`USER_ACTION_REQUIRED` 通知可达 `Human Owner`。
 - **测试:** 适配器契约测试（数据来源断言、脱敏断言、无写 GitHub 断言）。
 - **风险:** 误把 Buzz 当权威 → 由边界文档与测试双重约束；Buzz Workflow Approval Executor 不得作生产门禁。
 - **回滚:** 适配器为新增模块，删除/禁用即可。
-- **是否需要用户操作:** 否（接入配置由主理人后续处理）。
+- **是否需要用户操作:** 否（真实 Buzz 部署/账号/连接由 **Buzz 接入门禁** 控制，需 Human Owner 操作，见下文）。
 - **是否阻塞下一阶段:** 否（可与 D/E 并行；但显示能力依赖 A/B 数据）。
+
+### Buzz 接入门禁 (Buzz Integration Gate)
+
+弥合 **Phase C（仅契约/适配器边界，不部署真实 Buzz 后端）** 与 **Phase G（真实 Buzz 工作空间试用）** 之间的缺口。Phase C 不部署真实 Buzz；在进入 Phase G 真实试用前，必须满足 `BUZZ_ENV_READY` 门禁（需 Human Owner 操作，原因 `EXTERNAL_ACCOUNT_SETUP`）：
+
+1. Buzz 后端已部署或提供可达实例（部署/连接账号已就绪）；
+2. 账号与 Workspace / 频道 / 连接已建立；
+3. 凭据经服务端 `.env`（不在聊天 / Issue / PR 传递）；
+4. 连接与通知链路经冒烟验证（`USER_ACTION_REQUIRED` 可达 `Human Owner`）。
+
+- 门禁未通过前，Phase G 不得开始真实 Buzz 试用（可用静态 / 模拟契约验证替代）。
+- 明确：**本设计分支（PR #8）不部署 Buzz**；Buzz 真实接入属后续实施阶段，受此门禁控制。
 
 ### `Phase D` — ACP Runtime Adapter
 
@@ -95,7 +108,9 @@
 
 ### `Phase F` — Smoke Test 真实闭环
 
-- **目标:** 在 `ALLOWED_GITHUB_REPOS`（`yzhlx/hermes-open-swe-smoke-test`）跑通人类+多 Agent 协作的完整闭环：Issue→计划→编码→CI→Review→(rework)→Draft PR→User Acceptance。
+- **目标:** 在 `ALLOWED_GITHUB_REPOS`（`yzhlx/hermes-open-swe-smoke-test`）跑通人类+多 Agent 协作的完整闭环，统一生命周期：
+  `Issue → Plan → Code/Test → Commit → controlled delivery (push + Draft PR via `DeliveryController.deliver()`) → CI → Independent Review → rework on same PR (若 `REQUEST_CHANGES`，受 `MAX_ROUNDS=2` 约束) → FINAL_ACCEPTANCE (Human Owner) → TASK_COMPLETED`。
+  （注意：Draft PR 必须先于 Independent Review 存在，Review 在既有 PR 上进行，不在开 PR 之前。）
 - **修改范围:** 端到端编排；严格沿用 `delivery.py` 纪律（Draft PR 强制、永不 merge、幂等）；不触碰 `PROTECTED_REPOS`。
 - **前置条件:** Phase B/D/E 完成且测试绿；凭据已落服务端 `.env`（用户操作）。
 - **验收标准:** 真实 Draft PR 创建于 smoke-test 仓库；`main` 不变；无自动 merge；证据齐全可溯源；`USER_ACTION_REQUIRED` 正确触发并去重。
@@ -109,7 +124,7 @@
 
 - **目标:** 人类与多个 Agent 在 Buzz 工作空间真实试用，收集体验反馈并迭代协作外壳（频道/Canvas/Activity Feed/搜索）。
 - **修改范围:** 以配置/模板/展示优化为主；不破坏权威边界。
-- **前置条件:** Phase F 真实闭环通过。
+- **前置条件:** Phase F 真实闭环通过，且 **Buzz 接入门禁（`BUZZ_ENV_READY`）通过**（真实 Buzz 实例可达、账号 / 连接就绪）。
 - **验收标准:** 人类可在 `#user-action-required` 完成授权/验收；多角色协作无歧义；搜索与 Canvas 溯源清晰。
 - **测试:** 用户体验走查 + 关键路径回归（不放松既有测试）。
 - **风险:** 体验优化误改权威路径 → 任何权威变更须回 Phase A/B 评审。
@@ -134,18 +149,18 @@
 | 频道 | 可进入 (Enter) | 可发言 (Speak) | 只读 (Read-only) |
 | --- | --- | --- | --- |
 | `#control-room` | `Human Owner`, `Hermes Master / Boss`, `Planner / Scheduler` | 上述三者 | 其他角色（观察） |
-| `#planning` | 全部 8 角色 | `Human Owner`, `Master/Boss`, `Planner/Scheduler`, `Documentation Agent` | 其余（观察） |
-| `#implementation` | 全部 | `Coding Worker`, `QA Agent`, `Documentation Agent`, `Planner/Scheduler` | 其余（观察） |
-| `#review` | 全部 | `Independent Reviewer`, `Planner/Scheduler`, `Human Owner` | 其余（观察，含 `Coding Worker` 不得自审发言） |
-| `#qa` | 全部 | `QA Agent`, `Coding Worker`, `Planner/Scheduler` | 其余（观察） |
-| `#release` | 全部 | `Release Agent`, `Planner/Scheduler`, `Human Owner` | 其余（观察） |
+| `#planning` | 全部 8 角色 | `Human Owner`, `Hermes Master / Boss`, `Planner / Scheduler`, `Documentation Agent` | 其余（观察） |
+| `#implementation` | 全部 | `Coding Worker`, `QA Agent`, `Documentation Agent`, `Planner / Scheduler` | 其余（观察） |
+| `#review` | 全部 | `Independent Reviewer`, `Planner / Scheduler`, `Human Owner` | 其余（观察，含 `Coding Worker` 不得自审发言） |
+| `#qa` | 全部 | `QA Agent`, `Coding Worker`, `Planner / Scheduler` | 其余（观察） |
+| `#release` | 全部 | `Release Agent`, `Planner / Scheduler`, `Human Owner` | 其余（观察） |
 | `#user-action-required` | `Human Owner` + 发起角色 | `Human Owner`（响应）、发起角色（说明） | 其余（观察） |
-| `#task-<task-id>` | 该任务相关角色（`Coding Worker`/`QA Agent`/`Reviewer`/`Scheduler`/`Master`/`Human Owner`） | 任务相关角色 | 其他（观察） |
+| `#task-<task-id>` | 该任务相关角色（`Coding Worker`/`QA Agent`/`Independent Reviewer`/`Planner / Scheduler`/`Hermes Master / Boss`/`Human Owner`） | 任务相关角色 | 其他（观察） |
 
 ### 3.3 生命周期与映射 (Lifecycle & Mapping)
 
 - **临时频道创建:** `TASK_STARTED` 时由控制层申请创建 `#task-<task-id>`。
-- **归档:** `TASK_COMPLETED` 且（如适用）`FINAL_ACCEPTANCE` 后归档；归档前内容须已同步权威记录。
+- **归档:** `FINAL_ACCEPTANCE` 完成后方可触发 `TASK_COMPLETED` 并归档；归档前内容须已同步权威记录。
 - **频道消息 → GitHub 映射:**
   - 计划/范围讨论 → `PLAN_UPDATED` 事件 + GitHub Issue 备注（须同步）。
   - 代码/测试结论 → `FILE_MODIFIED`/`TEST_FINISHED`/`COMMIT_CREATED` 事件 + GitHub Commit/Check。
@@ -178,7 +193,7 @@ Canvas 是**协作展示层**，12 字段如下（英文原名原样，全文档
 - Canvas（12 字段）
 - Hermes 状态事件（21 类 Activity 事件）
 - GitHub：`Issue` / `Commit` / `Draft PR` / `CI Check` / `Review`
-- 审计文档（`docs/audits/*`、本批架构文档）
+- 审计文档（位于复用审计分支 **PR #7** 的 `docs/audits/*`；本设计分支（PR #8）基于更早的 `d4-delivery-layer`，已**内联**复用结论，不重复依赖该路径。集成顺序见下文"PR 堆叠与 Rebase 顺序"。）
 - 运行报告（`runtime/runs/*.jsonl`、交付/评审报告）
 
 **检索证据优先级 (Evidence Priority — 全文档一致):**
@@ -260,3 +275,14 @@ Canvas 是**协作展示层**，12 字段如下（英文原名原样，全文档
 - **凭据隔离:** 令牌仅 push 步骤局部注入并丢弃；MCP 默认不暴露密钥。
 - **无第二事实源:** 频道/Canvas/搜索/Buzz 均为协作/聚合层；权威结论回 GitHub 或控制层。
 - **不开发 HLO:** Hermes Learning OS 当前未激活（Activation Gate 6 前置），本阶段不开发。
+
+## 9. PR 堆叠与 Rebase 顺序 (Stacked PR Integration Order)
+
+本设计（PR #8）与复用审计（PR #7）为**堆叠 PR**，共同基准为 `d4-delivery-layer`：
+
+1. **PR #7（审计）先合并**进入共同基准 `d4-delivery-layer`；
+2. **PR #8（设计）随后 rebase / merge 到更新后的基准**再合并；
+3. 合并前 PR #8 须 rebase 到 PR #7 合并后的 `d4-delivery-layer` HEAD，解决任何冲突；
+4. PR #6（`d4-delivery-layer`→`d3-design`）、PR #7、PR #8 均保持 **Draft / 不合并**，直至主理人按此顺序推进。
+
+设计文档已内联审计结论，故 PR #8 不硬依赖 `docs/audits/*` 路径存在；若需引用原始审计文档，须先完成步骤 1–2。

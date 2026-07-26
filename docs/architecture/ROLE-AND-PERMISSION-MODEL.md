@@ -131,7 +131,7 @@
 | 输入契约 | `AgentRuntimeAdapter.submit_task()` 派发的任务 + 受控授权 `DeliveryAuthorization`（`GRANT_PUSH_AND_DRAFT_PR`，task+repo+commit 绑定）。 |
 | 输出契约 | 提交 SHA、Draft PR URL、测试结果；通过 Activity 事件（`COMMIT_CREATED`/`PUSH_COMPLETED`/`DRAFT_PR_CREATED` 等）回流。 |
 | 任务开始条件 | Scheduler 派发且获得有效 `DeliveryAuthorization`。 |
-| 完成条件 | Draft PR 已创建且 CI 触发；状态写入控制层与 GitHub。 |
+| 完成条件 | 经 `delivery.py` 的 `DeliveryController.deliver()` 完成受控交付（push + Draft PR 创建，唯一负责方），CI 已触发；状态写入控制层与 GitHub。 |
 | 失败和升级路径 | CI/Review 失败 → 进入 `REWORK_STARTED`（受 `MAX_ROUNDS` 约束）；超限升级 `Human Owner`。 |
 | 是否允许修改代码 | 是（仅允许仓库、仅目标分支） |
 | 是否允许操作 GitHub | 仅经授权（经 `delivery.py`：push + Draft PR，永不 merge） |
@@ -167,7 +167,7 @@
 | 允许写入的位置 | 仅 `ALLOWED_GITHUB_REPOS` 的目标分支（如追加测试）；Canvas 的 `Evidence`/`Current Status`。 |
 | 禁止操作 | 不得触碰 `PROTECTED_REPOS`；不得 merge；不得持有凭据；不得绕过 `delivery.py`。 |
 | 输入契约 | Scheduler 派发的 QA 任务 + 受控授权。 |
-| 输出契约 | 测试结论、证据链接（`workspace_get_evidence`）；通过 `TEST_PASSED`/`TEST_FAILED`（映射到 `TEST_FINISHED` 状态）事件回流。 |
+| 输出契约 | 测试结论、证据链接（`workspace_get_evidence`）；通过 `TEST_FINISHED(status=success|failure)` 事件回流（权威事件名见 `ACTIVITY-AND-INTERVENTION-EVENT-MODEL.md` §1.2 #8，禁止使用 `TEST_PASSED`/`TEST_FAILED`）。 |
 | 任务开始条件 | Master/Scheduler 派发 QA 阶段任务。 |
 | 完成条件 | 验收标准验证完毕且证据已记录。 |
 | 失败和升级路径 | 验收不通过 → 升级 Scheduler 触发返工；阻塞则升级 `Human Owner`。 |
@@ -207,7 +207,7 @@
 | 输入契约 | 已完成 Review 的任务 + 有效 `DeliveryAuthorization`。 |
 | 输出契约 | 交付状态（`DRAFT_PR_CREATED`/幂等结果）、待用户动作（如 `FINAL_ACCEPTANCE`/`PRODUCTION_RELEASE`）经 `workspace_request_user_action` 回流。 |
 | 任务开始条件 | Review 通过且 Scheduler 移交交付阶段。 |
-| 完成条件 | Draft PR 已创建且状态持久化；若需发布则发 `USER_ACTION_REQUIRED` 给 `Human Owner`。 |
+| 完成条件 | 受控交付已编排，Draft PR 生命周期由 `delivery.py` 管理；**Draft PR 的创建唯一由 `DeliveryController.deliver()` 负责，Release Agent 不得重复声明创建 Draft PR**。若后续需发布则发 `USER_ACTION_REQUIRED` 给 `Human Owner`。 |
 | 失败和升级路径 | 交付失败（凭据/分支/冲突）→ fail-closed 终止并升级 `Human Owner`。 |
 | 是否允许修改代码 | 否 |
 | 是否允许操作 GitHub | 仅经授权（经 `delivery.py`：Draft PR，永不 merge） |
