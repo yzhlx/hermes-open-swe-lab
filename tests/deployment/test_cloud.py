@@ -87,6 +87,26 @@ def _grant_traversal(path):
         d = parent
 
 
+def _make_source_executable(repo):
+    """Make the source tree's shell scripts executable inside the test repo.
+
+    rollback_control_plane.sh exec's `$SRC/scripts/deploy_control_plane.sh`
+    directly (not via `bash`), so the source script must carry an execute bit.
+    In the git checkout the script is 0644, and under the root-run privileged
+    suite the temp repo is root-owned, so even root cannot exec a file without
+    an execute bit. Chmod the source scripts to 0755 in the test's temp repo
+    only — this does NOT modify the production repository.
+    """
+    for name in ("deploy_control_plane.sh", "check_config.sh",
+                 "rollback_control_plane.sh"):
+        p = os.path.join(str(repo), "scripts", name)
+        if os.path.exists(p):
+            try:
+                os.chmod(p, 0o755)
+            except OSError:
+                pass
+
+
 def _posix(p):
     return str(p).replace("\\", "/")
 
@@ -320,6 +340,7 @@ def test_log_rotation(tmp_path):
 def test_deploy_idempotency(tmp_path):
     repo = build_git_repo(tmp_path)
     _grant_traversal(tmp_path)
+    _make_source_executable(repo)
     sha_a = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo),
                            capture_output=True, text=True).stdout.strip()
     app_home = tmp_path / "install"
@@ -347,6 +368,7 @@ def test_deploy_idempotency(tmp_path):
 def test_rollback(tmp_path):
     repo = build_git_repo(tmp_path)
     _grant_traversal(tmp_path)
+    _make_source_executable(repo)
     (repo / "deploy" / "DEPLOY_MARKER").write_text("A")
     sha_a = commit(repo, "marker A")
     (repo / "deploy" / "DEPLOY_MARKER").write_text("B")
