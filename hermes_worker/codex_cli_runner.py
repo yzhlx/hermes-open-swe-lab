@@ -275,6 +275,8 @@ class CodexCliRunner:
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
         }
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP

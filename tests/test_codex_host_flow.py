@@ -61,6 +61,7 @@ class FakePopen:
         self.final_message = final_message
         self.on_communicate = on_communicate
         self.args = None
+        self.kwargs = None
         self.cwd = None
         self.env = None
         self.stdin = None
@@ -69,6 +70,7 @@ class FakePopen:
 
     def __call__(self, args, **kwargs):
         self.args = list(args)
+        self.kwargs = dict(kwargs)
         self.cwd = kwargs["cwd"]
         self.env = dict(kwargs["env"])
         output_path = Path(args[args.index("--output-last-message") + 1])
@@ -139,6 +141,8 @@ class CodexCliRunnerTests(unittest.TestCase):
             self.assertFalse(result.timed_out)
             self.assertEqual(fake.stdin, "implement from stdin")
             self.assertEqual(fake.cwd, str(repo.resolve()))
+            self.assertEqual(fake.kwargs["encoding"], "utf-8")
+            self.assertEqual(fake.kwargs["errors"], "replace")
             self.assertEqual(fake.args[0:2], ["codex-test", "exec"])
             for arg in ("--sandbox", "workspace-write", "--ephemeral", "--json",
                         "--output-last-message", "-"):
