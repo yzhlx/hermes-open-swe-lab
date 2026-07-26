@@ -125,6 +125,155 @@ class CodexJobRunner:
         finally:
             cp.conn.close()
 
+    def run_local(
+        self,
+        job_id: int,
+        worker_token: str,
+        repo_path: Path,
+        task: str,
+        test_command: str,
+        timeout_seconds: int,
+    ) -> CodexJobResult:
+        """Run an existing local-fixture Job without GitHub delivery actions."""
+        repo_path = Path(repo_path).resolve()
+        if not repo_path.is_dir() or not (repo_path / ".git").is_dir():
+            raise ControlPlaneError("local_repository_unavailable")
+
+        self.cp.claim_job(worker_token, job_id)
+        stop = threading.Event()
+        keepalive = threading.Thread(
+            target=self._lease_loop,
+            args=(job_id, worker_token, stop),
+            daemon=True,
+        )
+        keepalive.start()
+
+        try:
+            self._transition(job_id, worker_token, "CODEX_RUNNING")
+            codex_result = self.codex.run(
+                repo_path, task, timeout_seconds
+            )
+            self.cp.append_event(job_id, {
+                "type": "codex_result",
+                "payload": {
+                    "exit_code": codex_result.exit_code,
+                    "timed_out": codex_result.timed_out,
+                    "duration_seconds": codex_result.duration_seconds,
+                    "stdout_summary": codex_result.stdout_summary,
+                    "stderr_summary": codex_result.stderr_summary,
+                    "changed_files": codex_result.changed_files,
+                    "command": codex_result.command_redacted,
+                },
+            })
+            if codex_result.exit_code != 0:
+                return self._finish(
+                    job_id, worker_token, "CODEX_FAILED",
+                    repo_path=repo_path,
+                    result={
+                        "exit_code": codex_result.exit_code,
+                        "modified_files": codex_result.changed_files,
+                        "command": codex_result.command_redacted,
+                        "role": ROLE_CODING_AGENT,
+                    },
+                    error=codex_result.stderr_summary or "codex_failed",
+                )
+
+            changed_files = self.git.changed_files(repo_path)
+            self.cp.append_event(job_id, {
+                "type": "inspect_changes",
+                "payload": {"changed_files": changed_files},
+            })
+            if not changed_files:
+                return self._finish(
+                    job_id, worker_token, "CODEX_NO_CHANGES",
+                    repo_path=repo_path,
+                    result={
+                        "exit_code": 0,
+                        "modified_files": [],
+                        "command": codex_result.command_redacted,
+                        "role": ROLE_CODING_AGENT,
+                    },
+                )
+
+            self._transition(job_id, worker_token, "TESTING", {
+                "command": redact(test_command),
+            })
+            docker = self.docker_backend_factory(repo_path)
+            test_result = docker.run_tests(
+                test_command, timeout=timeout_seconds
+            )
+            self.cp.append_event(job_id, {
+                "type": "docker_test_result",
+                "payload": {
+                    "image_id": test_result.image_id,
+                    "container_id": test_result.container_id,
+                    "command": test_result.command,
+                    "exit_code": test_result.exit_code,
+                    "passed": test_result.passed,
+                    "failed": test_result.failed,
+                    "skipped": test_result.skipped,
+                    "timed_out": test_result.timed_out,
+                    "stdout_summary": test_result.stdout_summary,
+                    "stderr_summary": test_result.stderr_summary,
+                    "cleanup_succeeded": test_result.cleanup_succeeded,
+                    "residual_container_count":
+                        test_result.residual_container_count,
+                },
+            })
+            if (
+                test_result.exit_code != 0
+                or test_result.timed_out
+                or not test_result.cleanup_succeeded
+                or test_result.residual_container_count != 0
+            ):
+                state = (
+                    "TEST_FAILED"
+                    if test_result.exit_code != 0 or test_result.timed_out
+                    else "BLOCKED"
+                )
+                return self._finish(
+                    job_id, worker_token, state,
+                    repo_path=repo_path,
+                    result={
+                        "exit_code": test_result.exit_code,
+                        "modified_files": changed_files,
+                        "container_id": test_result.container_id,
+                        "command": test_result.command,
+                        "role": ROLE_CODING_AGENT,
+                    },
+                    error=test_result.stderr_summary or "docker_test_failed",
+                )
+
+            result = {
+                "exit_code": 0,
+                "modified_files": changed_files,
+                "container_id": test_result.container_id,
+                "command": test_result.command,
+                "role": ROLE_CODING_AGENT,
+            }
+            self.cp.append_event(job_id, {
+                "type": "completed",
+                "payload": {
+                    "modified_files": changed_files,
+                    "container_id": test_result.container_id,
+                },
+            })
+            self.cp.complete(worker_token, job_id, result)
+            return CodexJobResult(
+                state="completed",
+                job_id=job_id,
+                repo_path=str(repo_path),
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed and release lease
+            return self._finish(
+                job_id, worker_token, "BLOCKED",
+                repo_path=repo_path,
+                error=redact(str(exc)) or type(exc).__name__,
+            )
+        finally:
+            stop.set()
+            keepalive.join(timeout=2)
+
     def run(
         self,
         job_id: int,

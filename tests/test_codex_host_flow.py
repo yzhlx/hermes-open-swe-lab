@@ -472,6 +472,32 @@ class CodexJobRunnerStateTests(unittest.TestCase):
         })
         self.assertNotIn(FAKE_TOKEN, evidence)
 
+    def test_local_success_runs_codex_and_docker_then_completes_without_delivery(self):
+        job_id = self.create_job()
+        flow, codex, docker, git_ops, github = self.build_flow()
+        repo_path = self.root / "local-fixture"
+        (repo_path / ".git").mkdir(parents=True)
+
+        result = flow.run_local(
+            job_id=job_id,
+            worker_token=self.token,
+            repo_path=repo_path,
+            task="implement",
+            test_command="pytest -q",
+            timeout_seconds=60,
+        )
+
+        self.assertEqual(result.state, "completed")
+        self.assertEqual(codex.calls, 1)
+        self.assertEqual(docker.calls, 1)
+        self.assertEqual(git_ops.commit_calls, 0)
+        self.assertEqual(git_ops.push_calls, 0)
+        self.assertEqual(github.pr_calls, 0)
+        self.assertEqual(flow.broker.calls, 0)
+        job = self.cp.get_job(job_id)
+        self.assertEqual(job["state"], "completed")
+        self.assertIsNone(job["lease_expires"])
+
     def test_codex_failure_skips_test_commit_and_push_and_releases_lease(self):
         job_id = self.create_job()
         flow, _, docker, git_ops, github = self.build_flow(codex_exit=9)
