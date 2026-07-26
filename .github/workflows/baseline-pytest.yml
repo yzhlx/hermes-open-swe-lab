@@ -31,6 +31,26 @@ jobs:
         run: |
           python -m pytest tests/ --collect-only -q -p no:cacheprovider
 
-      - name: Run full baseline test suite
+      # --- Non-root suite: every baseline test EXCEPT the two deployment tests
+      #     that legitimately require root (they invoke `runuser` against the
+      #     service user and run separately with `sudo -E` below). The root-refusal
+      #     guard (test_check_config_refuses_root) now runs HERE and passes via the
+      #     HERMES_SERVICE_USER mismatch gate — no skip. Either suite failing fails
+      #     the whole job. ---
+      - name: Run non-root baseline test suite
         run: |
-          python -m pytest tests/ -v -p no:cacheprovider -rA
+          python -m pytest tests/ -v -p no:cacheprovider -rA \
+            --deselect tests/deployment/test_cloud.py::test_deploy_idempotency \
+            --deselect tests/deployment/test_cloud.py::test_rollback
+
+      # --- Root-required suite: ONLY the two deploy/rollback tests need `runuser`
+      #     (root). Run via `sudo -E`; SUDO_USER (set by sudo) carries the original
+      #     non-root runner user, so the deploy runs check_config as that non-root
+      #     user. No production code is modified to accommodate CI. ---
+      - name: Run root-required deployment tests (sudo)
+        run: |
+          PYBIN="$(which python)"
+          sudo -E "$PYBIN" -m pytest \
+            tests/deployment/test_cloud.py::test_deploy_idempotency \
+            tests/deployment/test_cloud.py::test_rollback \
+            -v -p no:cacheprovider -rA

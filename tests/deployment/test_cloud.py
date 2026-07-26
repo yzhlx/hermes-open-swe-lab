@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import pytest
 import sqlite3
 import subprocess
 import sys
@@ -26,6 +27,33 @@ def _current_user():
     import subprocess as _sp
     r = _sp.run(["id", "-un"], capture_output=True, text=True)
     return r.stdout.strip() or getpass.getuser()
+
+
+def _deploy_service_user():
+    """Resolve the non-root service user for the root-required deploy tests.
+
+    Security contract (fail-closed, never skip):
+    - euid != 0: use the effective user (`id -un`); it must not be root.
+    - euid == 0 (running under `sudo -E`): the harness is root, so the current
+      process user is root and must NOT become HERMES_SERVICE_USER. Read the
+      original non-root runner user from SUDO_USER; it must exist and must not be
+      root. If it is missing/invalid, fail loudly (no skip, no root fallback).
+    check_config.sh refuses both a root process and a HERMES_SERVICE_USER mismatch,
+    so the deploy always runs check_config as this non-root user via `runuser`.
+    """
+    if os.geteuid() == 0:
+        user = os.environ.get("SUDO_USER", "").strip()
+        if not user or user == "root":
+            raise AssertionError(
+                "root test harness requires a non-root SUDO_USER"
+            )
+        return user
+    user = subprocess.check_output(
+        ["id", "-un"], text=True, encoding="utf-8"
+    ).strip()
+    if user == "root":
+        raise AssertionError("service user must not be root")
+    return user
 
 
 def _posix(p):
@@ -112,6 +140,46 @@ def test_app_refuses_non_loopback(monkeypatch):
                             "localhost_test": True, "log_dir": "logs",
                             "db_path": "runtime/events.db"})
     assert e.value.code == 3
+
+
+def test_check_config_refuses_root():
+    """check_config.sh must fail-closed when HERMES_SERVICE_USER does not match.
+
+    Guards the security gate that the Control Plane never runs as root: on a
+    non-root runner this exercises the user-mismatch gate (HERMES_SERVICE_USER is
+    set to "root" while the invoking user is not root); under `sudo -E` it would
+    additionally hit the root-process gate. No skip — always executed.
+    """
+    rc, _ = run_bash("scripts/check_config.sh",
+                     _required_env({"HERMES_SERVICE_USER": "root"}))
+    assert rc != 0, "check_config.sh must refuse a non-matching service user (security gate)"
+
+
+def test_service_user_non_root_returns_current(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    user = _deploy_service_user()
+    assert user and user != "root"
+
+
+def test_service_user_root_with_valid_sudo_user(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setenv("SUDO_USER", "runner")
+    assert _deploy_service_user() == "runner"
+
+
+def test_service_user_root_missing_sudo_user_fails(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    with pytest.raises(AssertionError):
+        _deploy_service_user()
+
+
+def test_service_user_root_sudo_user_is_root_fails(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setenv("SUDO_USER", "root")
+    with pytest.raises(AssertionError):
+        _deploy_service_user()
 
 
 # --------------------------------------------------------------------------
@@ -227,7 +295,7 @@ def test_deploy_idempotency(tmp_path):
     env.update({
         "HERMES_APP_HOME": _posix(app_home),
         "HERMES_DEPLOY_SRC": _posix(repo),
-        "HERMES_SERVICE_USER": _current_user(),
+        "HERMES_SERVICE_USER": _deploy_service_user(),
         "HERMES_AUTOSTART": "0",
         "HERMES_DB_PATH": _posix(app_home / "runtime" / "events.db"),
         "HERMES_RUNTIME_DIR": _posix(app_home / "runtime"),
@@ -257,7 +325,7 @@ def test_rollback(tmp_path):
     env.update({
         "HERMES_APP_HOME": _posix(app_home),
         "HERMES_DEPLOY_SRC": _posix(repo),
-        "HERMES_SERVICE_USER": _current_user(),
+        "HERMES_SERVICE_USER": _deploy_service_user(),
         "HERMES_AUTOSTART": "0",
         "HERMES_DB_PATH": _posix(app_home / "runtime" / "events.db"),
         "HERMES_RUNTIME_DIR": _posix(app_home / "runtime"),
