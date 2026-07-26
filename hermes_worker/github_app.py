@@ -17,11 +17,15 @@ path requires PyJWT + the App PEM and is NOT_TESTED from this environment.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
+import urllib.error
+import urllib.request
 from typing import Callable, Optional
 
 from .constants import ALLOWED_GITHUB_REPOS
+from .constants import HOST_WORKER_ACTIVE_STATES
 from .control_plane import ControlPlane, ControlPlaneError
 
 
@@ -105,7 +109,7 @@ class GitHubAppTokenBroker:
         job = cp._get_job(job_id)
         if job["worker_token_hash"] != h:
             raise ControlPlaneError("job_not_owned_by_worker")
-        if job["state"] not in ("claimed", "running"):
+        if job["state"] not in ("claimed", *HOST_WORKER_ACTIVE_STATES):
             raise ControlPlaneError("job_not_active")
         repo = job.get("repo") or self._repo_for_job(cp, job_id)
         if not repo or repo not in self.allowed_repos:
@@ -135,6 +139,49 @@ class AppApiClient:
     def exchange_installation_token(self, jwt: str, installation_id: str,
                                     repositories: list, ttl_seconds: int) -> str:
         raise NotImplementedError
+
+
+class RealAppApiClient(AppApiClient):
+    """Exchange App JWTs for repository-scoped Installation Tokens."""
+
+    def __init__(self, api_base: str = "https://api.github.com"):
+        self.api_base = api_base.rstrip("/")
+
+    def exchange_installation_token(self, jwt: str, installation_id: str,
+                                    repositories: list, ttl_seconds: int) -> str:
+        del ttl_seconds  # GitHub controls the Installation Token lifetime.
+        names = [repo.split("/", 1)[-1] for repo in repositories]
+        payload = json.dumps({
+            "repositories": names,
+            "permissions": {
+                "contents": "write",
+                "metadata": "read",
+                "pull_requests": "write",
+            },
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.api_base}/app/installations/{installation_id}/access_tokens",
+            data=payload,
+            method="POST",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": "Bearer " + jwt,
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "hermes-host-worker",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"GitHub Installation Token exchange failed (HTTP {exc.code})"
+            ) from exc
+        token = body.get("token")
+        if not token:
+            raise RuntimeError("GitHub Installation Token response omitted token")
+        return token
 
 
 class FakeAppApiClient(AppApiClient):

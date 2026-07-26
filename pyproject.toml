@@ -12,9 +12,10 @@ dependencies = []
 
 [project.optional-dependencies]
 relay = ["openai>=1.30"]
+worker = ["PyJWT[crypto]==2.10.1"]
 
 [tool.setuptools.packages.find]
-include = ["hermes_open_swe_relay*"]
+include = ["hermes_open_swe_relay*", "hermes_worker*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

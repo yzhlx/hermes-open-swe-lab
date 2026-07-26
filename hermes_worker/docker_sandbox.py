@@ -20,10 +20,9 @@ Architecture (per ADR-002 and the MVP-0 isolation contract):
 Runtime dependency: only the ``docker`` CLI is required (called as a
 subprocess). No Docker SDK, no LangSmith, no cloud SDK.
 
-GitHub token (D3 placeholder): a short-lived GitHub App Installation Token
-scoped to ``yzhlx/hermes-open-swe-smoke-test`` only may be injected via
-``set_github_token()``. It is added as the ``GITHUB_TOKEN`` env var for
-``push()`` and is NEVER written to logs (redacted in ``_calls``).
+GitHub and Codex credentials are forbidden in the container. Repository
+preparation, commit, push, and Draft PR creation are Host Worker operations;
+this backend executes target dependency/build/test commands only.
 
 The command runner is injectable (``runner=``) so the backend can be verified
 offline without a Docker daemon: tests pass a fake runner that records the
@@ -36,10 +35,12 @@ asserted offline.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .protocol import SandboxBackend, ExecResult
@@ -55,9 +56,59 @@ IDLE_COMMAND = ["tail", "-f", "/dev/null"]  # keeps the container alive for exec
 
 # Env keys whose values must never appear in logs / _calls.
 SECRET_ENV_KEYS = {"GITHUB_TOKEN", "GITHUB_APP_TOKEN", "GH_TOKEN"}
+FORBIDDEN_CONTAINER_ENV_KEYS = {
+    "GITHUB_TOKEN",
+    "GITHUB_APP_TOKEN",
+    "GH_TOKEN",
+    "HERMES_GITHUB_APP_ID",
+    "HERMES_GITHUB_INSTALLATION_ID",
+    "HERMES_GITHUB_APP_PRIVATE_KEY_PATH",
+    "HERMES_GIT_INSTALLATION_TOKEN",
+    "CODEX_HOME",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GITHUB_WEBHOOK_SECRET",
+    "WEBHOOK_SECRET",
+}
 
 # Marker for the only allowed bind mount (task workdir -> /workspace).
 WORKSPACE_MOUNT_TARGET = "/workspace"
+
+
+@dataclass(frozen=True)
+class DockerTestResult:
+    image_id: str
+    container_id: str
+    command: str
+    exit_code: int
+    passed: int
+    failed: int
+    skipped: int
+    timed_out: bool
+    stdout_summary: str
+    stderr_summary: str
+    cleanup_succeeded: bool
+    residual_container_count: int
+
+
+def _summary(text: str, limit: int = 2000) -> str:
+    clean = _redact_text(text or "")
+    lines = [line.strip() for line in clean.splitlines() if line.strip()]
+    return " | ".join(lines[-12:])[:limit]
+
+
+def _test_counts(stdout: str, stderr: str, exit_code: int) -> tuple[int, int, int]:
+    combined = f"{stdout}\n{stderr}"
+    counts = {}
+    for label in ("passed", "failed", "skipped"):
+        matches = re.findall(rf"(\d+)\s+{label}\b", combined, flags=re.I)
+        counts[label] = int(matches[-1]) if matches else 0
+    if not any(counts.values()):
+        # Generic non-pytest commands still produce truthful binary evidence.
+        counts["passed"] = 1 if exit_code == 0 else 0
+        counts["failed"] = 0 if exit_code == 0 else 1
+    return counts["passed"], counts["failed"], counts["skipped"]
 
 
 def _redact(args) -> list:
@@ -108,7 +159,9 @@ class HermesDockerSandboxBackend(SandboxBackend):
         self._image = image
         self._workdir = workdir
         self._runner = runner
-        self._github_token = github_token
+        if github_token:
+            raise ValueError("GitHub credentials are forbidden in Docker")
+        self._github_token = None
         self._keep_workdir = keep_workdir
         self._cpus = cpus
         self._memory = memory
@@ -117,6 +170,7 @@ class HermesDockerSandboxBackend(SandboxBackend):
 
         self._ws: Optional[str] = None
         self._container: Optional[str] = None
+        self._container_id: Optional[str] = None
         self._created_at: Optional[float] = None
         # Recorded (REDACTED) docker invocations — for inspection / tests.
         self._calls: list = []
@@ -140,9 +194,9 @@ class HermesDockerSandboxBackend(SandboxBackend):
     def _git_exec(self, git_args: list, use_token: bool = False) -> ExecResult:
         if self._container is None:
             raise RuntimeError("sandbox not created")
+        if use_token:
+            raise RuntimeError("Docker GitHub credential injection is forbidden")
         args = ["docker", "exec"]
-        if use_token and self._github_token:
-            args += ["-e", f"GITHUB_TOKEN={self._github_token}"]
         args += ["--workdir", WORKSPACE_MOUNT_TARGET, self._container, "git"]
         args += git_args
         return self._docker(args)
@@ -167,6 +221,7 @@ class HermesDockerSandboxBackend(SandboxBackend):
         res = self._docker(args)
         if res.exit_code != 0:
             raise RuntimeError(f"docker run failed: {res.stderr}")
+        self._container_id = res.stdout.strip() or self._container
         self._created_at = time.time()
         return self._ws
 
@@ -176,6 +231,8 @@ class HermesDockerSandboxBackend(SandboxBackend):
             raise RuntimeError("sandbox not created")
         args = ["docker", "exec"]
         for k, v in (env or {}).items():
+            if k.upper() in FORBIDDEN_CONTAINER_ENV_KEYS:
+                raise ValueError(f"credential environment forbidden in Docker: {k}")
             args += ["-e", f"{k}={v}"]
         args += ["--workdir", cwd or WORKSPACE_MOUNT_TARGET,
                  self._container, "bash", "-lc", command]
@@ -215,7 +272,7 @@ class HermesDockerSandboxBackend(SandboxBackend):
         self.write_file(path, cur.replace(old, new, 1))
 
     def git_clone(self, url: str, dest: str) -> ExecResult:
-        return self._git_exec(["clone", url, dest])
+        raise RuntimeError("git clone is disabled; Host Worker uses init + fetch")
 
     def git_status(self, repo: str) -> ExecResult:
         return self._git_exec(["-C", repo, "status"])
@@ -224,11 +281,10 @@ class HermesDockerSandboxBackend(SandboxBackend):
         return self._git_exec(["-C", repo, "diff"])
 
     def commit(self, repo: str, message: str) -> ExecResult:
-        return self._git_exec(["-C", repo, "commit", "-m", message])
+        raise RuntimeError("Docker commit is disabled; Host Worker owns commits")
 
     def push(self, repo: str, remote: str, branch: str) -> ExecResult:
-        return self._git_exec(["-C", repo, "push", remote, branch],
-                              use_token=True)
+        raise RuntimeError("Docker push is disabled; Host Worker owns pushes")
 
     def health_check(self) -> bool:
         if self._container is None:
@@ -236,6 +292,111 @@ class HermesDockerSandboxBackend(SandboxBackend):
         res = self._docker(["docker", "inspect", "-f",
                             "{{.State.Running}}", self._container])
         return res.exit_code == 0 and res.stdout.strip() == "true"
+
+    def run_tests(self, command: str, timeout: int = 1200) -> DockerTestResult:
+        """Run the target repository test command in a real Docker container.
+
+        The host worktree is the only bind mount. No GitHub/Codex credential is
+        injected. Cleanup and a residual-container query run on every outcome.
+        """
+        try:
+            self.create()
+        except Exception as exc:  # noqa: BLE001 - return cleanup evidence
+            container_name = self._container
+            removal = self._docker(["docker", "rm", "-f", container_name]) \
+                if container_name else ExecResult(0, "", "")
+            residual_count = 0
+            if container_name:
+                residual = self._docker([
+                    "docker", "ps", "-aq", "--filter",
+                    f"name=^/{container_name}$",
+                ])
+                residual_count = (
+                    len([line for line in residual.stdout.splitlines() if line.strip()])
+                    if residual.exit_code == 0 else -1
+                )
+            self._container = None
+            self._container_id = None
+            if self._ws and os.path.isdir(self._ws) and not self._keep_workdir:
+                shutil.rmtree(self._ws, ignore_errors=True)
+                self._ws = None
+            return DockerTestResult(
+                image_id="unknown",
+                container_id=container_name or "unknown",
+                command=_redact_text(command),
+                exit_code=125,
+                passed=0,
+                failed=1,
+                skipped=0,
+                timed_out=False,
+                stdout_summary="",
+                stderr_summary=_summary(str(exc)),
+                cleanup_succeeded=(
+                    removal.exit_code == 0 and residual_count == 0
+                ),
+                residual_container_count=residual_count,
+            )
+        container_name = self._container
+        container_id = self._container_id or container_name or "unknown"
+        image_id = "unknown"
+        image = self._docker(
+            ["docker", "image", "inspect", "-f", "{{.Id}}", self._image]
+        )
+        if image.exit_code == 0 and image.stdout.strip():
+            image_id = image.stdout.strip()
+        inspected = self._docker(
+            ["docker", "inspect", "-f", "{{.Id}}", container_name]
+        )
+        if inspected.exit_code == 0 and inspected.stdout.strip():
+            container_id = inspected.stdout.strip()
+
+        execution = ExecResult(125, "", "docker test did not start")
+        cleanup_succeeded = False
+        residual_count = -1
+        try:
+            execution = self.execute(command, timeout=timeout)
+        finally:
+            removal = self._docker(["docker", "rm", "-f", container_name])
+            cleanup_succeeded = removal.exit_code == 0
+            residual = self._docker(
+                [
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    f"name=^/{container_name}$",
+                ]
+            )
+            if residual.exit_code == 0:
+                residual_count = len(
+                    [line for line in residual.stdout.splitlines() if line.strip()]
+                )
+            cleanup_succeeded = (
+                removal.exit_code == 0 and residual_count == 0
+            )
+            self._container = None
+            self._container_id = None
+            if self._ws and os.path.isdir(self._ws) and not self._keep_workdir:
+                shutil.rmtree(self._ws, ignore_errors=True)
+                self._ws = None
+
+        passed, failed, skipped = _test_counts(
+            execution.stdout, execution.stderr, execution.exit_code
+        )
+        return DockerTestResult(
+            image_id=image_id,
+            container_id=container_id,
+            command=_redact_text(command),
+            exit_code=execution.exit_code,
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+            timed_out=execution.exit_code == 124,
+            stdout_summary=_summary(execution.stdout),
+            stderr_summary=_summary(execution.stderr),
+            cleanup_succeeded=cleanup_succeeded,
+            residual_container_count=residual_count,
+        )
 
     def stop(self) -> None:
         if self._container:
@@ -245,16 +406,14 @@ class HermesDockerSandboxBackend(SandboxBackend):
         if self._container:
             self._docker(["docker", "rm", "-f", self._container])
             self._container = None
+            self._container_id = None
         if self._ws and os.path.isdir(self._ws) and not self._keep_workdir:
             shutil.rmtree(self._ws, ignore_errors=True)
             self._ws = None
 
     # -- D3 hook -------------------------------------------------------------
     def set_github_token(self, token: str) -> None:
-        """Inject a short-lived GitHub App Installation Token (D3).
-
-        Scoped to ``yzhlx/hermes-open-swe-smoke-test`` only; added as the
-        ``GITHUB_TOKEN`` env var for ``push()``. Never logged (redacted in
-        ``_calls``).
-        """
-        self._github_token = token
+        del token
+        raise RuntimeError(
+            "GitHub credentials are host-only and forbidden in Docker"
+        )

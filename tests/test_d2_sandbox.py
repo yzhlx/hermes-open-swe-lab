@@ -8,8 +8,8 @@ lets us assert, offline:
 - privileged mode and the Docker host socket are NEVER used
 - ONLY the task workdir is bind-mounted (no home / SSH / cookies / other repos)
 - ``execute`` builds a correct ``docker exec`` with workdir + env
-- the GitHub token is injected ONLY for ``push()`` (not clone/commit) and the
-  redacted ``_calls`` log never contains the token value
+- GitHub/Codex credentials and clone/commit/push operations are rejected by
+  the Docker boundary, while command logs still redact embedded secret text
 - write/read/edit round-trip on the real (mounted) host workdir
 - delete() force-removes the container and wipes the workdir
 
@@ -125,34 +125,30 @@ class D2SandboxTest(unittest.TestCase):
         self.assertNotIn("--privileged", exe)
 
     # -- github token scoping ------------------------------------------------
-    def test_06_token_only_on_push(self):
-        self.backend.set_github_token("ghp_FAKE_TOKEN_123")
+    def test_06_github_credentials_and_publish_operations_are_rejected(self):
         self.backend.create()
-        # clone / commit must NOT carry the token
-        self.backend.git_clone("https://github.com/x/y", "repo")
-        self.backend.commit("repo", "msg")
-        for c in self.fake.raw_calls:
-            if c[:2] == ["docker", "exec"] and "push" not in c:
-                self.assertNotIn("ghp_FAKE_TOKEN_123", " ".join(c),
-                                 "token leaked into a non-push git call")
-        # push MUST carry the token (raw call, pre-redaction)
-        self.backend.push("repo", "origin", "feat/x")
-        push = None
-        for c in self.fake.raw_calls:
-            if c[:2] == ["docker", "exec"] and "push" in c:
-                push = c
-                break
-        self.assertIsNotNone(push, "expected a docker exec push call")
-        self.assertIn("GITHUB_TOKEN=ghp_FAKE_TOKEN_123", " ".join(push))
+        with self.assertRaises(RuntimeError):
+            self.backend.set_github_token("ghp_FAKE_TOKEN_123")
+        with self.assertRaises(RuntimeError):
+            self.backend.git_clone("https://github.com/x/y", "repo")
+        with self.assertRaises(RuntimeError):
+            self.backend.commit("repo", "msg")
+        with self.assertRaises(RuntimeError):
+            self.backend.push("repo", "origin", "feat/x")
 
-    def test_07_token_redacted_in_call_log(self):
-        self.backend.set_github_token("ghp_FAKE_TOKEN_123")
+    def test_07_secret_environment_rejected_and_embedded_text_redacted(self):
         self.backend.create()
-        self.backend.push("repo", "origin", "feat/x")
+        with self.assertRaises(ValueError):
+            self.backend.execute("pytest -q", env={
+                "HERMES_GITHUB_APP_PRIVATE_KEY_PATH": "forbidden.pem"
+            })
+        self.backend.execute(
+            "echo https://ghp_FAKE_TOKEN_123@github.com/example/repo"
+        )
         flat = " ".join(" ".join(c) for c in self.backend._calls)
         self.assertNotIn("ghp_FAKE_TOKEN_123", flat,
                          "token value must never appear in _calls (redacted)")
-        self.assertIn("GITHUB_TOKEN=***REDACTED***", flat)
+        self.assertIn("***REDACTED***", flat)
 
     # -- file round-trip (host workdir == mounted /workspace) ---------------
     def test_08_write_read_edit_roundtrip(self):

@@ -312,7 +312,10 @@ class D3SecurityTest(unittest.TestCase):
             t.join(timeout=3)
             job = self.cp.get_job(jid)
             self.assertEqual(job["state"], "completed")
+            # Reaching completed proves keepalive prevented mid-run reaping.
+            # The audit owner remains, while the active lease is released.
             self.assertEqual(job["worker_token_hash"], hash_token(TOKENS[0]))
+            self.assertIsNone(job["lease_expires"])
         finally:
             srv.shutdown(); srv.server_close()
 
@@ -323,8 +326,10 @@ class D3SecurityTest(unittest.TestCase):
         b = HermesDockerSandboxBackend(runner=fake_runner)
         b.create()
         b.execute(f"git push https://{FAKE_GH_TOKEN}@github.com/o/r.git main")
-        b.set_github_token(FAKE_GH_TOKEN)
-        b.push("repo", "origin", "main")
+        with self.assertRaises(RuntimeError):
+            b.set_github_token(FAKE_GH_TOKEN)
+        with self.assertRaises(RuntimeError):
+            b.push("repo", "origin", "main")
         flat = " ".join(" ".join(str(a) for a in call) for call in b._calls)
         self.assertNotIn(FAKE_GH_TOKEN, flat)
         self.assertIn("***REDACTED***", flat)

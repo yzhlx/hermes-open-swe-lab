@@ -11,11 +11,13 @@ exists only so the test can assert the orchestrator never invokes it.
 from __future__ import annotations
 
 import os
+import json
 import subprocess
+import urllib.error
+import urllib.request
 from typing import Optional
 
 from .constants import ALLOWED_GITHUB_REPOS
-from .redact import redact
 
 
 class GitHubClientError(Exception):
@@ -131,10 +133,11 @@ class FakeGitHubClient(GitHubClient):
 
 
 class RealGitHubClient(GitHubClient):
-    """``gh``/``git``-backed client. NOT_TESTED from this environment.
+    """Legacy D3 client retained for CI/review compatibility.
 
-    Every method shells out; the Installation Token is passed only at push and is
-    redacted before any logging. Merge is never called by the automation.
+    Repository preparation, push, and Draft PR creation fail closed here. The
+    host Codex architecture uses ``RepositoryPreparer``, ``HostGitOperations``,
+    and ``GitHubRestClient`` so it cannot fall back to clone or ``gh auth``.
     """
     def __init__(self, gh_bin: str = "gh", git_bin: str = "git",
                  default_branch: str = "main"):
@@ -143,33 +146,21 @@ class RealGitHubClient(GitHubClient):
         self.default_branch = default_branch
 
     def clone(self, full_name: str, dest: str) -> str:
-        url = f"https://github.com/{full_name}.git"
-        subprocess.run([self.git, "clone", url, dest], check=True,
-                       capture_output=True, text=True)
-        return dest
+        raise GitHubClientError(
+            "git_clone_disabled_use_repository_preparer"
+        )
 
     def push_branch(self, full_name: str, branch: str, head_sha: str,
                     token: Optional[str] = None) -> None:
-        # Token is injected only for this push subprocess and never logged.
-        env = dict(os.environ)
-        if token:
-            env["GITHUB_TOKEN"] = token
-        # The worker pushes from inside the sandbox; here we model the push of
-        # an already-created local branch. Caller ensures `branch` exists.
-        subprocess.run([self.git, "push", "--force-with-lease", "origin", branch],
-                       cwd=dest_placeholder(), check=True, capture_output=True,
-                       text=True, env={k: (redact(v) if k == "GITHUB_TOKEN" else v)
-                                       for k, v in env.items()})
+        raise GitHubClientError(
+            "legacy_push_disabled_use_host_git_operations"
+        )
 
     def create_draft_pr(self, full_name: str, branch: str, title: str,
                         body: str = "") -> dict:
-        out = subprocess.run(
-            [self.gh, "pr", "create", "--repo", full_name, "--head", branch,
-             "--title", title, "--body", body, "--draft", "--json",
-             "number,headRefOid,url"],
-            check=True, capture_output=True, text=True)
-        import json
-        return json.loads(out.stdout)
+        raise GitHubClientError(
+            "legacy_pr_create_disabled_use_github_rest_client"
+        )
 
     def get_ci_status(self, pr_number: int) -> str:
         out = subprocess.run(
@@ -193,7 +184,48 @@ class RealGitHubClient(GitHubClient):
     def merge_pr(self, pr_number: int) -> None:
         # Never called by the automation. User merges via UI/gh.
         raise GitHubClientError("merge_not_permitted_for_automation")
+class GitHubRestClient:
+    """Minimal host-side GitHub client for Draft PR creation.
 
+    The Installation Token is accepted only in memory and sent as an HTTP
+    header. It is never placed in a command, URL, Git config, or returned data.
+    """
 
-def dest_placeholder() -> str:  # pragma: no cover
-    return "."
+    def __init__(self, api_base: str = "https://api.github.com"):
+        self.api_base = api_base.rstrip("/")
+
+    def create_draft_pr(self, repo: str, branch: str, base: str, title: str,
+                        body: str, token: str) -> dict:
+        if repo not in ALLOWED_GITHUB_REPOS:
+            raise GitHubClientError("repo_not_allowed")
+        payload = json.dumps({
+            "title": title,
+            "head": branch,
+            "base": base,
+            "body": body,
+            "draft": True,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.api_base}/repos/{repo}/pulls",
+            data=payload,
+            method="POST",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": "Bearer " + token,
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "hermes-host-worker",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise GitHubClientError(
+                f"draft_pr_create_failed_http_{exc.code}"
+            ) from exc
+        return {
+            "number": result["number"],
+            "url": result.get("html_url"),
+            "draft": bool(result.get("draft", True)),
+        }

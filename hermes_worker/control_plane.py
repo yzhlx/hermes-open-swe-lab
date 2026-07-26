@@ -18,6 +18,7 @@ import functools
 from typing import Optional
 
 from .db import init_db, hash_token
+from .constants import HOST_WORKER_ACTIVE_STATES, HOST_WORKER_TERMINAL_STATES
 
 
 class ControlPlaneError(Exception):
@@ -218,7 +219,7 @@ class ControlPlane:
         upd = {}
         for k in ("modified_files", "token_usage", "tool_calls", "container_id",
                   "command", "commit_sha", "ci_status", "model", "role", "pr_number",
-                  "round"):
+                  "round", "exit_code", "error"):
             if k in result and result[k] is not None:
                 v = result[k]
                 if k in ("modified_files", "token_usage") and not isinstance(v, str):
@@ -246,7 +247,7 @@ class ControlPlane:
         job = self._get_job(job_id)
         if job["worker_token_hash"] != h:
             raise ControlPlaneError("job_not_owned_by_worker")
-        if job["state"] not in ("claimed", "running"):
+        if job["state"] not in ("claimed", *HOST_WORKER_ACTIVE_STATES):
             raise ControlPlaneError("job_not_active")
         self.conn.execute(
             "UPDATE jobs SET lease_expires=? WHERE id=?",
@@ -261,17 +262,19 @@ class ControlPlane:
         # reap. On every claim (which calls reap), fresh leases mean nothing is
         # expired -> the hot path stays a read and never contends on the write
         # lock. This is what keeps concurrent claim() fast under WAL.
+        active = ("claimed", *HOST_WORKER_ACTIVE_STATES)
+        placeholders = ",".join("?" for _ in active)
         probe = self.conn.execute(
-            "SELECT 1 FROM jobs WHERE state IN ('claimed','running') "
+            f"SELECT 1 FROM jobs WHERE state IN ({placeholders}) "
             "AND lease_expires IS NOT NULL AND lease_expires < ? LIMIT 1",
-            (now,)).fetchone()
+            (*active, now)).fetchone()
         if not probe:
             return 0
         cur = self.conn.execute(
-            """UPDATE jobs SET state='pending', worker_token_hash=NULL, lease_expires=NULL
-               WHERE state IN ('claimed','running') AND lease_expires IS NOT NULL
-               AND lease_expires < ?""",
-            (now,))
+            f"""UPDATE jobs SET state='pending', worker_token_hash=NULL, lease_expires=NULL
+                WHERE state IN ({placeholders}) AND lease_expires IS NOT NULL
+                AND lease_expires < ?""",
+            (*active, now))
         self.conn.commit()
         return cur.rowcount
 
@@ -282,9 +285,11 @@ class ControlPlane:
         # 1) Re-claim an already-owned (claimed/running/agent_done) job — idempotent.
         #    'agent_done' is re-claimable so a round-2 rework can pick the same
         #    task back up after the scheduler signals rework.
+        owned_states = ("claimed", "agent_done", *HOST_WORKER_ACTIVE_STATES)
+        placeholders = ",".join("?" for _ in owned_states)
         cur = self.conn.execute(
-            "SELECT id FROM jobs WHERE state IN ('claimed','running','agent_done') "
-            "AND worker_token_hash=? LIMIT 1", (h,))
+            f"SELECT id FROM jobs WHERE state IN ({placeholders}) "
+            "AND worker_token_hash=? LIMIT 1", (*owned_states, h))
         row = cur.fetchone()
         if row:
             job = self._get_job(row["id"])
@@ -314,6 +319,40 @@ class ControlPlane:
         job = self._get_job(jid)
         return {"job_id": jid, "payload": json.loads(job["payload"] or "{}"),
                 "lease_expires": lease}
+
+    @_retry_on_locked
+    def claim_job(self, token: str, job_id: int) -> dict:
+        """Claim one explicitly selected job without consuming another pending job."""
+        h = self._check_token(token)
+        self.reap_expired_leases()
+        job = self._get_job(job_id)
+        if job["worker_token_hash"] == h and job["state"] in (
+            "claimed", "agent_done", *HOST_WORKER_ACTIVE_STATES
+        ):
+            lease = self._now() + self.lease_seconds
+            self.conn.execute(
+                "UPDATE jobs SET state='running', lease_expires=?, "
+                "started_at=COALESCE(started_at,?) WHERE id=?",
+                (lease, self._now(), job_id),
+            )
+            self.conn.commit()
+            return {"job_id": job_id, "already_claimed": True,
+                    "lease_expires": lease}
+        if job["state"] not in ("pending", "agent_done") or job["worker_token_hash"]:
+            raise ControlPlaneError("job_not_claimable")
+        lease = self._now() + self.lease_seconds
+        cur = self.conn.execute(
+            """UPDATE jobs
+               SET state='running', worker_token_hash=?, lease_expires=?,
+                   started_at=COALESCE(started_at,?)
+               WHERE id=? AND state IN ('pending','agent_done')
+                     AND worker_token_hash IS NULL""",
+            (h, lease, self._now(), job_id),
+        )
+        if cur.rowcount != 1:
+            raise ControlPlaneError("job_not_claimable")
+        self.conn.commit()
+        return {"job_id": job_id, "lease_expires": lease}
 
     def post_events(self, token: str, job_id: int, events: list) -> dict:
         h = self._check_token(token)
@@ -369,14 +408,42 @@ class ControlPlane:
         job = self._get_job(job_id)
         if job["worker_token_hash"] != h:
             raise ControlPlaneError("job_not_owned_by_worker")
-        if job["state"] in ("completed", "failed"):
+        if job["ended_at"] is not None:
             return {"ok": True, "already_finished": True, "state": job["state"]}
-        set_cols = ", ".join(f"{k}=?" for k in updates)
-        params = [final_state, self._now(), *updates.values(), job_id]
+        assignments = [
+            "state=?",
+            "ended_at=?",
+            "lease_expires=NULL",
+        ]
+        params = [final_state, self._now()]
+        for key, value in updates.items():
+            assignments.append(f"{key}=?")
+            params.append(value)
+        params.append(job_id)
         self.conn.execute(
-            f"UPDATE jobs SET state=?, ended_at=?, {set_cols} WHERE id=?", params)
+            f"UPDATE jobs SET {', '.join(assignments)} WHERE id=?", params)
         self.conn.commit()
         return {"ok": True, "state": final_state}
+
+    def finish_state(self, token: str, job_id: int, state: str,
+                     result: dict = None, error: str = None) -> dict:
+        """Finish a Host Codex job in an explicit terminal state and release its lease."""
+        if state not in HOST_WORKER_TERMINAL_STATES:
+            raise ControlPlaneError("invalid_terminal_state")
+        updates = {}
+        for key, value in (result or {}).items():
+            if key not in {
+                "modified_files", "container_id", "command", "exit_code",
+                "commit_sha", "ci_status", "model", "role", "pr_number",
+                "round", "token_usage", "tool_calls",
+            } or value is None:
+                continue
+            if key in ("modified_files", "token_usage") and not isinstance(value, str):
+                value = json.dumps(value)
+            updates[key] = value
+        if error:
+            updates["error"] = error
+        return self._finish(token, job_id, state, updates)
 
     def complete(self, token, job_id, result: dict = None) -> dict:
         upd = {}
