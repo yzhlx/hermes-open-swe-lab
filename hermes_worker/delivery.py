@@ -1,42 +1,45 @@
 """Host Worker — GitHub Draft PR controlled delivery layer (MVP-0, D4).
 
-This module implements the *controlled* delivery of an already-completed local
-task commit into a GitHub **Draft** pull request. It is deliberately narrow:
+Reconciliation status
+---------------------
+This module is a *thin coordination layer*, not a re-implementation of the
+worker's existing infrastructure. It deliberately reuses:
 
-- It does NOT run the coding agent, the sandbox, the reviewer, or Feishu.
-- It does NOT introduce a new ExecutionAgent abstraction or a second agent.
-- It does NOT modify the WSL Codex route, the Open SWE upstream, or the
-  protected repository ``yzhlx/hermes-learning-os``.
+* ``hermes_worker.db``      — single SQLite store + ``delivery_state`` table for
+  idempotency / recovery (no second SQLite connection or registry).
+* ``hermes_worker.redact``  — the one and only secret redactor (logs / bodies /
+  errors). There is no second redactor here.
+* ``hermes_worker.control_plane.ControlPlaneError`` — the single error taxonomy;
+  ``DeliveryError`` subclasses it.
 
-It only turns a *validated* local commit plus an *explicit, task/repo-scoped*
-authorization into:
+The following capabilities are intentionally NOT re-implemented here because
+their canonical implementations live only on the frozen ``codex-primary-agent-
+policy`` worktree (``repository.py`` / ``github_app.py`` / ``github_client.py`` /
+``constants.py``) which this task forbids modifying or touching, and copying
+them in would create the second parallel implementation this task prohibits.
+They are therefore retained as narrow D4-specific seams and documented in the
+reconciliation report:
 
-  1. a structured, force-free ``PushPlan``;
-  2. a structured, always-draft ``DraftPrRequest``;
+* ``GitWorkspace`` (local-commit / working-tree validation) — the local-git
+  equivalent of ``repository.HostGitOperations``.
+* ``GitHubClient`` (push / create_draft_pr / get_pull_request) — the GitHub
+  write equivalent of ``github_client.GitHubRestClient``.
 
-behind a fail-closed authorization gate, a repository allowlist (with a
-hard-denied protected repo), a branch policy, and an idempotency registry.
+The delivery layer only turns a *validated* local commit plus an *explicit,
+task+repo+commit-scoped* authorization into a force-free ``PushPlan`` and an
+always-draft ``DraftPrRequest``, behind a fail-closed authorization gate, a
+protected-repo + allowlist check, a pre-push diff secret scan, and an
+idempotency/recovery registry.
 
-All GitHub write calls go through an injected ``GitHubClient`` so they can be
-fully exercised by ``FakeGitHubClient`` (no real network, no real token). The
-delivery controller itself NEVER receives or holds a GitHub credential: the
-token lives only in the GitHub client, which is constructed by the Host Worker
-/ Token Broker. This keeps credentials out of logs, PR bodies, exceptions, and
-evidence files *by construction*.
-
-Local git validation goes through an injected ``GitWorkspace`` (a real
-``LocalGitWorkspace`` using the git CLI, or a ``FakeGitWorkspace`` in tests).
-
-Safety boundaries honoured (see repo AGENTS.md):
-- ``yzhlx/hermes-learning-os`` is always denied and is never writable, even if
-  accidentally added to the allowlist.
-- No real Push / PR / Merge is performed unless an explicit per-task, per-repo
-  authorization is supplied; all gated paths are verified via Fake / dry-run.
+Credential isolation by construction: the controller NEVER receives or holds a
+GitHub token. The token lives only in the GitHub client (constructed by the
+Host Worker / Token Broker). PR bodies and error text are redacted. There is
+deliberately NO merge method on the client (auto-merge is structurally
+impossible).
 """
 from __future__ import annotations
 
 import abc
-import hashlib
 import os
 import re
 import subprocess
@@ -45,13 +48,18 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .redact import redact as _redact_text
+from .control_plane import ControlPlaneError
+from . import db as _db
+from .secret_scan import scan_diff_for_secrets
 
 
 # --------------------------------------------------------------------------
-# Constants
+# Constants (single source of truth within this worktree; canonical
+# ALLOWED_GITHUB_REPOS / PROTECTED_REPOS on the frozen codex branch are not
+# present here, so this module owns the only copy in THIS branch).
 # --------------------------------------------------------------------------
 
-# Never writable through this module, even if someone adds it to the allowlist.
+# Never writable through this module, even if accidentally added to the allowlist.
 PROTECTED_REPOS = frozenset({"yzhlx/hermes-learning-os"})
 
 # Default branches that must never be the *target* of a direct push.
@@ -87,6 +95,8 @@ CONFLICT_COMMIT_CHANGED = "DELIVERY_CONFLICT_COMMIT_CHANGED"
 DUPLICATE_SUPPRESSED = "DELIVERY_DUPLICATE_SUPPRESSED"
 PUSH_FAILED = "DELIVERY_PUSH_FAILED"
 PR_CREATION_FAILED = "DELIVERY_PR_CREATION_FAILED"
+PR_CLOSED = "DELIVERY_BLOCKED_PR_CLOSED"
+PR_MERGED = "DELIVERY_BLOCKED_PR_MERGED"
 DRY_RUN_NO_WRITE = "DELIVERY_DRY_RUN_NO_WRITE"
 COMPLETED = "DELIVERY_COMPLETED"
 
@@ -96,7 +106,8 @@ class DeliveryState:
 
     Discipline (per repo AGENTS.md): none of the blocked/failed states may
     transition into COMPLETED. COMPLETED / PR_CREATED are the only success
-    terminals; the rest are explicit, testable block/fail states.
+    terminals; the rest are explicit, testable block/fail states. This mirrors
+    the fail-closed terminal-state discipline of ``ControlPlane``.
     """
 
     NOT_STARTED = "not_started"
@@ -108,6 +119,7 @@ class DeliveryState:
     CREATING_PR = "creating_pr"
     PR_CREATED = "pr_created"
     PR_CLOSED = "pr_closed"
+    PR_MERGED = "pr_merged"
     COMMIT_CHANGED = "commit_changed"
     DUPLICATE_DETECTED = "duplicate_detected"
     PUSH_FAILED = "push_failed"
@@ -135,6 +147,8 @@ class DeliveryState:
         DUPLICATE_SUPPRESSED: DUPLICATE_DETECTED,
         PUSH_FAILED: PUSH_FAILED,
         PR_CREATION_FAILED: PR_FAILED,
+        PR_CLOSED: PR_CLOSED,
+        PR_MERGED: PR_MERGED,
         DRY_RUN_NO_WRITE: DRY_RUN,
         COMPLETED: COMPLETED,
     }
@@ -150,25 +164,27 @@ class DeliveryState:
 
 @dataclass
 class DeliveryAuthorization:
-    """Explicit, task+repo-scoped grant.
+    """Explicit, task+repo+commit-scoped grant.
 
     This object MUST be supplied by the caller. It is NEVER inferred from an
-    environment variable, a config default, or any Coding-Agent text. The grant
-    value is a fixed, non-default constant so it cannot be accidentally enabled
-    by a truthy string such as ``"true"`` / ``"auto"`` / ``"default"``.
+    environment variable, a config default, a worker lease, or any Coding-Agent
+    text. The ``grant`` value is a fixed, non-default constant so it cannot be
+    accidentally enabled by a truthy string such as ``"true"`` / ``"auto"``.
     """
 
     task_id: str
     repository: str
+    commit_sha: str
     grant: str
 
     REQUIRED_GRANT = "GRANT_PUSH_AND_DRAFT_PR"
 
-    def is_valid_for(self, task_id: str, repository: str) -> bool:
+    def is_valid_for(self, task_id: str, repository: str, commit_sha: str) -> bool:
         if not self.grant:
             return False
         return (self.task_id == task_id
                 and self.repository == repository
+                and self.commit_sha == commit_sha
                 and self.grant == self.REQUIRED_GRANT)
 
 
@@ -263,8 +279,12 @@ class DeliveryStatus:
         }
 
 
-class DeliveryError(Exception):
-    """Raised internally for branch-policy violations (caught by ``deliver``)."""
+class DeliveryError(ControlPlaneError):
+    """Raised internally for branch-policy / authorization violations.
+
+    Subclasses ``ControlPlaneError`` so the delivery layer shares the control
+    plane's single error taxonomy (no second error hierarchy).
+    """
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -273,7 +293,9 @@ class DeliveryError(Exception):
 
 
 # --------------------------------------------------------------------------
-# Git workspace abstraction (real + fake)
+# Git workspace abstraction (real + fake). This is a D4-specific seam; the
+# canonical local-git implementation (repository.HostGitOperations) lives only
+# on the frozen codex branch and is not copied in (see module docstring).
 # --------------------------------------------------------------------------
 
 class GitWorkspace(abc.ABC):
@@ -292,6 +314,9 @@ class GitWorkspace(abc.ABC):
     def is_clean(self) -> bool: ...
 
     @abc.abstractmethod
+    def is_detached_head(self) -> bool: ...
+
+    @abc.abstractmethod
     def commit_in_history(self, sha: str) -> bool: ...
 
     @abc.abstractmethod
@@ -299,6 +324,9 @@ class GitWorkspace(abc.ABC):
 
     @abc.abstractmethod
     def commit_contains_credential(self, sha: str) -> bool: ...
+
+    @abc.abstractmethod
+    def get_commit_diff(self, sha: str) -> str: ...
 
 
 class LocalGitWorkspace(GitWorkspace):
@@ -335,6 +363,10 @@ class LocalGitWorkspace(GitWorkspace):
         r = self._git("status", "--porcelain")
         return r.returncode == 0 and r.stdout.strip() == ""
 
+    def is_detached_head(self) -> bool:
+        r = self._git("symbolic-ref", "-q", "HEAD")
+        return r.returncode != 0
+
     def commit_in_history(self, sha: str) -> bool:
         r = self._git("merge-base", "--is-ancestor", sha, "HEAD")
         return r.returncode == 0
@@ -352,6 +384,12 @@ class LocalGitWorkspace(GitWorkspace):
             return False
         return _redact_text(r.stdout) != r.stdout
 
+    def get_commit_diff(self, sha: str) -> str:
+        r = self._git("show", "--format=", "--no-color", sha)
+        if r.returncode != 0:
+            return ""
+        return r.stdout
+
 
 @dataclass
 class FakeGitWorkspace(GitWorkspace):
@@ -362,9 +400,11 @@ class FakeGitWorkspace(GitWorkspace):
     _is_repo: bool = True
     _head_sha: str = "a" * 40
     _clean: bool = True
+    _detached: bool = False
     _in_history: bool = True
     _empty: bool = False
     _has_credential: bool = False
+    _diff: str = ""
 
     def exists(self) -> bool:
         return self._exists
@@ -380,6 +420,9 @@ class FakeGitWorkspace(GitWorkspace):
     def is_clean(self) -> bool:
         return self._clean
 
+    def is_detached_head(self) -> bool:
+        return self._detached
+
     def commit_in_history(self, sha: str) -> bool:
         return self._in_history
 
@@ -389,9 +432,14 @@ class FakeGitWorkspace(GitWorkspace):
     def commit_contains_credential(self, sha: str) -> bool:
         return self._has_credential
 
+    def get_commit_diff(self, sha: str) -> str:
+        return self._diff
+
 
 # --------------------------------------------------------------------------
-# GitHub client abstraction (real + fake)
+# GitHub client abstraction (real + fake). D4-specific seam; the canonical
+# write client (github_client.GitHubRestClient) lives only on the frozen codex
+# branch and is not copied in. There is deliberately NO merge method.
 # --------------------------------------------------------------------------
 
 class GitHubClientError(Exception):
@@ -411,6 +459,10 @@ class GitHubClient(abc.ABC):
              force: bool = False) -> dict: ...
 
     @abc.abstractmethod
+    def get_pull_request(self, *, repository: str,
+                         head_branch: str) -> Optional[dict]: ...
+
+    @abc.abstractmethod
     def create_pull_request(self, *, repository: str, base_branch: str,
                             head_branch: str, title: str, body: str,
                             draft: bool = True) -> dict: ...
@@ -420,16 +472,19 @@ class FakeGitHubClient(GitHubClient):
     """Records calls, never touches the network, never receives a token."""
 
     def __init__(self, *, fail_push: bool = False, fail_pr: bool = False,
+                 return_non_draft: bool = False,
                  push_error: str = "fake push failed",
                  pr_error: str = "fake pr failed",
                  pr_url_template: str = "https://github.com/{repo}/pull/{n}"):
         self.fail_push = fail_push
         self.fail_pr = fail_pr
+        self.return_non_draft = return_non_draft
         self.push_error = push_error
         self.pr_error = pr_error
         self.pr_url_template = pr_url_template
         self.push_calls: list = []
         self.pr_calls: list = []
+        self.prs: list = []            # created PR dicts (for get_pull_request)
         self.order: list = []          # interleaved call order (push/pr)
         self.merge_calls: list = []    # MUST stay empty (auto-merge forbidden)
         self._pr_counter = 0
@@ -446,6 +501,12 @@ class FakeGitHubClient(GitHubClient):
         return {"ok": True, "remote_commit_sha": local_commit_sha,
                 "remote_branch": remote_branch}
 
+    def get_pull_request(self, *, repository, head_branch):
+        for pr in self.prs:
+            if pr.get("repository") == repository and pr.get("head_branch") == head_branch:
+                return pr
+        return None
+
     def create_pull_request(self, *, repository, base_branch, head_branch,
                             title, body, draft=True):
         self.pr_calls.append({
@@ -456,9 +517,14 @@ class FakeGitHubClient(GitHubClient):
         if self.fail_pr:
             raise GitHubClientError(self.pr_error)
         self._pr_counter += 1
-        return {"ok": True,
-                "html_url": self.pr_url_template.format(repo=repository, n=self._pr_counter),
-                "number": self._pr_counter, "draft": draft}
+        pr = {"ok": True, "html_url": self.pr_url_template.format(
+                  repo=repository, n=self._pr_counter),
+              "number": self._pr_counter,
+              "draft": bool(draft) and not self.return_non_draft,
+              "state": "open", "repository": repository,
+              "head_branch": head_branch, "base_branch": base_branch}
+        self.prs.append(pr)
+        return pr
 
     def merge_pull_request(self, *args, **kwargs):
         # Present only so a test can assert it is NEVER invoked.
@@ -468,11 +534,10 @@ class FakeGitHubClient(GitHubClient):
 
 class GhCliGitHubClient(GitHubClient):
     """Real GitHub client via the ``gh`` CLI + ``git`` (authenticated out-of-band
-    by the Host Worker / Token Broker via ``GITHUB_TOKEN``). The delivery
-    controller never passes a token here, so credentials stay in the worker
-    process and are redacted on the subprocess boundary by the worker's redaction
-    layer. This code path is only exercised in production behind the authorization
-    gate; the test suite uses ``FakeGitHubClient`` instead.
+    by the Host Worker / Token Broker). The delivery controller never passes a
+    token here, so credentials stay in the worker process. This path is only
+    exercised in production behind the authorization gate; tests use
+    ``FakeGitHubClient``.
     """
 
     def __init__(self, gh_bin: str = "gh", git_bin: str = "git", timeout: int = 120):
@@ -493,6 +558,26 @@ class GhCliGitHubClient(GitHubClient):
         return {"ok": True, "remote_commit_sha": local_commit_sha,
                 "remote_branch": remote_branch}
 
+    def get_pull_request(self, *, repository, head_branch):
+        proc = subprocess.run(
+            [self.gh, "pr", "list", "--repo", repository, "--head", head_branch,
+             "--state", "all", "--json", "number,url,title,state,isDraft"],
+            capture_output=True, text=True, timeout=self.timeout)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        import json as _json
+        try:
+            items = _json.loads(proc.stdout)
+        except ValueError:
+            return None
+        if not items:
+            return None
+        it = items[0]
+        return {"number": it.get("number"), "html_url": it.get("url"),
+                "title": it.get("title"), "state": it.get("state", "open"),
+                "draft": it.get("isDraft", True), "repository": repository,
+                "head_branch": head_branch}
+
     def create_pull_request(self, *, repository, base_branch, head_branch,
                             title, body, draft=True):
         if not draft:
@@ -505,11 +590,12 @@ class GhCliGitHubClient(GitHubClient):
         if proc.returncode != 0:
             raise GitHubClientError(proc.stderr or "gh pr create failed")
         return {"ok": True, "html_url": proc.stdout.strip(),
-                "number": None, "draft": True}
+                "number": None, "draft": True, "state": "open",
+                "repository": repository, "head_branch": head_branch}
 
 
 # --------------------------------------------------------------------------
-# Idempotency registry
+# Idempotency / recovery registry
 # --------------------------------------------------------------------------
 
 class DeliveryRegistry(abc.ABC):
@@ -525,6 +611,8 @@ class DeliveryRegistry(abc.ABC):
 
 
 class InMemoryDeliveryRegistry(DeliveryRegistry):
+    """In-memory registry (tests / ephemeral runs)."""
+
     def __init__(self):
         self._store: dict = {}
 
@@ -544,66 +632,31 @@ class InMemoryDeliveryRegistry(DeliveryRegistry):
         self._store[key] = dict(record)
 
 
-class SqliteDeliveryRegistry(DeliveryRegistry):
+class DbBackedDeliveryRegistry(DeliveryRegistry):
+    """Registry backed by the existing ``hermes_worker.db`` store (single SQLite
+    file, schema owned by db.py). This replaces the previous second SQLite
+    connection / ``delivery_registry`` table — there is now exactly one DB.
+    """
+
     def __init__(self, db_path: str):
-        parent = os.path.dirname(db_path) or "."
-        os.makedirs(parent, exist_ok=True)
-        self.conn = __import__("sqlite3").connect(db_path)
-        self.conn.execute(
-            """CREATE TABLE IF NOT EXISTS delivery_registry (
-                   key TEXT PRIMARY KEY,
-                   state TEXT,
-                   repository TEXT,
-                   task_id TEXT,
-                   commit_sha TEXT,
-                   remote_branch TEXT,
-                   pr_url TEXT,
-                   pr_number INTEGER,
-                   updated_at REAL)""")
-        self.conn.commit()
+        self._conn = _db.init_db(db_path)
 
     def get(self, key: str) -> Optional[dict]:
-        row = self.conn.execute(
-            "SELECT state, repository, task_id, commit_sha, remote_branch, "
-            "pr_url, pr_number FROM delivery_registry WHERE key=?",
-            (key,)).fetchone()
-        if not row:
-            return None
-        return self._row_to_dict(row)
+        return _db.select_delivery_state(self._conn, key)
 
     def get_by_task(self, repository: str, task_id: str,
                     remote_branch: str) -> Optional[dict]:
-        row = self.conn.execute(
-            "SELECT state, repository, task_id, commit_sha, remote_branch, "
-            "pr_url, pr_number FROM delivery_registry "
-            "WHERE repository=? AND task_id=? AND remote_branch=?",
-            (repository, task_id, remote_branch)).fetchone()
-        if not row:
-            return None
-        return self._row_to_dict(row)
-
-    @staticmethod
-    def _row_to_dict(row) -> dict:
-        return {"state": row[0], "repository": row[1], "task_id": row[2],
-                "commit_sha": row[3], "remote_branch": row[4],
-                "pr_url": row[5], "pr_number": row[6]}
+        return _db.select_delivery_state_by_task(
+            self._conn, repository=repository, task_id=task_id,
+            remote_branch=remote_branch)
 
     def put(self, key: str, record: dict) -> None:
-        self.conn.execute(
-            """INSERT INTO delivery_registry(
-                   key, state, repository, task_id, commit_sha, remote_branch,
-                   pr_url, pr_number, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(key) DO UPDATE SET
-                 state=excluded.state, repository=excluded.repository,
-                 task_id=excluded.task_id, commit_sha=excluded.commit_sha,
-                 remote_branch=excluded.remote_branch, pr_url=excluded.pr_url,
-                 pr_number=excluded.pr_number, updated_at=excluded.updated_at""",
-            (key, record.get("state"), record.get("repository"),
-             record.get("task_id"), record.get("commit_sha"),
-             record.get("remote_branch"), record.get("pr_url"),
-             record.get("pr_number"), time.time()))
-        self.conn.commit()
+        _db.upsert_delivery_state(
+            self._conn, key=key, state=record.get("state"),
+            repository=record.get("repository"), task_id=record.get("task_id"),
+            commit_sha=record.get("commit_sha"),
+            remote_branch=record.get("remote_branch"),
+            pr_url=record.get("pr_url"), pr_number=record.get("pr_number"))
 
 
 # --------------------------------------------------------------------------
@@ -613,6 +666,7 @@ class SqliteDeliveryRegistry(DeliveryRegistry):
 class DeliveryController:
     def __init__(self, *, github_client: GitHubClient, git_workspace: GitWorkspace,
                  registry: Optional[DeliveryRegistry] = None,
+                 db_path: Optional[str] = None,
                  allowed_repos: Optional[set] = None,
                  protected_repos: Optional[set] = None,
                  protected_branches: Optional[set] = None,
@@ -622,6 +676,8 @@ class DeliveryController:
                  max_branch_len: int = MAX_BRANCH_LEN):
         self.github = github_client
         self.git = git_workspace
+        if registry is None and db_path is not None:
+            registry = DbBackedDeliveryRegistry(db_path)
         self.registry = registry or InMemoryDeliveryRegistry()
         self.allowed_repos = set(allowed_repos or set())
         self.protected_repos = set(protected_repos or PROTECTED_REPOS)
@@ -639,6 +695,8 @@ class DeliveryController:
         if (low.startswith("-") or low.endswith("/") or low.endswith(".")
                 or ".." in low):
             raise DeliveryError(BRANCH_INVALID, f"illegal branch name: {name!r}")
+        if low.startswith("refs/") or low.startswith("ref/"):
+            raise DeliveryError(BRANCH_INVALID, f"ref-style branch rejected: {name!r}")
         if any(tok == low or tok in low.split("/")
                for tok in _ILLEGAL_BRANCH_TOKENS):
             raise DeliveryError(BRANCH_INVALID, f"illegal branch token: {name!r}")
@@ -716,6 +774,9 @@ class DeliveryController:
         except Exception:
             return self._blocked(HEAD_NOT_EXPLICIT_COMMIT,
                                  "HEAD is not an explicit commit")
+        if self.git.is_detached_head():
+            return self._blocked(HEAD_NOT_EXPLICIT_COMMIT,
+                                 "workspace is in detached HEAD state")
         if not self.git.is_clean():
             return self._blocked(WORKSPACE_DIRTY,
                                  "workspace has uncommitted or untracked changes")
@@ -751,13 +812,14 @@ class DeliveryController:
         local_branch = local_branch or base_branch
         dry_run = bool(dry_run)
 
-        # 1) Authorization gate (fail-closed).
+        # 1) Authorization gate (fail-closed), binding task + repo + commit.
         if (not isinstance(authorization, DeliveryAuthorization)
-                or not authorization.is_valid_for(task_id, repository)):
+                or not authorization.is_valid_for(task_id, repository, local_commit_sha)):
             return self._blocked(
                 AUTHORIZATION_REQUIRED,
-                "explicit task/repo-scoped authorization required; "
-                "none supplied or mismatch", dry_run=dry_run)
+                "explicit task/repo/commit-scoped authorization required; "
+                "none supplied or mismatch (env token / lease / agent claim "
+                "do NOT count)", dry_run=dry_run)
 
         # 2) Repository allowlist + protected repo (protected always wins).
         if repository in self.protected_repos:
@@ -770,13 +832,13 @@ class DeliveryController:
                 REPOSITORY_NOT_ALLOWED,
                 f"repository not in allowlist: {repository}", dry_run=dry_run)
 
-        # 3) Force push is never allowed.
+        # 3) Force push / remote-branch deletion is never allowed.
         if force:
             return self._blocked(
                 FORCE_PUSH_NOT_ALLOWED, "force push is disabled and rejected",
                 dry_run=dry_run)
 
-        # 4) Branch policy.
+        # 4) Branch policy (also rejects default/protected + path-injection).
         try:
             remote_branch = self.derive_remote_branch(
                 task_id=task_id, issue_number=issue_number, explicit=remote_branch)
@@ -787,33 +849,33 @@ class DeliveryController:
         key = self.idempotency_key(repository, task_id, local_commit_sha,
                                    remote_branch)
 
-        # 6) Local commit validation.
+        # 6) Local commit validation (blocked states never reach push/PR).
         blocked = self._validate_local_commit(local_commit_sha, expected_sha)
         if blocked is not None:
             blocked.idempotency_key = key
             return blocked
 
-        # 7) Idempotency / conflict resolution.
+        # 7) Pre-push diff secret scan (reuses redact; never pushes a leaked secret).
+        secret_hits = scan_diff_for_secrets(self.git.get_commit_diff(local_commit_sha))
+        if secret_hits:
+            return DeliveryStatus(
+                state=DeliveryState.BLOCKED,
+                status_code=COMMIT_CONTAINS_CREDENTIAL,
+                # secret_hits are ALREADY redacted (no raw secret value present).
+                message=f"commit diff contains a suspected credential "
+                        f"{secret_hits}; delivery blocked",
+                idempotency_key=key, dry_run=dry_run)
+
+        # 8) Idempotency / conflict / recovery resolution.
         existing = self.registry.get(key)
         if existing is not None:
-            # Same key (same repo/task/commit/branch) already recorded.
             prev_state = existing.get("state")
-            if prev_state in (DeliveryState.PUSHED, DeliveryState.PR_CREATED,
-                              DeliveryState.PR_CLOSED):
-                if prev_state == DeliveryState.PR_CLOSED:
-                    return DeliveryStatus(
-                        state=DeliveryState.PR_CLOSED,
-                        status_code=DUPLICATE_SUPPRESSED,
-                        message="previous draft PR was closed; manual action required",
-                        pr_url=existing.get("pr_url"),
-                        pr_number=existing.get("pr_number"),
-                        idempotency_key=key, dry_run=dry_run)
-                # PR already exists (or push done) -> do NOT create a second PR.
+            if prev_state == DeliveryState.PR_CREATED:
+                # Already delivered for this exact key -> reuse, no 2nd PR.
                 return DeliveryStatus(
                     state=DeliveryState.PR_CREATED,
                     status_code=DUPLICATE_SUPPRESSED,
-                    message="delivery already completed for this key; "
-                            "duplicate suppressed",
+                    message="delivery already completed for this key; duplicate suppressed",
                     pr_url=existing.get("pr_url"),
                     pr_number=existing.get("pr_number"),
                     idempotency_key=key, dry_run=dry_run,
@@ -824,11 +886,17 @@ class DeliveryController:
                         repository, base_branch, remote_branch, title, body, task_id,
                         issue_number, local_commit_sha, test_summary,
                         security_summary))
-            # A prior failed attempt for the same key: suppress (no duplicate).
-            return DeliveryStatus(
-                state=prev_state, status_code=DUPLICATE_SUPPRESSED,
-                message=f"prior attempt recorded ({prev_state}); duplicate suppressed",
-                idempotency_key=key, dry_run=dry_run)
+            if prev_state == DeliveryState.PR_CLOSED:
+                return DeliveryStatus(
+                    state=DeliveryState.PR_CLOSED, status_code=PR_CLOSED,
+                    message="previous draft PR was closed; manual action required",
+                    pr_url=existing.get("pr_url"),
+                    pr_number=existing.get("pr_number"),
+                    idempotency_key=key, dry_run=dry_run)
+            if prev_state == DeliveryState.PUSHED or prev_state == DeliveryState.PR_FAILED:
+                # Crash / retry recovery: push already done, resume PR creation.
+                pass
+            # PUSH_FAILED / DRY_RUN -> allow a fresh attempt below.
 
         prior = self.registry.get_by_task(repository, task_id, remote_branch)
         if prior is not None and prior.get("commit_sha") != local_commit_sha:
@@ -839,7 +907,7 @@ class DeliveryController:
                 message="same task/branch already delivered with a different commit",
                 idempotency_key=key, dry_run=dry_run)
 
-        # 8) Build structured plans (authorization present, force=false).
+        # 9) Build structured plans (authorization present, force=false).
         push_plan = self._build_push_plan(
             repository, local_branch, local_commit_sha, remote_branch,
             authorization, dry_run)
@@ -847,7 +915,7 @@ class DeliveryController:
             repository, base_branch, remote_branch, title, body, task_id,
             issue_number, local_commit_sha, test_summary, security_summary)
 
-        # 9) Dry-run: no GitHub write calls at all.
+        # 10) Dry-run: no GitHub write calls at all.
         if dry_run:
             self.registry.put(key, {
                 "state": DeliveryState.DRY_RUN, "repository": repository,
@@ -859,26 +927,78 @@ class DeliveryController:
                 push_plan=push_plan, pr_request=pr_request,
                 idempotency_key=key, dry_run=True)
 
-        # 10) Push, then Draft PR (ordered; fail-closed at each step).
-        try:
-            self.github.push(
-                repository=repository, remote_name=self.remote_name,
-                local_commit_sha=local_commit_sha, remote_branch=remote_branch,
-                force=False)
-        except GitHubClientError as e:
+        resume_pr_only = existing is not None and existing.get("state") in (
+            DeliveryState.PUSHED, DeliveryState.PR_FAILED,
+            DeliveryState.PR_CLOSED, DeliveryState.PR_MERGED)
+
+        # 11) Push (unless resuming after a recorded push), then Draft PR.
+        if not resume_pr_only:
+            try:
+                self.github.push(
+                    repository=repository, remote_name=self.remote_name,
+                    local_commit_sha=local_commit_sha, remote_branch=remote_branch,
+                    force=False)
+            except GitHubClientError as e:
+                self.registry.put(key, {
+                    "state": DeliveryState.PUSH_FAILED, "repository": repository,
+                    "task_id": task_id, "commit_sha": local_commit_sha,
+                    "remote_branch": remote_branch, "pr_url": None,
+                    "pr_number": None})
+                return DeliveryStatus(
+                    state=DeliveryState.PUSH_FAILED, status_code=PUSH_FAILED,
+                    message=f"push failed: {_redact_text(str(e))}",
+                    push_plan=push_plan, idempotency_key=key)
             self.registry.put(key, {
-                "state": DeliveryState.PUSH_FAILED, "repository": repository,
+                "state": DeliveryState.PUSHED, "repository": repository,
                 "task_id": task_id, "commit_sha": local_commit_sha,
                 "remote_branch": remote_branch, "pr_url": None, "pr_number": None})
-            return DeliveryStatus(
-                state=DeliveryState.PUSH_FAILED, status_code=PUSH_FAILED,
-                message=f"push failed: {_redact_text(str(e))}",
-                push_plan=push_plan, idempotency_key=key)
 
-        self.registry.put(key, {
-            "state": DeliveryState.PUSHED, "repository": repository,
-            "task_id": task_id, "commit_sha": local_commit_sha,
-            "remote_branch": remote_branch, "pr_url": None, "pr_number": None})
+        # 12) Draft PR — reuse an existing PR for the branch if present
+        #     (robust against push-then-crash / retry duplication).
+        existing_pr = self.github.get_pull_request(
+            repository=repository, head_branch=remote_branch)
+        if existing_pr is not None:
+            st = existing_pr.get("state")
+            if st == "closed":
+                self.registry.put(key, {
+                    "state": DeliveryState.PR_CLOSED, "repository": repository,
+                    "task_id": task_id, "commit_sha": local_commit_sha,
+                    "remote_branch": remote_branch,
+                    "pr_url": existing_pr.get("html_url"),
+                    "pr_number": existing_pr.get("number")})
+                return DeliveryStatus(
+                    state=DeliveryState.PR_CLOSED, status_code=PR_CLOSED,
+                    message="existing draft PR for branch was closed; manual action required",
+                    pr_url=existing_pr.get("html_url"),
+                    pr_number=existing_pr.get("number"),
+                    idempotency_key=key, push_plan=push_plan)
+            if st == "merged":
+                self.registry.put(key, {
+                    "state": DeliveryState.PR_MERGED, "repository": repository,
+                    "task_id": task_id, "commit_sha": local_commit_sha,
+                    "remote_branch": remote_branch,
+                    "pr_url": existing_pr.get("html_url"),
+                    "pr_number": existing_pr.get("number")})
+                return DeliveryStatus(
+                    state=DeliveryState.PR_MERGED, status_code=PR_MERGED,
+                    message="existing draft PR for branch was merged; not re-delivered",
+                    pr_url=existing_pr.get("html_url"),
+                    pr_number=existing_pr.get("number"),
+                    idempotency_key=key, push_plan=push_plan)
+            # open PR already exists -> reuse (no 2nd PR created).
+            self.registry.put(key, {
+                "state": DeliveryState.PR_CREATED, "repository": repository,
+                "task_id": task_id, "commit_sha": local_commit_sha,
+                "remote_branch": remote_branch,
+                "pr_url": existing_pr.get("html_url"),
+                "pr_number": existing_pr.get("number")})
+            return DeliveryStatus(
+                state=DeliveryState.PR_CREATED, status_code=DUPLICATE_SUPPRESSED,
+                message="existing draft PR for branch reused; no duplicate created",
+                pr_url=existing_pr.get("html_url"),
+                pr_number=existing_pr.get("number"),
+                idempotency_key=key, push_plan=push_plan,
+                pr_request=pr_request)
 
         try:
             pr = self.github.create_pull_request(
@@ -893,6 +1013,18 @@ class DeliveryController:
             return DeliveryStatus(
                 state=DeliveryState.PR_FAILED, status_code=PR_CREATION_FAILED,
                 message=f"draft PR creation failed: {_redact_text(str(e))}",
+                push_plan=push_plan, idempotency_key=key)
+
+        if not pr.get("draft"):
+            # GitHub ignored the draft flag -> fail-closed, do NOT mark completed.
+            self.registry.put(key, {
+                "state": DeliveryState.PR_FAILED, "repository": repository,
+                "task_id": task_id, "commit_sha": local_commit_sha,
+                "remote_branch": remote_branch,
+                "pr_url": pr.get("html_url"), "pr_number": pr.get("number")})
+            return DeliveryStatus(
+                state=DeliveryState.PR_FAILED, status_code=PR_CREATION_FAILED,
+                message="GitHub returned a non-draft PR; delivery refused",
                 push_plan=push_plan, idempotency_key=key)
 
         self.registry.put(key, {
