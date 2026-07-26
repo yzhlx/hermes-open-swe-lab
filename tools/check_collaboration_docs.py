@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -340,15 +341,22 @@ def norm(s: str) -> str:
 # 以下模式用于把真实凭据/令牌掩码，避免 checker 自身成为凭据泄露面。
 _SECRET_PATTERNS: List["re.Pattern[str]"] = [
     re.compile(r"sk-[A-Za-z0-9]{16,}"),
+    re.compile(r"sk_live_[A-Za-z0-9]{16,}"),
+    re.compile(r"pk_live_[A-Za-z0-9]{16,}"),
+    re.compile(r"rk_live_[A-Za-z0-9]{16,}"),
     re.compile(r"ghp_[A-Za-z0-9]{16,}"),
     re.compile(r"gho_[A-Za-z0-9]{16,}"),
     re.compile(r"ghu_[A-Za-z0-9]{16,}"),
     re.compile(r"ghs_[A-Za-z0-9]{16,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{16,}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"xoxb-[A-Za-z0-9-]{12,}"),
+    re.compile(r"xox[bpoa]-[A-Za-z0-9-]{10,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"glpat-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"ya29\.[0-9A-Za-z_-]+"),
+    re.compile(r"npm_[0-9A-Za-z]{36,}"),
+    re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),  # JWT
 ]
 
 
@@ -536,6 +544,9 @@ def check_channels(f: List[Finding], doc: Dict[str, str]) -> None:
     if not sec:
         f.append(Finding("C_CHANNELS", DOC_ROADMAP, False,
                          message="未找到频道拓扑章节", found="section missing"))
+        f.append(Finding("C_CHANNELS_CONSISTENCY", f"{DOC_ROADMAP} + {DOC_HUMAN}", False,
+                         message="未找到频道拓扑章节，无法校验跨文档频道一致性",
+                         found="section missing"))
         return
     chs = [t for t in backticked(sec) if t.startswith("#")]
     defaults = [c for c in chs if c != CANONICAL_TEMP_CHANNEL]
@@ -690,88 +701,193 @@ def check_phase_a_def(f: List[Finding], doc: Dict[str, str]) -> None:
     )
 
 
-NEGATION_WORDS = ("不得", "MUST NOT", "不", "禁止", "不允许", "仅经授权")
+# ---------------------------------------------------------------------------
+# 不可信文本归一化 + 子句级否定判定（B2 / F-02 / F-03 共用基座）
+# ---------------------------------------------------------------------------
+
+# 语义子句边界：否定词必须与目标关键词处于同一子句内才算否定。
+_CLAUSE_BOUNDARY_RE = re.compile(r"[，,。！？；;\n、]")
+# 交付方法调用：允许零宽/全角/空格分隔，覆盖 DeliveryController.deliver() /
+# DeliveryController．deliver（ / 等绕过写法（F-03）。
+_DELIVER_CALL_RE = re.compile(r"DeliveryController\W*deliver\s*\(", re.IGNORECASE)
+# push 的等义词（仅代码推送类短语，避免"非代码推送"/"分支推送完成"/"推送提醒"
+# 等合法表述被误判为交付违规，F-03）。英文 push 仍按独立单词匹配。
+_PUSH_SYNONYMS = ("push", "推送分支", "推送代码", "远端推送", "上传分支",
+                  "发布分支", "代码推送", "推送远端")
+# 创建/发起 Draft PR 的动词（含中文近义），用于识别"正向执行 Draft PR"。
+_DRAFT_PR_VERBS = ("创建", "执行", "负责", "发起", "生成", "建", "起草", "开建", "新建")
+# 表示"第二个/另一个/新的" Draft PR 的近义词（rework 期间不得新建，F-03）。
+_SECOND_PR_ALIASES = ("第二个", "第2个", "第 2 个", "另一个", "新的", "再建", "second", "another", "new")
+
+# 否定词表（fail-closed：子句内出现任一即视为否定表述）。
+NEGATION_WORDS = ("不得", "MUST NOT", "不", "禁止", "不允许", "仅经授权",
+                  "不得再次", "不得重复", "不可", "不能", "无法")
+
+# 双重否定 / 反向强调短语：出现即表示"正向授权"，不得当作否定（B2 / §八）。
+# 在子句否定判定前先整体剔除，避免"不得不 / 并非不能 / 不受限制"等被误判为否定
+# 而放过真实违规。替换时保持长度以保留索引对齐。
+_REAFFIRMATIVE = (
+    "不得不", "并非不", "并非不能", "不可能不", "不会不", "不可不", "不能不",
+    "不受限制", "不受影响", "不受约束",
+)
+# "除了 / 除…外" 例外结构："不得 X，除了 Y" 表示 Y 被授权（如"不得做任何事，除了 push"）。
+_EXCEPT_RE = re.compile(r"除了|除.{0,8}外")
 
 
-def _has_affirmative(body: str, keyword: str,
-                     negations: Tuple[str, ...] = NEGATION_WORDS,
-                     window: int = 50, boundary: bool = False) -> bool:
-    """判断 keyword 是否以"正向（非否定）"形式出现在 body 中。
+def normalize_untrusted_text(text: str) -> str:
+    """归一化不可信文档文本，消除用于绕过语义检查的编码技巧。
 
-    若 keyword 之前的 window 个字符内出现任一否定词，则视为否定表述，
-    不计入正向。用于区分"Coding Worker 不得 push"（合法）与
-    "Coding Worker 可 push"（违规），以及"不得再次调用 deliver()"（合法）
-    与"再次调用 deliver()"（违规）。
-
-    boundary=True 时要求 keyword 前后不是单词字符，以排除
-    PUSH_COMPLETED / DRAFT_PR_CREATED 这类事件标识符中的子串匹配。
+    处理：
+      * NFKC：全角字母/数字/标点转 ASCII 等价（ｐｕｓｈ→push、ＰＵＳＨ→PUSH、
+        全角括号→半角），使全宽变体失效；
+      * 剥离零宽字符（\\u200b/\\u200c/\\u200d/\\ufeff），消除 pus\\u200bh 类插入；
+      * 剥离 HTML 注释（<!-- ... -->，支持跨行），消除注释包裹绕过；
+      * 折叠所有空白（含换行）为单空格，支持跨行 ALLOWED_GITHUB_REPOS 解析；
+      * 去除首尾空白。
+    归一化会折叠换行，故"逐行"语义规则需改为在归一化后的整文本上做子串/正则匹配。
     """
+    if not isinstance(text, str):
+        return ""
+    t = unicodedata.normalize("NFKC", text)
+    for z in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        t = t.replace(z, "")
+    t = re.sub(r"<!--.*?-->", " ", t, flags=re.DOTALL)
+    t = re.sub(r"\s+", " ", t)
+    # 大小写归一（§五 要求 #6）：消除 Push/push、ALLOWED_GITHUB_REPOS 等大小写变体。
+    # 安全关键规则全部复用本入口，拉丁关键词匹配均使用 IGNORECASE，故归一后一致。
+    t = t.lower()
+    return t.strip()
+
+
+def _clause_negated(body_n: str, match_start: int,
+                    negations: Tuple[str, ...] = NEGATION_WORDS) -> bool:
+    """判断 body_n 中 match_start 处的匹配是否位于否定子句内。
+
+    取代原 50 字符窗口单字'不'启发式（B2）。判定顺序：
+      * 取包含该匹配的语义子句（以 _CLAUSE_BOUNDARY_RE 为界）；
+      * 子句内若出现"除了 / 除…外"且关键词位于其后，视为例外授权（不判违）；
+      * 先剔除双重否定短语（不得不 / 并非不能 / 不受限制 …），再检查关键词前的
+        子句前缀是否含否定词；
+      * 否定判定大小写不敏感（与 normalize_untrusted_text 的大小写归一配套）。
+    fail-closed：不确定即不判违（视为正向授权 => 触发规则失败）。
+    """
+    cs = match_start
+    while cs > 0 and not _CLAUSE_BOUNDARY_RE.match(body_n[cs - 1]):
+        cs -= 1
+    ce = match_start
+    while ce < len(body_n) and not _CLAUSE_BOUNDARY_RE.match(body_n[ce]):
+        ce += 1
+    clause = body_n[cs:ce]
+    # 例外结构：关键词位于"除了"之后 => 被授权，不算否定（§八：不得做任何事，除了 push）。
+    m_exc = _EXCEPT_RE.search(clause)
+    if m_exc and match_start >= cs + m_exc.end():
+        return False
+    # 剔除双重否定短语（保持长度以保留索引对齐），再取关键词前的子句前缀。
+    cleaned = clause
+    for r in _REAFFIRMATIVE:
+        cleaned = cleaned.replace(r, " " * len(r))
+    prefix = cleaned[:match_start - cs]
+    return any(neg.lower() in prefix.lower() for neg in negations)
+
+
+def _contains_affirmative(body: str, keyword: str,
+                           negations: Tuple[str, ...] = NEGATION_WORDS,
+                           boundary: bool = False) -> bool:
+    """判断 keyword 是否以正向（非否定）形式出现在 body 中（B2 子句级否定）。
+
+    否定词必须与关键词处于同一语义子句内才算否定（取代原 50 字符窗口单字
+    '不'启发式），避免双向误判：既不会把"不得 push"误判为违规，也不会把
+    "可 push"漏判。boundary=True 时要求 keyword 前后非单词字符，排除
+    PUSH_COMPLETED 等标识符子串。
+    """
+    body_n = normalize_untrusted_text(body)
     pat = re.escape(keyword)
     if boundary:
         pat = r"(?<![\w])" + pat + r"(?![\w])"
-    for m in re.finditer(pat, body, re.IGNORECASE):
-        before = body[max(0, m.start() - window):m.start()]
-        if not any(neg in before for neg in negations):
+    for m in re.finditer(pat, body_n, re.IGNORECASE):
+        if not _clause_negated(body_n, m.start(), negations):
             return True
     return False
 
 
 def _contains_affirmative_deliver(body: str) -> bool:
-    return _has_affirmative(body, "DeliveryController.deliver()")
-
-
-# 仅当"创建/执行 Draft PR"等动作动词出现且无否定时，才算正向执行动作；
-# 排除"评审 Draft PR"这类合法引用。
-_CREATION_VERBS = ("创建", "执行", "负责", "发起", "生成", "建")
+    """正向（非否定）声明调用 DeliveryController.deliver()（F-03 强化）。"""
+    body_n = normalize_untrusted_text(body)
+    for m in _DELIVER_CALL_RE.finditer(body_n):
+        if not _clause_negated(body_n, m.start(), NEGATION_WORDS):
+            return True
+    return False
 
 
 def _contains_affirmative_push_or_draft_pr(body: str) -> bool:
-    """正向（非否定）地声明执行 push 或创建 Draft PR。
+    """正向（非否定）地声明执行 push 或创建 Draft PR（F-03 强化）。
 
-    排除事件标识符中的子串（如 PUSH_COMPLETED / DRAFT_PR_CREATED），
-    以及"评审 Draft PR"这类仅引用、非执行的合法表述。
+    覆盖英文 push（独立单词，排除 PUSH_COMPLETED 等标识符）及其中文近义
+    （推送分支/推送代码/上传分支/发布分支/远端推送/代码推送/推送远端），以及
+    "创建/发起/… Draft PR"各类中文动词近义。排除两类合法表述：
+      * 子句级否定（如"不得推送分支"/"不创建 Draft PR"）由 _clause_negated 处理；
+      * 紧邻"非"前缀的代码推送短语——"非代码推送"指非代码类推送
+        （标签/Issue 更新等），属合法表述，不得误判为交付违规。
     """
-    # "push" 仅作为独立单词匹配（排除 PUSH_COMPLETED 等标识符）
-    if _has_affirmative(body, "push", boundary=True):
-        return True
-    # "Draft PR" 仅在伴随创建/执行动词且无否定时才计为执行动作
-    for verb in _CREATION_VERBS:
-        for m in re.finditer(verb + r"\s*Draft PR", body, re.IGNORECASE):
-            before = body[max(0, m.start() - 50):m.start()]
-            if not any(neg in before for neg in NEGATION_WORDS):
+    body_n = normalize_untrusted_text(body)
+    for kw in _PUSH_SYNONYMS:
+        if kw == "push":
+            pat = r"(?<![\w])push(?![\w])"
+        else:
+            pat = re.escape(kw)
+        for m in re.finditer(pat, body_n, re.IGNORECASE):
+            # 排除"非代码推送"：向前跳过空格，首个非空字符为"非"即视为否定前缀。
+            j = m.start() - 1
+            while j >= 0 and body_n[j] == " ":
+                j -= 1
+            if j >= 0 and body_n[j] == "非":
+                continue
+            if not _clause_negated(body_n, m.start(), NEGATION_WORDS):
+                return True
+    for verb in _DRAFT_PR_VERBS:
+        target = verb + " Draft PR"
+        for m in re.finditer(re.escape(target), body_n, re.IGNORECASE):
+            if not _clause_negated(body_n, m.start(), NEGATION_WORDS):
                 return True
     return False
 
 
 def _release_violates_post_review(ra_body: str) -> bool:
-    """True 表示 Release Agent 被正向描述为 Review 之后复投 / 创建第二个 Draft PR。
+    """Release Agent 被正向描述为 Review 之后复投 / 创建第二个 Draft PR。
 
-    文档允许（且要求）显式禁止这些行为（"不得再次调用 deliver()、不得重复创建
-    Draft PR"），故仅当"再次调用 deliver()/创建第二个 Draft PR"以正向形式出现时才判违。
+    仅当"创建第二个/另一个/新的 Draft PR"或"再次/重复调用 deliver()"以**正向
+    （非否定）**形式出现时才判违（"不得再次调用 deliver()"为合法否定表述）。
     """
-    if "创建第二个" in ra_body and "Draft PR" in ra_body:
-        return True
-    m = re.search(r"再次调用\s*`?DeliveryController\.deliver\(\)`?", ra_body)
-    if m and "不得" not in ra_body[max(0, m.start() - 30):m.end()]:
-        return True
+    ra_n = normalize_untrusted_text(ra_body)
+    second_pr_re = re.compile(
+        r"创建\s*(?:" + "|".join(re.escape(a) for a in _SECOND_PR_ALIASES) +
+        r")\s*Draft PR", re.IGNORECASE)
+    for m in second_pr_re.finditer(ra_n):
+        if not _clause_negated(ra_n, m.start(), NEGATION_WORDS):
+            return True
+    for m in _DELIVER_CALL_RE.finditer(ra_n):
+        before = ra_n[max(0, m.start() - 15):m.start()]
+        if re.search(r"再次|重复|re-?deliver|another|second", before, re.IGNORECASE) \
+                and not _clause_negated(ra_n, m.start(), NEGATION_WORDS):
+            return True
     return False
 
 
 def _release_delivery_after_review(ra_body: str) -> bool:
-    """True 表示 Release Agent 被正向（非否定）描述为在 Review 之后才执行受控交付
-    （push / 创建 Draft PR / deliver）。
+    """Release Agent 被正向（非否定）描述为在 Review 之后才执行受控交付。
 
     真实文档中"Review 通过后进入验收协调：仅发起 USER_ACTION_REQUIRED，
-    不得再次调用 deliver()"属于合法的后置验收阶段——其中 deliver 为否定表述，
-    不在本检查范围内。本检查仅当"Review 之后/通过后"紧随**非否定**的交付动词
-    （push / 创建 Draft PR / deliver / 受控交付）时才判违。
+    不得再次调用 deliver()"属于合法后置验收阶段。本检查仅当"Review 之后/通过后"
+    紧随**非否定**的交付动词（push / 推送 / 创建 Draft PR / deliver / 受控交付）
+    时才判违。
     """
-    for m in re.finditer(r"Review\s*(?:之后|通过后|完成后)", ra_body, re.IGNORECASE):
-        after = ra_body[m.end():m.end() + 60]
-        for vm in re.finditer(r"push|创建\s*Draft PR|deliver|受控交付|交付", after, re.IGNORECASE):
-            before_v = after[max(0, vm.start() - 20):vm.start()]
-            if not any(neg in before_v for neg in NEGATION_WORDS):
-                return True
+    ra_n = normalize_untrusted_text(ra_body)
+    for m in re.finditer(r"Review\s*(?:之后|通过后|完成后)", ra_n, re.IGNORECASE):
+        after = ra_n[m.end():m.end() + 80]
+        for kw in ("push", "推送", "创建 Draft PR", "deliver", "受控交付"):
+            for mm in re.finditer(re.escape(kw), after, re.IGNORECASE):
+                if not _clause_negated(after, mm.start(), NEGATION_WORDS):
+                    return True
     return False
 
 
@@ -820,7 +936,7 @@ def check_draft_pr_responsibility(f: List[Finding], doc: Dict[str, str]) -> None
     if cw is not None:
         if _contains_affirmative_push_or_draft_pr(cw):
             problems.append("Coding Worker 被描述为执行 push / 创建 Draft PR（违反仅本地 Commit 责任）")
-        if _has_affirmative(cw, "交付凭据") or _has_affirmative(cw, "GitHub 交付凭据"):
+        if _contains_affirmative(cw, "交付凭据") or _contains_affirmative(cw, "GitHub 交付凭据"):
             problems.append("Coding Worker 被描述为接触 GitHub 交付凭据")
     other_deliverers = [name for name, b in bodies.items()
                         if name not in ("Release Agent", "Coding Worker")
@@ -866,7 +982,8 @@ def check_max_rounds(f: List[Finding], doc: Dict[str, str]) -> None:
     "re-review 上限 2"。文档实际保证 MAX_ROUNDS=2，故断言之。
     """
     all_text = "\n".join(doc.get(dk, "") for dk in ALL_DOCS)
-    ok = bool(re.search(r"MAX_ROUNDS\s*=\s*2", all_text, re.IGNORECASE)) or \
+    # \b 防止 MAX_ROUNDS=20 误判为 =2（§9 修复）
+    ok = bool(re.search(r"MAX_ROUNDS\s*=\s*2\b", all_text, re.IGNORECASE)) or \
          ("review rounds: 2" in all_text.lower()) or \
          ("re-review 上限 2" in all_text)
     f.append(
@@ -1232,20 +1349,58 @@ def check_no_second_truth(f: List[Finding], doc: Dict[str, str]) -> None:
     )
 
 
+def _allowed_repos_contains_protected(text_n: str) -> bool:
+    """判断归一化文本中 ALLOWED_GITHUB_REPOS 的赋值是否包含受保护仓库。
+
+    覆盖多种写法（F-02 跨行/多格式绕过）：
+      * set / list / tuple 字面量（可跨行）：ALLOWED_GITHUB_REPOS = { a, b }
+        / [ a, b ] / ( a, b )
+      * 行内/冒号：ALLOWED_GITHUB_REPOS: a
+      * YAML list：ALLOWED_GITHUB_REPOS:\n  - a
+      * Markdown bullet
+      * 逗号分隔 / 引号包围
+      * 全角/零宽/HTML 注释变体（由归一化统一处理）
+    仅当受保护仓库出现在赋值**值**区间内才判泄露，说明句（如
+    "ALLOWED / PROTECTED 约束；hermes-learning-os 永不…"）不误判。
+    """
+    prot = normalize_untrusted_text(PROTECTED_REPO)
+    # Form 1：赋值集合（{...} / [...] / (...)），归一化后跨行已折叠为单行。
+    # 按开括号类型匹配对应闭括号，支持 list / tuple / set 三种容器。
+    # 必须遍历全部出现位置（Buzz 文档与 ROADMAP 各自可能声明一次）。
+    for m in re.finditer(r"ALLOWED_GITHUB_REPOS\s*=\s*([\{\[\(])", text_n, re.IGNORECASE):
+        open_ch = m.group(1)
+        close_ch = {"{": "}", "[": "]", "(": ")"}.get(open_ch, "}")
+        depth = 0
+        close = -1
+        for j in range(m.end() - 1, len(text_n)):
+            if text_n[j] == open_ch:
+                depth += 1
+            elif text_n[j] == close_ch:
+                depth -= 1
+                if depth == 0:
+                    close = j
+                    break
+        seg = text_n[m.end():close] if close != -1 else text_n[m.end():]
+        if prot in seg:
+            return True
+    # Form 2：行内/冒号/列表（值延伸到下一个同类键、句点，或文末）
+    for m in re.finditer(r"ALLOWED_GITHUB_REPOS\s*[:\-]\s*", text_n, re.IGNORECASE):
+        rest = text_n[m.end():]
+        m2 = re.search(r"(?=ALLOWED_|PROTECTED_|\.|$)", rest)
+        end = m2.start() if m2 else len(rest)
+        if prot in rest[:end]:
+            return True
+    return False
+
+
 def check_protected_repo(f: List[Finding], doc: Dict[str, str]) -> None:
     all_text = "\n".join(doc.get(dk, "") for dk in ALL_DOCS)
-    present = PROTECTED_REPO in all_text
-    associated = ("PROTECTED_REPOS" in all_text and PROTECTED_REPO in all_text) or \
-                 (PROTECTED_REPO in all_text and ("永久保护" in all_text or "保护" in all_text))
-    # ALLOWED_GITHUB_REPOS 的赋值句中不得包含受保护仓库。逐行判断，仅当
-    # 同一行内出现赋值式（= / : / {）后紧跟受保护仓库时才视为泄露，避免
-    # "ALLOWED / PROTECTED 约束；hermes-learning-os 永不…"这类说明句被误判。
-    leak = False
-    for line in all_text.splitlines():
-        if "ALLOWED_GITHUB_REPOS" in line and PROTECTED_REPO in line:
-            if re.search(r"ALLOWED_GITHUB_REPOS\s*[=:{].*?" + re.escape(PROTECTED_REPO), line):
-                leak = True
-                break
+    all_n = normalize_untrusted_text(all_text)
+    present = PROTECTED_REPO in all_n
+    associated = ("protected_repos" in all_n and PROTECTED_REPO in all_n) or \
+                 (PROTECTED_REPO in all_n and ("永久保护" in all_n or "保护" in all_n))
+    # ALLOWED_GITHUB_REPOS 的赋值区间不得包含受保护仓库（跨行/多格式解析，F-02）。
+    leak = _allowed_repos_contains_protected(all_n)
     ok = present and associated and not leak
     f.append(
         Finding(
@@ -1319,8 +1474,10 @@ def check_release_agent_two_stage_duty(f: List[Finding], doc: Dict[str, str]) ->
         f.append(Finding("S_RELEASE_AGENT_TWO_STAGE_DUTY", DOC_ROLE, False,
                          message="未找到 Release Agent 角色小节", found="section missing"))
         return
-    has_controlled = "受控" in ra
-    has_first = "首次" in ra
+    # 归一化后做子串判定，并排除"不受控"/"非首次"等反转写法（§9 修复）。
+    ra_n = normalize_untrusted_text(ra)
+    has_controlled = bool(re.search(r"(?<!不)受控", ra_n))
+    has_first = bool(re.search(r"(?<!非)首次", ra_n))
     ok = has_controlled and has_first
     f.append(Finding(
         "S_RELEASE_AGENT_TWO_STAGE_DUTY", DOC_ROLE, ok,
@@ -1431,8 +1588,10 @@ def check_final_acceptance_blocking(f: List[Finding], doc: Dict[str, str]) -> No
     **不得**触发/归档（任务视为阻塞）。若改为"可以提前"则判违。
     """
     all_text = "\n".join(doc.get(dk, "") for dk in ALL_DOCS)
-    ok = bool(re.search(r"TASK_COMPLETED[^。\n]{0,15}不得触发/归档", all_text)) or \
-         bool(re.search(r"不得触发/归档[^。\n]{0,15}TASK_COMPLETED", all_text))
+    # 否定词"不得"必须直接修饰"触发/归档"；"不得不触发"为双重否定（=必须触发），
+    # 属违规授权，必须用负向后查排除（§十一：不得把"不得不触发"误判为"不得触发"）。
+    ok = bool(re.search(r"TASK_COMPLETED[^。\n]{0,15}(?<!不)不得触发/归档", all_text)) or \
+         bool(re.search(r"(?<!不)不得触发/归档[^。\n]{0,15}TASK_COMPLETED", all_text))
     f.append(Finding(
         "S_FINAL_ACCEPTANCE_BLOCKING", "ALL", ok,
         message="FINAL_ACCEPTANCE 完成前 TASK_COMPLETED 不得触发/归档（任务视为阻塞）"
@@ -1538,8 +1697,9 @@ def _print_human(summary: Dict[str, object], findings: List[Finding], docs: List
         print("失败规则:")
         for x in fails:
             print(f"  [FAIL] {x.rule_id}  @ {x.doc}")
-            print(f"         {x.message}")
-            print(f"         实际发现: {x.found}")
+            # 不可信文档片段回显前先脱敏，避免 checker 成为凭据泄露面（B1）。
+            print(f"         {redact(x.message)}")
+            print(f"         实际发现: {redact(x.found)}")
     else:
         print("所有规则通过 ✅")
     print("-" * 72)
@@ -1564,9 +1724,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             path = _safe_doc_path(args.docs_dir, dk)
         except ValueError as exc:
             if args.json:
-                print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
+                print(json.dumps({"ok": False, "error": redact(str(exc))}, ensure_ascii=False, indent=2))
             else:
-                print("ERROR: " + str(exc))
+                print("ERROR: " + redact(str(exc)))
             return 2
         if not os.path.isfile(path):
             missing.append(path)
@@ -1576,9 +1736,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if missing:
         msg = f"缺少文档文件: {missing}"
         if args.json:
-            print(json.dumps({"ok": False, "error": msg, "missing": missing}, ensure_ascii=False, indent=2))
+            print(json.dumps({"ok": False, "error": redact(msg), "missing": missing}, ensure_ascii=False, indent=2))
         else:
-            print("ERROR: " + msg)
+            print("ERROR: " + redact(msg))
         return 2
 
     findings = run_checks(doc_contents)

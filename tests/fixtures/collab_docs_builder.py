@@ -613,13 +613,108 @@ def _bad_protected_repo(docs):
     return _mutate(docs, cc.DOC_ROADMAP, old, new)
 
 
+# ---------------------------------------------------------------------------
+# 第二轮补强规则（9 条）的 fail/mutation 变体（CQ1 修复）
+# 此前这些规则只有正向（good）断言、缺反向（bad）断言，无法证明检查器真能
+# 捕获对应语义破坏。每条变体精确触发其目标语义断言失败。
+# ---------------------------------------------------------------------------
+
+@_m("S_DELIVER_LOGICAL_ROLE_UNIQUE")
+def _bad_deliver_logical_role_unique(docs):
+    # 让 QA Agent（非 Release Agent）正向调用 deliver()，破坏"唯一逻辑调用方"。
+    old = "### 3.6 `QA Agent`\n\n| 字段 | 定义 |"
+    new = "### 3.6 `QA Agent`\n\nQA Agent 调用 DeliveryController.deliver() 执行交付。\n\n| 字段 | 定义 |"
+    d = dict(docs)
+    assert old in d[cc.DOC_ROLE], "QA Agent anchor not found"
+    d[cc.DOC_ROLE] = d[cc.DOC_ROLE].replace(old, new, 1)
+    return d
+
+
+@_m("S_RELEASE_AGENT_START_ORDER")
+def _bad_release_agent_start_order(docs):
+    # 把"在 CI 与 Independent Reviewer 之前"改为"之后"，破坏正向启动时点约束。
+    d = dict(docs)
+    for dk in (cc.DOC_ROLE, cc.DOC_ROADMAP):
+        if "在 CI 与 Independent Reviewer 之前" in d.get(dk, ""):
+            d[dk] = d[dk].replace("在 CI 与 Independent Reviewer 之前",
+                                  "在 CI 与 Independent Reviewer 之后")
+    return d
+
+
+@_m("S_RELEASE_AGENT_TWO_STAGE_DUTY")
+def _bad_release_agent_two_stage_duty(docs):
+    # 移除 Release Agent 的"受控"标识（两阶段职责缺一项即失败）。
+    d = dict(docs)
+    role = d[cc.DOC_ROLE]
+    role = role.replace("编排受控交付", "编排交付")
+    role = role.replace("受控 Push", "Push")
+    d[cc.DOC_ROLE] = role
+    return d
+
+
+@_m("S_CANONICAL_LIFECYCLE_COMPLETE")
+def _bad_canonical_lifecycle(docs):
+    # 重排 ACTIVITY 生命周期，使 Review 出现在 Draft PR 之前（破坏双处一致）。
+    old = "Issue → Plan → Code/Test → Commit → controlled delivery (push + Draft PR via DeliveryController.deliver()) → CI → Independent Review → rework on same PR (若 REQUEST_CHANGES，受 MAX_ROUNDS=2) → FINAL_ACCEPTANCE (Human Owner) → TASK_COMPLETED"
+    new = old.replace(
+        "controlled delivery (push + Draft PR via DeliveryController.deliver()) → CI → Independent Review",
+        "Independent Review → controlled delivery (push + Draft PR via DeliveryController.deliver()) → CI",
+    )
+    return _mutate(docs, cc.DOC_ACTIVITY, old, new)
+
+
+@_m("S_PHASE_B_LIFECYCLE_COMPLETE")
+def _bad_phase_b_lifecycle_complete(docs):
+    # 移除 Phase B 验收标准中的"不新建第 2 个 PR"约束。
+    old = "8. rework 的 Commit 再次经 Release Agent 受控 Push（不新建第 2 个 PR）。"
+    new = "8. rework 的 Commit 再次经 Release Agent 受控 Push（新建第 2 个 PR）。"
+    return _mutate(docs, cc.DOC_ROADMAP, old, new)
+
+
+@_m("S_REWORK_SAME_PR")
+def _bad_rework_same_pr(docs):
+    # 把"不新建第 2 个 PR"改为肯定式，破坏 rework 复用同 PR 约束。
+    old = "不新建第 2 个 PR"
+    new = "可新建第 2 个 PR"
+    return _mutate(docs, cc.DOC_ROADMAP, old, new)
+
+
+@_m("S_FINAL_ACCEPTANCE_BLOCKING")
+def _bad_final_acceptance_blocking(docs):
+    # 把"TASK_COMPLETED 不得触发/归档"改为肯定式，破坏 FINAL_ACCEPTANCE 前阻塞。
+    old = "TASK_COMPLETED 不得触发/归档"
+    new = "TASK_COMPLETED 可以触发/归档"
+    return _mutate(docs, cc.DOC_ROADMAP, old, new)
+
+
+@_m("S_ROLE_CONTRACT_FULL_NAMES")
+def _bad_role_contract_full_names(docs):
+    # 在 ROADMAP 正文（非表格）注入裸歧义简称 Master，破坏全文档完整名约束。
+    old = "统一任务生命周期验收标准（12 点，与 ACTIVITY §1.2.1 一致）："
+    new = "统一任务生命周期验收标准（12 点，与 ACTIVITY §1.2.1 一致）：由 Master 负责协调。"
+    return _mutate(docs, cc.DOC_ROADMAP, old, new)
+
+
+def mutate_allowed_repos_line(docs: dict, new_line: str) -> dict:
+    """把 ROADMAP 中 `ALLOWED_GITHUB_REPOS = {ALLOWED_REPO}` 整行替换为 new_line。
+
+    供 F-02 跨行/多格式绕过变体的 PoC 测试复用（不注册为规则 mutator）。
+    """
+    d = dict(docs)
+    rm = d[cc.DOC_ROADMAP]
+    old = "ALLOWED_GITHUB_REPOS = {" + ALLOWED_REPO + "}"
+    assert old in rm, "ALLOWED_GITHUB_REPOS anchor not found"
+    d[cc.DOC_ROADMAP] = rm.replace(old, new_line, 1)
+    return d
+
+
 def build_bad_docs(rule_id: str) -> dict:
     if rule_id not in _MUTATORS:
         raise KeyError(f"no mutator for rule {rule_id}")
     return _MUTATORS[rule_id](build_good_docs())
 
 
-# 全部需要覆盖的规则
+# 全部需要覆盖的规则（38 条 = 13 C_ 结构化 + 25 S_ 语义）
 RULE_IDS = [
     "C_ROLES_COUNT", "C_ROLES_CONSISTENCY", "C_ROLE_FIELDS_COUNT", "C_ROLE_FIELDS_PER_ROLE",
     "C_EVENTS_COUNT", "C_EVENTS_FORBIDDEN", "C_UAR_COUNT", "C_CHANNELS", "C_CHANNELS_CONSISTENCY",
@@ -630,6 +725,11 @@ RULE_IDS = [
     "S_NO_SECOND_TRUTH_BUZZ", "S_NO_SECOND_TRUTH_CANVAS", "S_NO_SECOND_TRUTH_ACTIVITY",
     "S_PROTECTED_REPO",
     "S_MAX_ROUNDS", "S_LIFECYCLE_REVIEW_ON_PR", "S_ROLE_FULLNAME",
+    # 第二轮补强（9 条）—— 此前缺 fail/mutation 测试（CQ1 修复）
+    "S_DELIVER_LOGICAL_ROLE_UNIQUE", "S_RELEASE_AGENT_START_ORDER",
+    "S_RELEASE_AGENT_TWO_STAGE_DUTY", "S_CANONICAL_LIFECYCLE_COMPLETE",
+    "S_PHASE_B_LIFECYCLE_COMPLETE", "S_REWORK_SAME_PR",
+    "S_FINAL_ACCEPTANCE_BLOCKING", "S_ROLE_CONTRACT_FULL_NAMES",
 ]
 
 
