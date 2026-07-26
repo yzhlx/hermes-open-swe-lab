@@ -42,7 +42,7 @@
 
 | # | 事件名 (Event) | 触发时机 | 典型 `status` | `github_refs` 关联 |
 |---| --- | --- | --- | --- |
-| 1 | `TASK_STARTED` | 任务被 Scheduler 派发、Agent 会话启动 | `running` | `issue` |
+| 1 | `TASK_STARTED` | 任务被 `Planner / Scheduler` 派发、Agent 会话启动 | `running` | `issue` |
 | 2 | `PLAN_UPDATED` | 计划/范围/验收标准变更（如 Canvas `Scope`/`Acceptance Criteria`） | `success` | `issue` |
 | 3 | `FILE_READ` | Agent 读取仓库文件 | `success` | `commit` |
 | 4 | `FILE_MODIFIED` | Agent 修改工作树文件 | `success` | `commit`（待） |
@@ -51,8 +51,8 @@
 | 7 | `TEST_STARTED` | 测试套件开始 | `running` | `check` |
 | 8 | `TEST_FINISHED` | 测试结束（通过/失败计数） | `success`/`failure` | `check` |
 | 9 | `COMMIT_CREATED` | 提交生成 | `success` | `commit` |
-| 10 | `PUSH_COMPLETED` | 分支推送完成（经 `delivery.py`） | `success`/`failure` | `commit` |
-| 11 | `DRAFT_PR_CREATED` | Draft PR 已创建（强制 draft，永不 merge） | `success` | `pr` |
+| 10 | `PUSH_COMPLETED` | 分支推送完成（经 `Release Agent` → `DeliveryController.deliver()`） | `success`/`failure` | `commit` |
+| 11 | `DRAFT_PR_CREATED` | Draft PR 已创建（经 `Release Agent` → `DeliveryController.deliver()`，唯一创建方；强制 draft，永不 merge） | `success` | `pr` |
 | 12 | `CI_PENDING` | CI 检查排队/进行中 | `pending`/`running` | `check` |
 | 13 | `CI_PASSED` | CI 全部通过 | `success` | `check` |
 | 14 | `CI_FAILED` | CI 失败 | `failure` | `check` |
@@ -70,9 +70,9 @@
 
 全系统唯一遵循的任务生命周期（任何角色/文档不得改写顺序）：
 
-`Issue → Plan → Code/Test → Commit → controlled delivery (push + Draft PR via `DeliveryController.deliver()`) → CI → Independent Review → rework on same PR (若 `REQUEST_CHANGES`，受 `MAX_ROUNDS=2`) → FINAL_ACCEPTANCE (Human Owner) → TASK_COMPLETED`
+`Issue → Plan → Code/Test → Commit → Release Agent controlled delivery (push + Draft PR via `DeliveryController.deliver()`) → CI → Independent Review → rework on same PR (若 `REQUEST_CHANGES`，受 `MAX_ROUNDS=2`) → FINAL_ACCEPTANCE (Human Owner) → TASK_COMPLETED`
 
-- **Draft PR 的唯一负责方是 `DeliveryController.deliver()`（受控交付）。** `Coding Worker` 触发受控交付；`Release Agent` 编排交付但**不得重复声明创建 Draft PR**。
+- **`Release Agent` 是唯一被允许调用 `DeliveryController.deliver()` 的逻辑角色；`DeliveryController.deliver()` 是创建 Draft PR 的唯一执行方法（受控交付）。** `Coding Worker` 仅完成本地 Commit 与测试证据、不得调用 `deliver()`；`Release Agent` 在 CI 与 `Independent Reviewer` 之前执行首次交付，但**不得重复声明创建 Draft PR**。
 - `Independent Review` 必须在既有 Draft PR 上进行（Review 不先于 PR 存在）。
 - `TASK_COMPLETED` 只能在 `FINAL_ACCEPTANCE` 完成后触发（见 §1.2 #21）。
 

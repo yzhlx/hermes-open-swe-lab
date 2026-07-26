@@ -85,7 +85,7 @@
 
 | 字段 | 定义 |
 | --- | --- |
-| 唯一职责 | 顶层 Master 决策：任务分配、跨角色协调、Phase 推进、冲突仲裁；对 `Hermes Engineering Controller` 负总责。 |
+| 唯一职责 | 顶层 `Hermes Master / Boss` 决策：任务分配、跨角色协调、Phase 推进、冲突仲裁；对 `Hermes Engineering Controller` 负总责。 |
 | 允许读取的数据 | 全部 Hermes 控制层状态、Activity Feed 聚合、GitHub 同步状态、Canvas 摘要。 |
 | 允许调用的工具 | 控制层内部分发器、`Planner / Scheduler`、`Independent Reviewer` 编排接口、人工介入中心。 |
 | 允许写入的位置 | 控制层状态存储；Canvas 的 `Goal`/`Scope`/`Assigned Roles`/`Current Status`/`Decisions` 字段（标注 actor）。 |
@@ -109,34 +109,34 @@
 | 允许调用的工具 | 控制层状态机、`AgentRuntimeAdapter`（`submit_task()`/`resume_session()`/`cancel_task()`）、受限 MCP `workspace_*` 工具（读取类）。 |
 | 允许写入的位置 | 控制层任务状态；GitHub Issue（计划/标签，非代码）；Canvas 的 `Scope`/`Out of Scope`/`Acceptance Criteria`/`Assigned Roles`/`Current Status`/`Next Step`。 |
 | 禁止操作 | 不得自行改代码；不得 merge；不得绕过返工上限；不得向非允许仓库写。 |
-| 输入契约 | Master 分配的目标 + GitHub Issue；遵循 `constants.py` 的 `ROLE_SCHEDULER`。 |
+| 输入契约 | `Hermes Master / Boss` 分配的目标 + GitHub Issue；遵循 `constants.py` 的 `ROLE_SCHEDULER`。 |
 | 输出契约 | 计划、任务派发、标签变更、`round-2` 信号；均落 GitHub/控制层权威记录。 |
-| 任务开始条件 | Master 分配或新 Issue 入队。 |
+| 任务开始条件 | `Hermes Master / Boss` 分配或新 Issue 入队。 |
 | 完成条件 | 任务达终态或交付给下一角色；状态已持久化。 |
 | 失败和升级路径 | 达 `MAX_ROUNDS` 仍失败 → 升级 `Human Owner`（发 `USER_ACTION_REQUIRED` 或 `TASK_BLOCKED`）。 |
 | 是否允许修改代码 | 否 |
 | 是否允许操作 GitHub | 仅经授权（经 `delivery.py` 受控、非代码推送；标签/Issue 更新） |
 | 是否允许接触凭据 | 否 |
-| 是否允许请求用户授权 | 是（经 Master 或代表控制层发起） |
+| 是否允许请求用户授权 | 是（经 `Hermes Master / Boss` 或代表控制层发起） |
 
 ### 3.4 `Coding Worker`
 
 | 字段 | 定义 |
 | --- | --- |
-| 唯一职责 | 实际代码实现：在沙箱内编辑目标仓库工作树、运行测试、提交、推送分支、开 Draft PR（经 `delivery.py`）。映射到 `ROLE_CODING_AGENT`。 |
+| 唯一职责 | 实际代码实现：在沙箱内编辑目标仓库工作树、运行测试、创建**本地 Commit**、输出 Commit SHA / 测试结果 / 证据；**MUST NOT** push、MUST NOT 创建 Draft PR、MUST NOT 调用 `DeliveryController.deliver()`、MUST NOT 接触 GitHub 交付凭据。映射到 `ROLE_CODING_AGENT`。 |
 | 允许读取的数据 | 目标仓库源码、GitHub Issue/PR diff、CI 结果、Canvas 的 `Acceptance Criteria`/`Evidence`、受限 MCP 提供的任务上下文。 |
 | 允许调用的工具 | `AgentRuntimeAdapter` 运行时（`Open SWE` 第一版）、受限 MCP `workspace_*` 工具、沙箱内 git/测试命令（经 `HermesDockerSandboxBackend`）。 |
 | 允许写入的位置 | 仅 `ALLOWED_GITHUB_REPOS`（`yzhlx/hermes-open-swe-smoke-test`）的目标分支；Canvas 的 `Current Status`/`Evidence` 字段。 |
-| 禁止操作 | 不得触碰 `PROTECTED_REPOS`（`yzhlx/hermes-learning-os`）；不得 push `main`、force-push、merge；不得持有 GitHub 令牌（仅 push 步骤被注入）；不得绕过 `delivery.py`。 |
-| 输入契约 | `AgentRuntimeAdapter.submit_task()` 派发的任务 + 受控授权 `DeliveryAuthorization`（`GRANT_PUSH_AND_DRAFT_PR`，task+repo+commit 绑定）。 |
-| 输出契约 | 提交 SHA、Draft PR URL、测试结果；通过 Activity 事件（`COMMIT_CREATED`/`PUSH_COMPLETED`/`DRAFT_PR_CREATED` 等）回流。 |
-| 任务开始条件 | Scheduler 派发且获得有效 `DeliveryAuthorization`。 |
-| 完成条件 | 经 `delivery.py` 的 `DeliveryController.deliver()` 完成受控交付（push + Draft PR 创建，唯一负责方），CI 已触发；状态写入控制层与 GitHub。 |
+| 禁止操作 | 不得触碰 `PROTECTED_REPOS`（`yzhlx/hermes-learning-os`）；不得 push、不得 force-push、不得 merge、不得创建 Draft PR、不得调用 `DeliveryController.deliver()`、不得持有/接触任何 GitHub 交付凭据；不得绕过交付纪律。 |
+| 输入契约 | `AgentRuntimeAdapter.submit_task()` 派发的任务（含目标仓库/分支与验收标准）；不涉及 `DeliveryAuthorization`（受控交付由 `Release Agent` 负责）。 |
+| 输出契约 | Commit SHA、测试结果、证据链接；通过 Activity 事件（`COMMIT_CREATED`/`TEST_FINISHED` 等）回流；`PUSH_COMPLETED`/`DRAFT_PR_CREATED` 由 `Release Agent` 受控交付阶段产生。 |
+| 任务开始条件 | `Planner / Scheduler` 派发任务。 |
+| 完成条件 | 测试通过 + 本地 Commit 已创建 + Commit SHA 和证据已持久化；随后由 `Planner / Scheduler` 移交 `Release Agent` 进入受控交付阶段。 |
 | 失败和升级路径 | CI/Review 失败 → 进入 `REWORK_STARTED`（受 `MAX_ROUNDS` 约束）；超限升级 `Human Owner`。 |
 | 是否允许修改代码 | 是（仅允许仓库、仅目标分支） |
-| 是否允许操作 GitHub | 仅经授权（经 `delivery.py`：push + Draft PR，永不 merge） |
-| 是否允许接触凭据 | 否（令牌仅在 push 步骤局部注入并丢弃） |
-| 是否允许请求用户授权 | 否（须经 Scheduler/Master 代为发起） |
+| 是否允许操作 GitHub | 否（仅创建本地 Commit；不得 push、不得创建 Draft PR、不得接触 GitHub 交付凭据） |
+| 是否允许接触凭据 | 否（不接触任何 GitHub 交付凭据） |
+| 是否允许请求用户授权 | 否（经 `Planner / Scheduler` 或 `Hermes Master / Boss` 代为发起） |
 
 ### 3.5 `Independent Reviewer`
 
@@ -149,13 +149,13 @@
 | 禁止操作 | 不得改代码、不得 merge、不得自审、不得访问非允许仓库。 |
 | 输入契约 | `REVIEW_STARTED` 事件 + 已达 CI green 的 Draft PR（与 `D3-IMPLEMENTATION-PLAN.md` §4.10 一致）。 |
 | 输出契约 | Review 结论经 `workspace_post_review_result` 与 `REVIEW_FINDING`/`REVIEW_PASSED` 事件回流；`REQUEST_CHANGES` 触发 `round-2`。 |
-| 任务开始条件 | CI 通过且 Scheduler 触发 `REVIEW_STARTED`。 |
+| 任务开始条件 | CI 通过且 `Planner / Scheduler` 触发 `REVIEW_STARTED`。 |
 | 完成条件 | `REVIEW_PASSED` 或 `REVIEW_FINDING`（含反馈）已记录并回流。 |
 | 失败和升级路径 | 审查无法判定 → 升级 `Human Owner`（`ARCHITECTURE_DECISION`/`USER_ACTION_REQUIRED`）。 |
 | 是否允许修改代码 | 否 |
 | 是否允许操作 GitHub | 仅经授权（PR Review 评论，非代码/merge） |
 | 是否允许接触凭据 | 否 |
-| 是否允许请求用户授权 | 否（经 Scheduler/Master 发起） |
+| 是否允许请求用户授权 | 否（经 `Planner / Scheduler` 或 `Hermes Master / Boss` 发起） |
 
 ### 3.6 `QA Agent`
 
@@ -166,15 +166,15 @@
 | 允许调用的工具 | 沙箱内测试命令、受限 MCP `workspace_post_update`/`workspace_get_evidence`、读取类工具。 |
 | 允许写入的位置 | 仅 `ALLOWED_GITHUB_REPOS` 的目标分支（如追加测试）；Canvas 的 `Evidence`/`Current Status`。 |
 | 禁止操作 | 不得触碰 `PROTECTED_REPOS`；不得 merge；不得持有凭据；不得绕过 `delivery.py`。 |
-| 输入契约 | Scheduler 派发的 QA 任务 + 受控授权。 |
+| 输入契约 | `Planner / Scheduler` 派发的 QA 任务 + 受控授权。 |
 | 输出契约 | 测试结论、证据链接（`workspace_get_evidence`）；通过 `TEST_FINISHED(status=success|failure)` 事件回流（权威事件名见 `ACTIVITY-AND-INTERVENTION-EVENT-MODEL.md` §1.2 #8，禁止使用 `TEST_PASSED`/`TEST_FAILED`）。 |
-| 任务开始条件 | Master/Scheduler 派发 QA 阶段任务。 |
+| 任务开始条件 | 经 `Planner / Scheduler` 或 `Hermes Master / Boss` 派发 QA 阶段任务。 |
 | 完成条件 | 验收标准验证完毕且证据已记录。 |
-| 失败和升级路径 | 验收不通过 → 升级 Scheduler 触发返工；阻塞则升级 `Human Owner`。 |
+| 失败和升级路径 | 验收不通过 → 升级 `Planner / Scheduler` 触发返工；阻塞则升级 `Human Owner`。 |
 | 是否允许修改代码 | 仅经授权（追加测试，限允许仓库目标分支） |
 | 是否允许操作 GitHub | 仅经授权（经 `delivery.py`） |
 | 是否允许接触凭据 | 否 |
-| 是否允许请求用户授权 | 否（经 Scheduler/Master 发起） |
+| 是否允许请求用户授权 | 否（经 `Planner / Scheduler` 或 `Hermes Master / Boss` 发起） |
 
 ### 3.7 `Documentation Agent`
 
@@ -185,29 +185,29 @@
 | 允许调用的工具 | 受限 MCP `workspace_update_canvas`/`workspace_post_update`/`workspace_get_evidence`、读取类工具。 |
 | 允许写入的位置 | 仅 `ALLOWED_GITHUB_REPOS` 的文档文件（限目标分支）；Canvas 的 `Decisions`/`Next Step`/`Risks` 等协作字段。 |
 | 禁止操作 | 不得改代码逻辑（仅文档）；不得 merge；不得触碰 `PROTECTED_REPOS`；不得持有凭据。 |
-| 输入契约 | Scheduler 派发的文档任务 + 变更上下文。 |
+| 输入契约 | `Planner / Scheduler` 派发的文档任务 + 变更上下文。 |
 | 输出契约 | 文档/报告/Canvas 更新；通过 `PLAN_UPDATED`/Canvas 更新事件回流。 |
-| 任务开始条件 | Master/Scheduler 派发或关联代码任务完成后触发。 |
+| 任务开始条件 | 经 `Planner / Scheduler` 或 `Hermes Master / Boss` 派发或关联代码任务完成后触发。 |
 | 完成条件 | 文档与代码变更同步且证据齐全。 |
-| 失败和升级路径 | 文档与代码冲突 → 升级 Scheduler。 |
+| 失败和升级路径 | 文档与代码冲突 → 升级 `Planner / Scheduler`。 |
 | 是否允许修改代码 | 否（仅文档文件，限允许仓库） |
 | 是否允许操作 GitHub | 仅经授权（经 `delivery.py`，仅文档） |
 | 是否允许接触凭据 | 否 |
-| 是否允许请求用户授权 | 否（经 Scheduler/Master 发起） |
+| 是否允许请求用户授权 | 否（经 `Planner / Scheduler` 或 `Hermes Master / Boss` 发起） |
 
 ### 3.8 `Release Agent`
 
 | 字段 | 定义 |
 | --- | --- |
-| 唯一职责 | 交付与发布：编排 `delivery.py` 受控交付、Draft PR 生命周期、发布前检查；**不执行**生产部署（Openship V1 不接入）。 |
+| 唯一职责 | 交付与发布：**唯一允许调用 `DeliveryController.deliver()` 的角色**；编排受控交付（push + Draft PR）、Draft PR 生命周期、发布前检查；**不执行**生产部署（Openship V1 不接入）。 |
 | 允许读取的数据 | Draft PR、CI/Review 状态、控制层交付状态、Canvas 的 `Current Status`/`Evidence`/`User Actions Required`。 |
 | 允许调用的工具 | `delivery.py` 的 `DeliveryController.deliver()`、受限 MCP `workspace_get_pending_actions`/`workspace_request_user_action`、读取类工具。 |
 | 允许写入的位置 | GitHub（Draft PR，经 `delivery.py`）；Canvas 的 `Current Status`/`User Actions Required`。 |
 | 禁止操作 | 不得 merge；不得生产部署；不得触碰 `PROTECTED_REPOS`；不得持有长期凭据。 |
-| 输入契约 | 已完成 Review 的任务 + 有效 `DeliveryAuthorization`。 |
+| 输入契约 | 已通过 `Coding Worker` 本地 Commit 且在 CI 与 `Independent Reviewer` **之前**的任务 + 验证后的 Commit SHA + 测试证据 + 目标仓库/分支 + 有效 `DeliveryAuthorization`（task+repo+commit 绑定）。 |
 | 输出契约 | 交付状态（`DRAFT_PR_CREATED`/幂等结果）、待用户动作（如 `FINAL_ACCEPTANCE`/`PRODUCTION_RELEASE`）经 `workspace_request_user_action` 回流。 |
-| 任务开始条件 | Review 通过且 Scheduler 移交交付阶段。 |
-| 完成条件 | 受控交付已编排，Draft PR 生命周期由 `delivery.py` 管理；**Draft PR 的创建唯一由 `DeliveryController.deliver()` 负责，Release Agent 不得重复声明创建 Draft PR**。若后续需发布则发 `USER_ACTION_REQUIRED` 给 `Human Owner`。 |
+| 任务开始条件 | `Coding Worker` 已完成本地 Commit，且在 CI 与 `Independent Reviewer` **之前**；由 `Planner / Scheduler` 移交交付阶段。 |
+| 完成条件 | 首次执行仅做受控 Push + 创建/幂等获取 Draft PR + 记录 `PUSH_COMPLETED`/`DRAFT_PR_CREATED` + 触发 CI（`Draft PR` 的创建**唯一由 `DeliveryController.deliver()` 执行**，`Release Agent` 不得重复声明）；Review 通过后进入“验收协调”：仅发起 `USER_ACTION_REQUIRED(reason=FINAL_ACCEPTANCE)` 等待 `Human Owner`，**不得再次调用 `deliver()`、不得重复创建 Draft PR**。 |
 | 失败和升级路径 | 交付失败（凭据/分支/冲突）→ fail-closed 终止并升级 `Human Owner`。 |
 | 是否允许修改代码 | 否 |
 | 是否允许操作 GitHub | 仅经授权（经 `delivery.py`：Draft PR，永不 merge） |
@@ -223,7 +223,7 @@
 | `Human Owner` | 否（手动 merge） | 是（手动） | 仅经授权 | 是 |
 | `Hermes Master / Boss` | 否 | 否（经控制层） | 否 | 是 |
 | `Planner / Scheduler` | 否 | 仅经授权 | 否 | 是 |
-| `Coding Worker` | 是（限允许仓库） | 仅经授权（`delivery.py`） | 否 | 否 |
+| `Coding Worker` | 是（限允许仓库） | 否（仅本地 Commit；不 push / 不建 Draft PR） | 否 | 否 |
 | `Independent Reviewer` | 否 | 仅经授权（Review） | 否 | 否 |
 | `QA Agent` | 仅经授权（测试） | 仅经授权（`delivery.py`） | 否 | 否 |
 | `Documentation Agent` | 否（仅文档） | 仅经授权（`delivery.py`） | 否 | 否 |

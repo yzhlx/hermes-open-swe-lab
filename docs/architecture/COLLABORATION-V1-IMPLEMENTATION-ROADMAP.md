@@ -20,7 +20,7 @@
 | Phase | 名称 | 目标 | 阻塞下一阶段? |
 | --- | --- | --- | --- |
 | `Phase A` | 工作空间、角色、频道、Canvas、Activity Feed 设计 | 定义协作外壳与展示契约 | 是 |
-| `Phase B` | Hermes 控制层 Scheduler / Reviewer / Rework 闭环 | 控制层闭环（权限/状态机/返工） | 是 |
+| `Phase B` | Hermes 控制层 `Planner / Scheduler` / `Independent Reviewer` / Rework 闭环 | 控制层闭环（权限/状态机/返工） | 是 |
 | `Phase C` | Buzz 工作空间适配器 | Buzz 仅作交互/展示接入 | 否（可并行部分） |
 | `Phase D` | ACP Runtime Adapter | 可替换 Agent 运行时接口 | 是（执行前需完成） |
 | `Phase E` | MCP Workspace Tools | 受限 MCP 工具与角色能力过滤 | 是 |
@@ -44,15 +44,33 @@
 - **回滚:** 文档未提交，删除即可。
 - **是否需要用户操作:** 否（仅评审）。
 - **是否阻塞下一阶段:** 是。
-- **本 PR 定位:** 本批 5 份文档（PR #8）即 **Phase A 的交付物**（协作外壳静态设计）。评审通过并合并后 Phase A 视为完成；**下一阶段为 Phase B**（Hermes 控制层 Scheduler/Reviewer/Rework 闭环实现），不在本 PR 内开展 Phase B。
+- **本 PR 定位:** 本批 5 份文档（PR #8）即 **Phase A 的交付物**（协作外壳静态设计）。评审通过并合并后 Phase A 视为完成；**下一阶段为 Phase B**（`Planner / Scheduler` / `Independent Reviewer` / Rework 闭环实现），不在本 PR 内开展 Phase B。
 
-### `Phase B` — Hermes 控制层 Scheduler / Reviewer / Rework 闭环
+### `Phase B` — Hermes 控制层 `Planner / Scheduler` / `Independent Reviewer` / Rework 闭环
 
 - **目标:** 在既有 `MVP-0-ARCHITECTURE.md` 控制层之上，落实 `Planner / Scheduler`、`Independent Reviewer`、返工闭环（`MAX_ROUNDS=2`、`ROUND2_LABEL="round-2"`），并接入人工介入中心。
-- **修改范围:** `hermes_worker/` 控制层（Scheduler/Reviewer 编排、状态机、USER_ACTION_REQUIRED 创建/去重/恢复）；复用 `delivery.py` 不变。
+- **修改范围:** `hermes_worker/` 控制层（`Planner / Scheduler`/`Independent Reviewer` 编排、状态机、USER_ACTION_REQUIRED 创建/去重/恢复）；复用 `delivery.py` 不变。
 - **前置条件:** Phase A 角色与事件契约定稿；`constants.py` 角色常量就绪。
-- **验收标准:** 任务可经 Scheduler 派发→Coding→CI→Review→(rework)→User Acceptance；返工达上限升级 `Human Owner`；`USER_ACTION_REQUIRED` 对同一 `(task_id, reason)` 不重复发送。
-- **测试:** 离线单测覆盖状态机转移、round-2 标签仅 Scheduler 可加、返工上限、介入去重、fail-closed（沿用 `tests/` 基线）。
+- **验收标准（统一任务生命周期 12 点，与 `ACTIVITY-AND-INTERVENTION-EVENT-MODEL.md` §1.2.1 一致）:**
+  1. `Planner / Scheduler` 接收 `Human Owner` 目标 / GitHub Issue，拆解并派发任务。
+  2. `Coding Worker` 在沙箱内完成代码实现与测试，创建**本地 Commit**（不得 push、不得创建 Draft PR、不得调用 `DeliveryController.deliver()`、不得接触 GitHub 交付凭据）。
+  3. `Coding Worker` 完成条件 = 测试通过 + 本地 Commit 已创建 + Commit SHA 与证据已持久化；随后由 `Planner / Scheduler` 移交 `Release Agent`。
+  4. `Release Agent` 是**唯一**允许调用 `DeliveryController.deliver()` 的角色，在 CI 与 `Independent Reviewer` **之前**启动。
+  5. `Release Agent` 首次执行仅做受控 Push + 创建/幂等获取 Draft PR + 记录 `PUSH_COMPLETED`/`DRAFT_PR_CREATED` + 触发 CI。
+  6. CI 全绿后，`Independent Reviewer` 在**既有 Draft PR** 上开始审查（Review 不先于 PR 存在）。
+  7. 若 `REQUEST_CHANGES`，回到 `Coding Worker` 在**同一 Draft PR** 上 rework（新增 Commit）。
+  8. rework 的 Commit 再次经 `Release Agent` 受控 Push（不新建第 2 个 PR）。
+  9. 返工受 `MAX_ROUNDS=2` 约束；超限升级 `Human Owner`（`USER_ACTION_REQUIRED`/`TASK_BLOCKED`）。
+  10. Review 通过后，`Release Agent` 进入“验收协调”：仅发起 `USER_ACTION_REQUIRED(reason=FINAL_ACCEPTANCE)` 等待 `Human Owner`，**不得再次调用 `deliver()`、不得重复创建 Draft PR**。
+  11. `FINAL_ACCEPTANCE` 完成前任务视为阻塞，`TASK_COMPLETED` 不得触发/归档。
+  12. 仅当 `Human Owner` 完成 `FINAL_ACCEPTANCE` 后，`TASK_COMPLETED` 方可触发，任务达终态。
+- **测试（6 点）:**
+  1. `Release Agent` 是唯一拥有 `deliver()` 调用权的角色（其他角色调用被拒 / fail-closed）。
+  2. `Coding Worker` 被禁止调用 `deliver()`（调用即失败，不 push / 不建 Draft PR）。
+  3. Draft PR 必须在 `Independent Review` 开始前存在（缺 PR 则 Review 不得启动）。
+  4. rework 在**同一 Draft PR** 上进行（不产生第 2 个 PR；新 Commit 经受控 Push）。
+  5. 重复调用 `deliver()` 幂等（同一 task+repo+commit 不产生重复 Draft PR / 重复 push）。
+  6. `FINAL_ACCEPTANCE` 完成前不得出现 `TASK_COMPLETED`（状态机断言）。
 - **风险:** 状态机与既有 `HOST_WORKER_ACTIVE_STATES`/`TERMINAL_STATES` 冲突 → 需对齐常量。
 - **回滚:** 分支化开发；失败保留 Draft PR 供审查，不合并。
 - **是否需要用户操作:** 是（仅在 `USER_ACTION_REQUIRED` 情形，如 `FINAL_ACCEPTANCE`）。
@@ -109,7 +127,7 @@
 ### `Phase F` — Smoke Test 真实闭环
 
 - **目标:** 在 `ALLOWED_GITHUB_REPOS`（`yzhlx/hermes-open-swe-smoke-test`）跑通人类+多 Agent 协作的完整闭环，统一生命周期：
-  `Issue → Plan → Code/Test → Commit → controlled delivery (push + Draft PR via `DeliveryController.deliver()`) → CI → Independent Review → rework on same PR (若 `REQUEST_CHANGES`，受 `MAX_ROUNDS=2` 约束) → FINAL_ACCEPTANCE (Human Owner) → TASK_COMPLETED`。
+  `Issue → Plan → Code/Test → Commit → Release Agent controlled delivery (push + Draft PR via `DeliveryController.deliver()`) → CI → Independent Review → rework on same PR (若 `REQUEST_CHANGES`，受 `MAX_ROUNDS=2` 约束) → FINAL_ACCEPTANCE (Human Owner) → TASK_COMPLETED`。
   （注意：Draft PR 必须先于 Independent Review 存在，Review 在既有 PR 上进行，不在开 PR 之前。）
 - **修改范围:** 端到端编排；严格沿用 `delivery.py` 纪律（Draft PR 强制、永不 merge、幂等）；不触碰 `PROTECTED_REPOS`。
 - **前置条件:** Phase B/D/E 完成且测试绿；凭据已落服务端 `.env`（用户操作）。

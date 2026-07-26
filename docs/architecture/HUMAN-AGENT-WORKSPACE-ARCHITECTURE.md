@@ -164,7 +164,7 @@ Human Owner ──授权/验收──▶ Hermes Engineering Controller
 
 - **仓库范围:** 仅 `yzhlx/hermes-open-swe-smoke-test` 可自动化写入；`yzhlx/hermes-learning-os` 永久保护 (`PROTECTED_REPOS`)。
 - **交付纪律:** 所有交付经 `delivery.py` 的 `DeliveryController.deliver()`：显式 `DeliveryAuthorization`（task+repo+commit 绑定、fail-closed）、Draft PR 强制 (`draft=True`，无法被绕过)、永不 merge（无 merge 方法）、幂等 (`idempotency_key`)。
-- **状态机:** 返工循环遵循 `MAX_ROUNDS=2` 与 `ROUND2_LABEL="round-2"`（仅 Scheduler 可加标签），与 `constants.py` 一致。
+- **状态机:** 返工循环遵循 `MAX_ROUNDS=2` 与 `ROUND2_LABEL="round-2"`（仅 `Planner / Scheduler` 可加标签），与 `constants.py` 一致。
 - **凭据隔离:** 控制器/控制层**从不持有长期令牌**；令牌仅在 push 步骤局部注入并丢弃（`delivery.py` 纪律）。Buzz 不持有或转发凭据。
 - **无第二事实源:** Buzz/Canvas/搜索均不得产生与 GitHub 冲突的任务真相；所有权威结论必须可同步回 GitHub Issue/PR/Review/文档。
 
