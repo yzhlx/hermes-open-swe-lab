@@ -84,10 +84,16 @@ def _role_detail_table(role: str) -> str:
     rows = ["| 字段 | 定义 |", "| --- | --- |"]
     special = {
         "Coding Worker": {
-            "完成条件": "经 delivery.py 的 DeliveryController.deliver() 完成受控交付（push + Draft PR 创建，唯一负责方），CI 已触发。",
+            "唯一职责": "实际代码实现：在沙箱内编辑目标仓库工作树、运行测试、创建本地 Commit、输出 Commit SHA / 测试结果 / 证据；MUST NOT push、MUST NOT 创建 Draft PR、MUST NOT 调用 DeliveryController.deliver()、MUST NOT 接触 GitHub 交付凭据。",
+            "禁止操作": "不得 push、不得 force-push、不得 merge、不得创建 Draft PR、不得调用 DeliveryController.deliver()、不得持有/接触任何 GitHub 交付凭据。",
+            "是否允许操作 GitHub": "否（仅创建本地 Commit；不得 push、不得创建 Draft PR、不得接触 GitHub 交付凭据）",
+            "是否允许接触凭据": "否（不接触任何 GitHub 交付凭据）",
+            "完成条件": "测试通过 + 本地 Commit 已创建 + Commit SHA 和证据已持久化；随后由 Planner / Scheduler 移交 Release Agent 进入受控交付阶段。",
         },
         "Release Agent": {
-            "完成条件": "受控交付已编排，Draft PR 生命周期由 delivery.py 管理；Draft PR 的创建唯一由 DeliveryController.deliver() 负责，Release Agent 不得重复声明创建 Draft PR。",
+            "唯一职责": "交付与发布：唯一允许调用 DeliveryController.deliver() 的角色；编排受控交付（push + Draft PR）、Draft PR 生命周期、发布前检查；不执行生产部署。",
+            "任务开始条件": "Coding Worker 已完成本地 Commit，且在 CI 与 Independent Reviewer 之前；由 Planner / Scheduler 移交交付阶段。",
+            "完成条件": "首次执行仅做受控 Push + 创建/幂等获取 Draft PR + 记录 PUSH_COMPLETED/DRAFT_PR_CREATED + 触发 CI（Draft PR 的创建唯一由 DeliveryController.deliver() 执行，Release Agent 不得重复声明）；Review 通过后仅发起 USER_ACTION_REQUIRED(reason=FINAL_ACCEPTANCE)，不得再次调用 deliver()、不得重复创建 Draft PR。",
         },
     }
     for f in ROLE_FIELDS:
@@ -241,6 +247,23 @@ def _roadmap_doc() -> str:
         "### `Phase A` — 工作空间、角色、频道、Canvas、Activity Feed 设计",
         "",
         "目标：完成协作外壳的静态设计。本批 5 份文档（PR #8）即 Phase A 的交付物（协作外壳静态设计）。修改范围：仅新增 docs/architecture/*，不改动 .py。",
+        "",
+        "### `Phase B` — Hermes 控制层 Planner / Scheduler / Independent Reviewer / Rework 闭环",
+        "",
+        "统一任务生命周期验收标准（12 点，与 ACTIVITY §1.2.1 一致）：",
+        "",
+        "1. Planner / Scheduler 接收 Human Owner 目标 / GitHub Issue，拆解并派发任务。",
+        "2. Coding Worker 在沙箱内完成代码实现与测试，创建本地 Commit（不得 push、不得创建 Draft PR、不得调用 DeliveryController.deliver()、不得接触 GitHub 交付凭据）。",
+        "3. Coding Worker 完成条件 = 测试通过 + 本地 Commit 已创建 + Commit SHA 与证据已持久化；随后由 Planner / Scheduler 移交 Release Agent。",
+        "4. Release Agent 是唯一允许调用 DeliveryController.deliver() 的角色，在 CI 与 Independent Reviewer 之前启动。",
+        "5. Release Agent 首次执行仅做受控 Push + 创建/幂等获取 Draft PR + 记录 PUSH_COMPLETED / DRAFT_PR_CREATED + 触发 CI。",
+        "6. CI 全绿后，Independent Reviewer 在既有 Draft PR 上开始审查（Review 不先于 PR 存在）。",
+        "7. 若 REQUEST_CHANGES，回到 Coding Worker 在同一 Draft PR 上 rework（新增 Commit）。",
+        "8. rework 的 Commit 再次经 Release Agent 受控 Push（不新建第 2 个 PR）。",
+        "9. 返工受 MAX_ROUNDS=2 约束；超限升级 Human Owner。",
+        "10. Review 通过后，Release Agent 进入验收协调：仅发起 USER_ACTION_REQUIRED(reason=FINAL_ACCEPTANCE) 等待 Human Owner，不得再次调用 deliver()、不得重复创建 Draft PR。",
+        "11. FINAL_ACCEPTANCE 完成前任务视为阻塞，TASK_COMPLETED 不得触发/归档。",
+        "12. 仅当 Human Owner 完成 FINAL_ACCEPTANCE 后，TASK_COMPLETED 方可触发，任务达终态。",
         "",
         "### `Phase C` — Buzz 工作空间适配器",
         "",
@@ -459,8 +482,41 @@ def _bad_phase_a_def(docs):
 
 @_m("S_DRAFT_PR_RESP")
 def _bad_draft_pr_resp(docs):
-    old = "Draft PR 的创建唯一由 DeliveryController.deliver() 负责，Release Agent 不得重复声明创建 Draft PR。"
-    new = "Draft PR 的创建由 Release Agent 负责创建，Release Agent 重复声明创建 Draft PR。"
+    # 让 Coding Worker 正向（非否定）声明调用 DeliveryController.deliver() 完成
+    # 受控交付（push + Draft PR 创建），从而违反"Release Agent 是唯一逻辑调用方
+    # 且 deliver() 是 Push+Draft PR 唯一执行方法"的新责任模型。
+    old = "移交 Release Agent 进入受控交付阶段"
+    new = "由 Coding Worker 调用 DeliveryController.deliver() 进入受控交付（push + Draft PR 创建），CI 已触发"
+    return _mutate(docs, cc.DOC_ROLE, old, new)
+
+
+@_m("S_MAX_ROUNDS")
+def _bad_max_rounds(docs):
+    # 将文档中所有 MAX_ROUNDS=2 改为 3（生命周期串位于 DOC_ACTIVITY，
+    # Phase B 验收标准位于 DOC_ROADMAP），确保 S_MAX_ROUNDS 真正失败，
+    # 不被 Phase B 中保留的 MAX_ROUNDS=2 兜底后仍然通过。
+    d = dict(docs)
+    for key in (cc.DOC_ACTIVITY, cc.DOC_ROADMAP):
+        if key in d:
+            d[key] = d[key].replace("MAX_ROUNDS=2", "MAX_ROUNDS=3")
+    return d
+
+
+@_m("S_LIFECYCLE_REVIEW_ON_PR")
+def _bad_lifecycle_review_on_pr(docs):
+    # 将生命周期串中的 "rework on same PR" 改为 "rework"，移除"同一 PR"表述，
+    # 使 S_LIFECYCLE_REVIEW_ON_PR 失败（Review 不再体现为在同一 PR 上进行）。
+    old = "rework on same PR"
+    new = "rework"
+    return _mutate(docs, cc.DOC_ACTIVITY, old, new)
+
+
+@_m("S_ROLE_FULLNAME")
+def _bad_role_fullname(docs):
+    # 在机器可消费区域（Human Owner 唯一职责单元格）用裸歧义简称替换完整权威名，
+    # 使 S_ROLE_FULLNAME 失败（Master / Scheduler 未被全名替换消除）。
+    old = "引用 Hermes Master / Boss 与 Planner / Scheduler 均使用完整名"
+    new = "引用 Master 与 Scheduler 均使用完整名"
     return _mutate(docs, cc.DOC_ROLE, old, new)
 
 
@@ -573,6 +629,7 @@ RULE_IDS = [
     "S_BUZZ_GATE", "S_PR_ORDER", "S_TABLE_ROLE_ABBREV",
     "S_NO_SECOND_TRUTH_BUZZ", "S_NO_SECOND_TRUTH_CANVAS", "S_NO_SECOND_TRUTH_ACTIVITY",
     "S_PROTECTED_REPO",
+    "S_MAX_ROUNDS", "S_LIFECYCLE_REVIEW_ON_PR", "S_ROLE_FULLNAME",
 ]
 
 

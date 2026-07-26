@@ -1,0 +1,40 @@
+name: Collaboration Docs Semantic Check
+
+on:
+  pull_request:
+    branches:
+      - "**"
+    paths:
+      - "docs/architecture/**"
+      - "tools/check_collaboration_docs.py"
+      - "tests/test_collaboration_docs_checker.py"
+      - "tests/fixtures/collab_docs_builder.py"
+      - ".github/workflows/collaboration-docs-check.yml"
+  workflow_dispatch:
+
+# 只读权限，绝不访问任何 secret / 受保护仓库。
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run semantic consistency checker on real architecture docs
+        run: python tools/check_collaboration_docs.py --docs-dir docs/architecture
+
+      - name: Run checker test suite
+        run: python -m pytest tests/test_collaboration_docs_checker.py -v

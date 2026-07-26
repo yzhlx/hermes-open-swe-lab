@@ -187,6 +187,12 @@ PROTECTED_REPO = "yzhlx/hermes-learning-os"
 ALLOWED_REPO = "yzhlx/hermes-open-swe-smoke-test"
 
 # 生命周期锚点（用于顺序校验）
+# 顺序必须与冻结的 PR #8 文档（ACTIVITY §1.2.1 / ROADMAP Phase F）一致：
+#   Issue → Plan → Code/Test → Commit → [Release Agent] controlled delivery
+#   (push + Draft PR via DeliveryController.deliver()) → CI → Independent Review
+#   → rework on same PR (MAX_ROUNDS=2) → FINAL_ACCEPTANCE → TASK_COMPLETED
+# 冻结文档未把 "Planner/Scheduler handoff" 与 "Release Agent 受控交付" 拆成独立
+# 箭头，二者合并为 "controlled delivery" 一步，故锚点仅取文档实际保证的段。
 LIFECYCLE_ANCHORS_ORDER = [
     "issue",
     "plan",
@@ -195,6 +201,7 @@ LIFECYCLE_ANCHORS_ORDER = [
     "draft_pr",
     "ci",
     "review",
+    "rework",
     "final_acceptance",
     "task_completed",
 ]
@@ -218,13 +225,15 @@ class Finding:
     found: str = ""
 
     def as_dict(self) -> Dict[str, object]:
+        # 文档作不可信数据：输出前对可能外泄的凭据/令牌做脱敏，避免 checker
+        # 把真实密钥回显到 stdout / JSON（B5/B11 脱敏纪律）。
         return {
             "rule_id": self.rule_id,
             "doc": self.doc,
             "ok": self.ok,
             "severity": self.severity,
-            "message": self.message,
-            "found": self.found,
+            "message": redact(self.message),
+            "found": redact(self.found),
         }
 
 
@@ -321,6 +330,49 @@ def backticked(text: str) -> List[str]:
 
 def norm(s: str) -> str:
     return re.sub(r"[\s`()（）:：#\-/]+", "", s).lower()
+
+
+# ---------------------------------------------------------------------------
+# 安全加固：输出脱敏 + 路径安全
+# ---------------------------------------------------------------------------
+
+# 文档/报告作为不可信数据，checker 的输出（message / found）可能回显文档片段。
+# 以下模式用于把真实凭据/令牌掩码，避免 checker 自身成为凭据泄露面。
+_SECRET_PATTERNS: List["re.Pattern[str]"] = [
+    re.compile(r"sk-[A-Za-z0-9]{16,}"),
+    re.compile(r"ghp_[A-Za-z0-9]{16,}"),
+    re.compile(r"gho_[A-Za-z0-9]{16,}"),
+    re.compile(r"ghu_[A-Za-z0-9]{16,}"),
+    re.compile(r"ghs_[A-Za-z0-9]{16,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{16,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"xoxb-[A-Za-z0-9-]{12,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"glpat-[A-Za-z0-9_-]{16,}"),
+]
+
+
+def redact(s: str) -> str:
+    """对可能含凭据的文本做掩码；结构稳定（仅替换值，不改键与长度语义）。"""
+    if not isinstance(s, str):
+        return s
+    for p in _SECRET_PATTERNS:
+        s = p.sub(lambda m: m.group(0)[:6] + "…[REDACTED]", s)
+    return s
+
+
+def _safe_doc_path(docs_dir: str, filename: str) -> str:
+    """将 docs_dir 下的 filename 解析为真实路径，并防止路径穿越 / 符号链接越界。
+
+    返回 realpath；若解析后路径落在 docs_dir 之外（如 filename='../secret'、
+    或经符号链接逃逸），抛出 ValueError，由调用方转为退出码 2。checker 只读
+    docs_dir 内的固定文件名，不读取目录外任何文件（AGENTS.md §8 不可信数据）。
+    """
+    base = os.path.realpath(docs_dir)
+    candidate = os.path.realpath(os.path.join(base, filename))
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise ValueError(f"path traversal blocked: {filename!r} resolves outside {docs_dir!r}")
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -638,26 +690,161 @@ def check_phase_a_def(f: List[Finding], doc: Dict[str, str]) -> None:
     )
 
 
+NEGATION_WORDS = ("不得", "MUST NOT", "不", "禁止", "不允许", "仅经授权")
+
+
+def _has_affirmative(body: str, keyword: str,
+                     negations: Tuple[str, ...] = NEGATION_WORDS,
+                     window: int = 50, boundary: bool = False) -> bool:
+    """判断 keyword 是否以"正向（非否定）"形式出现在 body 中。
+
+    若 keyword 之前的 window 个字符内出现任一否定词，则视为否定表述，
+    不计入正向。用于区分"Coding Worker 不得 push"（合法）与
+    "Coding Worker 可 push"（违规），以及"不得再次调用 deliver()"（合法）
+    与"再次调用 deliver()"（违规）。
+
+    boundary=True 时要求 keyword 前后不是单词字符，以排除
+    PUSH_COMPLETED / DRAFT_PR_CREATED 这类事件标识符中的子串匹配。
+    """
+    pat = re.escape(keyword)
+    if boundary:
+        pat = r"(?<![\w])" + pat + r"(?![\w])"
+    for m in re.finditer(pat, body, re.IGNORECASE):
+        before = body[max(0, m.start() - window):m.start()]
+        if not any(neg in before for neg in negations):
+            return True
+    return False
+
+
+def _contains_affirmative_deliver(body: str) -> bool:
+    return _has_affirmative(body, "DeliveryController.deliver()")
+
+
+# 仅当"创建/执行 Draft PR"等动作动词出现且无否定时，才算正向执行动作；
+# 排除"评审 Draft PR"这类合法引用。
+_CREATION_VERBS = ("创建", "执行", "负责", "发起", "生成", "建")
+
+
+def _contains_affirmative_push_or_draft_pr(body: str) -> bool:
+    """正向（非否定）地声明执行 push 或创建 Draft PR。
+
+    排除事件标识符中的子串（如 PUSH_COMPLETED / DRAFT_PR_CREATED），
+    以及"评审 Draft PR"这类仅引用、非执行的合法表述。
+    """
+    # "push" 仅作为独立单词匹配（排除 PUSH_COMPLETED 等标识符）
+    if _has_affirmative(body, "push", boundary=True):
+        return True
+    # "Draft PR" 仅在伴随创建/执行动词且无否定时才计为执行动作
+    for verb in _CREATION_VERBS:
+        for m in re.finditer(verb + r"\s*Draft PR", body, re.IGNORECASE):
+            before = body[max(0, m.start() - 50):m.start()]
+            if not any(neg in before for neg in NEGATION_WORDS):
+                return True
+    return False
+
+
+def _release_violates_post_review(ra_body: str) -> bool:
+    """True 表示 Release Agent 被正向描述为 Review 之后复投 / 创建第二个 Draft PR。
+
+    文档允许（且要求）显式禁止这些行为（"不得再次调用 deliver()、不得重复创建
+    Draft PR"），故仅当"再次调用 deliver()/创建第二个 Draft PR"以正向形式出现时才判违。
+    """
+    if "创建第二个" in ra_body and "Draft PR" in ra_body:
+        return True
+    m = re.search(r"再次调用\s*`?DeliveryController\.deliver\(\)`?", ra_body)
+    if m and "不得" not in ra_body[max(0, m.start() - 30):m.end()]:
+        return True
+    return False
+
+
+def _release_delivery_after_review(ra_body: str) -> bool:
+    """True 表示 Release Agent 被正向（非否定）描述为在 Review 之后才执行受控交付
+    （push / 创建 Draft PR / deliver）。
+
+    真实文档中"Review 通过后进入验收协调：仅发起 USER_ACTION_REQUIRED，
+    不得再次调用 deliver()"属于合法的后置验收阶段——其中 deliver 为否定表述，
+    不在本检查范围内。本检查仅当"Review 之后/通过后"紧随**非否定**的交付动词
+    （push / 创建 Draft PR / deliver / 受控交付）时才判违。
+    """
+    for m in re.finditer(r"Review\s*(?:之后|通过后|完成后)", ra_body, re.IGNORECASE):
+        after = ra_body[m.end():m.end() + 60]
+        for vm in re.finditer(r"push|创建\s*Draft PR|deliver|受控交付|交付", after, re.IGNORECASE):
+            before_v = after[max(0, vm.start() - 20):vm.start()]
+            if not any(neg in before_v for neg in NEGATION_WORDS):
+                return True
+    return False
+
+
 def check_draft_pr_responsibility(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_DRAFT_PR_RESP — Draft PR / 受控交付责任模型（第二轮返工后冻结）。
+
+    新模型：
+      * Coding Worker = 仅负责「代码 + 测试 + 本地 Commit」。必须不 push、
+        不创建 Draft PR、不调用 DeliveryController.deliver()、不接触 GitHub
+        交付凭据。
+      * Release Agent = **唯一**的逻辑调用方 of DeliveryController.deliver()。
+        它在 Coding Worker 本地 Commit 之后、CI/Review **之前**启动；执行受控
+        Push + 创建/幂等 Draft PR + 触发 CI。Review 之后仅发出
+        USER_ACTION_REQUIRED(reason=FINAL_ACCEPTANCE)，不得 re-deliver、
+        不得创建第二个 Draft PR。
+
+    规则必须同时验证两点：
+      (a) Release Agent 是 DeliveryController.deliver() 的唯一逻辑调用方；
+      (b) DeliveryController.deliver() 是 Push + Draft PR 的唯一执行方法
+          （即没有其他角色被描述成做 push/Draft PR，也没有其他交付机制被
+          当作交付方法）。
+
+    规则在以下情况必须 FAIL：
+      * Coding Worker 小节声称 push / Draft PR / deliver / 交付凭据；
+      * 除 Release Agent 外任何角色被描述为调用 deliver() / 作为交付调用方；
+      * 断言了 DeliveryController.deliver() 之外的交付方法；
+      * Release Agent 被描述为在 Review 之后启动 / re-deliver / 创建第二个 Draft PR。
+    """
     role_text = doc.get(DOC_ROLE, "")
-    responsible: List[str] = []
-    release_ok = True
-    for role_name, body in iter_role_subsections(role_text):
-        if "Draft PR" in body and ("唯一负责方" in body or "唯一负责" in body):
-            responsible.append(role_name)
-        if role_name == "Release Agent":
-            # Release Agent 不得重复声明"创建 Draft PR"
-            if "创建 Draft PR" in body and "不得" not in body:
-                release_ok = False
-    ok = (responsible == ["Coding Worker"]) and release_ok
+    bodies = {name: b for name, b in iter_role_subsections(role_text)}
+    cw = bodies.get("Coding Worker")
+    ra = bodies.get("Release Agent")
+
+    problems: List[str] = []
+
+    # (a) Release Agent 是 deliver() 的唯一逻辑调用方
+    release_is_caller = bool(ra) and _contains_affirmative_deliver(ra)
+    if not release_is_caller:
+        problems.append("Release Agent 未被描述为 DeliveryController.deliver() 的唯一调用方")
+    other_callers = [name for name, b in bodies.items()
+                     if name != "Release Agent" and _contains_affirmative_deliver(b)]
+    if other_callers:
+        problems.append("除 Release Agent 外存在调用 deliver() 的角色: " + ", ".join(other_callers))
+
+    # (b) DeliveryController.deliver() 是 Push + Draft PR 的唯一执行方法
+    if cw is not None:
+        if _contains_affirmative_push_or_draft_pr(cw):
+            problems.append("Coding Worker 被描述为执行 push / 创建 Draft PR（违反仅本地 Commit 责任）")
+        if _has_affirmative(cw, "交付凭据") or _has_affirmative(cw, "GitHub 交付凭据"):
+            problems.append("Coding Worker 被描述为接触 GitHub 交付凭据")
+    other_deliverers = [name for name, b in bodies.items()
+                        if name not in ("Release Agent", "Coding Worker")
+                        and _contains_affirmative_push_or_draft_pr(b)]
+    if other_deliverers:
+        problems.append("除 Release Agent 外存在执行 push/Draft PR 的角色: " + ", ".join(other_deliverers))
+
+    # Release Agent 不得 Review 之后启动 / re-deliver / 创建第二个 Draft PR
+    if ra is not None and _release_violates_post_review(ra):
+        problems.append("Release Agent 被描述为 Review 之后启动 / 重复交付 / 创建第二个 Draft PR")
+    # Release Agent 受控交付必须在 Review 之前（不得 Review 之后才交付）
+    if ra is not None and _release_delivery_after_review(ra):
+        problems.append("Release Agent 被描述为在 Review 之后才执行受控交付（违反交付先于 Review 的时序）")
+
+    ok = not problems
     f.append(
         Finding(
             "S_DRAFT_PR_RESP",
             DOC_ROLE,
             ok,
-            message="Draft PR 创建唯一责任方为 DeliveryController.deliver()（Coding Worker 触发，Release Agent 不重复声明）"
-            if ok else "Draft PR 责任归属冲突或 Release Agent 重复声明创建",
-            found=f"roles_claiming_unique_responsibility={responsible}; release_disclaims={release_ok}",
+            message="Draft PR/受控交付责任唯一归属 Release Agent（DeliveryController.deliver() 唯一执行方法，Coding Worker 仅本地 Commit）"
+            if ok else "Draft PR 责任模型冲突: " + "; ".join(problems),
+            found="; ".join(problems) if problems else
+            f"release_is_caller={release_is_caller}; other_callers={other_callers}",
         )
     )
 
@@ -669,6 +856,98 @@ def _extract_lifecycle(text: str) -> Optional[str]:
         if m:
             return m.group(0)
     return None
+
+
+def check_max_rounds(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_MAX_ROUNDS — 返工上限 MAX_ROUNDS = 2 必须在文档中明确声明。
+
+    第二轮返工后冻结：rework 受 MAX_ROUNDS=2 约束（同 PR 复投上限 2）。
+    检索规范生命周期串与权限模型中 "MAX_ROUNDS=2" / "review rounds: 2" /
+    "re-review 上限 2"。文档实际保证 MAX_ROUNDS=2，故断言之。
+    """
+    all_text = "\n".join(doc.get(dk, "") for dk in ALL_DOCS)
+    ok = bool(re.search(r"MAX_ROUNDS\s*=\s*2", all_text, re.IGNORECASE)) or \
+         ("review rounds: 2" in all_text.lower()) or \
+         ("re-review 上限 2" in all_text)
+    f.append(
+        Finding(
+            "S_MAX_ROUNDS",
+            "ALL",
+            ok,
+            message="返工上限 MAX_ROUNDS=2 已在文档中明确声明（rework 受 MAX_ROUNDS=2 约束）"
+            if ok else "文档未声明返工上限 MAX_ROUNDS=2",
+            found="MAX_ROUNDS=2 declared" if ok else "no MAX_ROUNDS=2 declaration found",
+        )
+    )
+
+
+def check_lifecycle_review_on_pr(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_LIFECYCLE_REVIEW_ON_PR — Review / rework 必须发生在『同一 PR』上。
+
+    对应生命周期子检查：Review 仅能在已有 PR 上进行（生命周期须体现
+    "同一 PR" / "同一 PR re-review"）。冻结文档生命周期串为
+    "rework on same PR (… MAX_ROUNDS=2)"（ACTIVITY §1.2.1），断言之。
+    """
+    act_text = doc.get(DOC_ACTIVITY, "")
+    lc = _extract_lifecycle(act_text)
+    if not lc:
+        f.append(Finding("S_LIFECYCLE_REVIEW_ON_PR", DOC_ACTIVITY, False,
+                         message="未找到规范生命周期定义", found="lifecycle string missing"))
+        return
+    ok = ("same PR" in lc) or ("同一 PR" in lc) or ("同一PR" in lc)
+    f.append(
+        Finding(
+            "S_LIFECYCLE_REVIEW_ON_PR",
+            DOC_ACTIVITY,
+            ok,
+            message="生命周期体现 Review/rework 在『同一 PR』上进行（Review 不先于 PR 存在）"
+            if ok else "生命周期未体现 Review/rework 在『同一 PR』上进行",
+            found=f"lifecycle_has_same_pr={ok}",
+        )
+    )
+
+
+def check_role_fullname(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_ROLE_FULLNAME — 机器可消费区域仅使用 8 个 CANONICAL_ROLES 完整权威名。
+
+    机器可消费区域（角色小节 §3.x、UAR 表格、事件/标识符表格、频道表格）必须
+    仅使用完整权威名。复用 S_TABLE_ROLE_ABBREV 的手法：先把每个 canonical 全名
+    替换成占位符（空格），再用词边界正则扫描禁用的歧义简称
+    （FORBIDDEN_ROLE_ABBREV = Master / Scheduler / Reviewer）。
+
+    关键：绝不能对完整名内部包含的单词误报（如 "Master" 出现在
+    "Hermes Master / Boss" 内部，应先被全名替换消除）。
+    """
+    violations: List[str] = []
+    # 收集机器可消费区域：角色小节 §3.x 正文 + ROLE/ACTIVITY/ROADMAP/HUMAN 的表格
+    regions: List[Tuple[str, str]] = []
+    role_text = doc.get(DOC_ROLE, "")
+    for _name, body in iter_role_subsections(role_text):
+        regions.append((DOC_ROLE, body))
+    for dk in (DOC_ROLE, DOC_ACTIVITY, DOC_ROADMAP, DOC_HUMAN):
+        text = doc.get(dk, "")
+        for tbl in all_tables(text):
+            for r in tbl:
+                for cell in r:
+                    regions.append((dk, cell))
+    for dk, text in regions:
+        s = text
+        for name in CANONICAL_ROLES:
+            s = s.replace(name, " ")
+        for abbr in FORBIDDEN_ROLE_ABBREV:
+            if re.search(r"(?<![A-Za-z])" + re.escape(abbr) + r"(?![A-Za-z])", s):
+                violations.append(f"{dk}:contains forbidden role abbrev '{abbr}'")
+    ok = not violations
+    f.append(
+        Finding(
+            "S_ROLE_FULLNAME",
+            "ALL",
+            ok,
+            message="机器可消费区域均使用完整权威角色名，无 Master/Scheduler/Reviewer 歧义简称"
+            if ok else "机器可消费区域出现歧义角色简称（未使用完整权威名）",
+            found="; ".join(violations[:10]) if violations else "no forbidden abbrev in machine-consumable regions",
+        )
+    )
 
 
 def _map_segment(seg: str) -> Optional[str]:
@@ -981,6 +1260,213 @@ def check_protected_repo(f: List[Finding], doc: Dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 第二轮补强：生命周期 / 责任冲突语义（9 条）
+# 每条规则只验证一个明确的语义断言，定向变异能精确触发，不被其他冗余段落兜底。
+# ---------------------------------------------------------------------------
+
+def _role_bodies(doc: Dict[str, str]) -> Dict[str, str]:
+    role_text = doc.get(DOC_ROLE, "")
+    return {name: b for name, b in iter_role_subsections(role_text)}
+
+
+def check_deliver_logical_role_unique(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_DELIVER_LOGICAL_ROLE_UNIQUE — DeliveryController.deliver() 逻辑调用方唯一。
+
+    Release Agent 必须是**唯一**以正向（非否定）形式声明调用
+    DeliveryController.deliver() 的角色。任何其它角色正向声明调用 deliver()
+    即判违（fail-closed：任何非预期调用方都破坏交付纪律）。
+    """
+    bodies = _role_bodies(doc)
+    callers = [name for name, b in bodies.items() if _contains_affirmative_deliver(b)]
+    ok = callers == ["Release Agent"]
+    f.append(Finding(
+        "S_DELIVER_LOGICAL_ROLE_UNIQUE", DOC_ROLE, ok,
+        message="DeliveryController.deliver() 的逻辑调用方唯一归属 Release Agent"
+        if ok else "deliver() 逻辑调用方不唯一或被非 Release Agent 角色正向声明调用",
+        found=f"affirmative_callers={callers}",
+    ))
+
+
+def check_release_agent_start_order(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_RELEASE_AGENT_START_ORDER — Release Agent 启动时点正确。
+
+    正向约束：Release Agent 在 Coding Worker 本地 Commit 之后、CI 与
+    Independent Reviewer **之前**启动。若文档描述 Release Agent 在 Review
+    通过后才启动交付，则判违。
+    """
+    all_text = "\n".join(doc.get(dk, "") for dk in ALL_DOCS)
+    ok_pos = bool(re.search(r"CI 与 Independent Reviewer 之前", all_text)) or \
+             bool(re.search(r"Independent Reviewer.{0,30}之前", all_text))
+    bad = "在 Review 通过后再启动交付" in all_text
+    ok = ok_pos and not bad
+    f.append(Finding(
+        "S_RELEASE_AGENT_START_ORDER", "ALL", ok,
+        message="Release Agent 在 CI 与 Independent Reviewer 之前启动（Coding Worker 本地 Commit 之后）"
+        if ok else "Release Agent 启动时点违规（非 CI/Review 之前，或在 Review 通过后才启动）",
+        found=f"ok_pos={ok_pos}; post_review_start={bad}",
+    ))
+
+
+def check_release_agent_two_stage_duty(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_RELEASE_AGENT_TWO_STAGE_DUTY — Release Agent 两阶段职责标识。
+
+    Release Agent 必须同时体现：受控交付（"受控"）+ 首次执行阶段（"首次"）。
+    移除任一标识即无法区分首阶段受控 Push 与验收后协调。
+    """
+    bodies = _role_bodies(doc)
+    ra = bodies.get("Release Agent")
+    if ra is None:
+        f.append(Finding("S_RELEASE_AGENT_TWO_STAGE_DUTY", DOC_ROLE, False,
+                         message="未找到 Release Agent 角色小节", found="section missing"))
+        return
+    has_controlled = "受控" in ra
+    has_first = "首次" in ra
+    ok = has_controlled and has_first
+    f.append(Finding(
+        "S_RELEASE_AGENT_TWO_STAGE_DUTY", DOC_ROLE, ok,
+        message="Release Agent 两阶段职责清晰（受控交付 + 首次执行阶段）"
+        if ok else "Release Agent 两阶段职责标识缺失（缺'受控'或'首次'）",
+        found=f"has_controlled={has_controlled}; has_first={has_first}",
+    ))
+
+
+def check_canonical_lifecycle_complete(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_CANONICAL_LIFECYCLE_COMPLETE — 规范生命周期在 ACTIVITY 与 ROADMAP 双处完整。
+
+    必须同时满足：ACTIVITY §1.2.1 与 ROADMAP Phase F 两份生命周期串均包含
+    全部 10 个锚点且顺序正确（Issue→…→Draft PR→CI→Review→FINAL_ACCEPTANCE
+    →TASK_COMPLETED，且 Review 在 Draft PR 之后）。任一处重排/缺失即判违。
+    """
+    problems: List[str] = []
+    for dk, src in ((DOC_ACTIVITY, doc.get(DOC_ACTIVITY, "")),
+                    (DOC_ROADMAP, doc.get(DOC_ROADMAP, ""))):
+        lc = _extract_lifecycle(src)
+        if not lc:
+            problems.append(f"{dk}: lifecycle string missing")
+            continue
+        segments = [s.strip() for s in re.split(r"→", lc)]
+        anchors: List[str] = []
+        for seg in segments:
+            a = _map_segment(seg)
+            if a:
+                anchors.append(a)
+        positions = {}
+        for anchor in LIFECYCLE_ANCHORS_ORDER:
+            idxs = [i for i, a in enumerate(anchors) if a == anchor]
+            if idxs:
+                positions[anchor] = idxs[0]
+        missing = [a for a in LIFECYCLE_ANCHORS_ORDER if a not in positions]
+        ordered = all(
+            positions.get(LIFECYCLE_ANCHORS_ORDER[i], 10 ** 9) <
+            positions.get(LIFECYCLE_ANCHORS_ORDER[i + 1], -1)
+            for i in range(len(LIFECYCLE_ANCHORS_ORDER) - 1)
+            if LIFECYCLE_ANCHORS_ORDER[i] in positions and LIFECYCLE_ANCHORS_ORDER[i + 1] in positions
+        )
+        draft_idx = positions.get("draft_pr")
+        review_idx = positions.get("review")
+        review_after_pr = (draft_idx is not None and review_idx is not None and draft_idx < review_idx)
+        if missing or not ordered or not review_after_pr:
+            problems.append(
+                f"{dk}: missing={missing}; ordered={ordered}; review_after_pr={review_after_pr}")
+    ok = not problems
+    f.append(Finding(
+        "S_CANONICAL_LIFECYCLE_COMPLETE", "ALL", ok,
+        message="规范生命周期在 ACTIVITY 与 ROADMAP 双处完整且顺序正确"
+        if ok else "规范生命周期不完整/顺序错误: " + "; ".join(problems),
+        found="; ".join(problems) if problems else "both lifecycle strings valid",
+    ))
+
+
+def check_phase_b_lifecycle_complete(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_PHASE_B_LIFECYCLE_COMPLETE — ROADMAP Phase B 生命周期验收标准完整。
+
+    Phase B 必须完整声明：受控交付（创建/幂等获取 Draft PR）、Coding Worker
+    边界（不得创建 Draft PR）、rework 复用同 PR（不新建第 2 个 PR）、返工上限
+    MAX_ROUNDS=2、FINAL_ACCEPTANCE 阻塞绑定。任一处缺失即判违。
+    """
+    rm_text = doc.get(DOC_ROADMAP, "")
+    body = None
+    for _lvl, title, b in iter_sections(rm_text):
+        if re.match(r"^`?Phase B`?", title.strip()):
+            body = b
+            break
+    if body is None:
+        f.append(Finding("S_PHASE_B_LIFECYCLE_COMPLETE", DOC_ROADMAP, False,
+                         message="未找到 Phase B 章节", found="section missing"))
+        return
+    required = {
+        "受控交付创建 Draft PR": "创建/幂等获取 Draft PR" in body,
+        "Coding Worker 不得创建 Draft PR": "不得创建 Draft PR" in body,
+        "rework 复用同 PR": "不新建第 2 个 PR" in body,
+        "MAX_ROUNDS=2": bool(re.search(r"MAX_ROUNDS\s*=\s*2", body, re.IGNORECASE)),
+        "FINAL_ACCEPTANCE 绑定": "FINAL_ACCEPTANCE" in body,
+        "受控交付标识": "受控" in body,
+    }
+    missing = [k for k, v in required.items() if not v]
+    ok = not missing
+    f.append(Finding(
+        "S_PHASE_B_LIFECYCLE_COMPLETE", DOC_ROADMAP, ok,
+        message="Phase B 生命周期验收标准完整（受控交付/rework 同 PR/MAX_ROUNDS=2/FINAL_ACCEPTANCE 绑定）"
+        if ok else "Phase B 生命周期验收标准缺失: " + "; ".join(missing),
+        found="; ".join(missing) if missing else "phase_b_complete",
+    ))
+
+
+def check_rework_same_pr(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_REWORK_SAME_PR — rework 必须复用同一 Draft PR（不新建第 2 个 PR）。"""
+    rm_text = doc.get(DOC_ROADMAP, "")
+    ok = "不新建第 2 个 PR" in rm_text
+    f.append(Finding(
+        "S_REWORK_SAME_PR", DOC_ROADMAP, ok,
+        message="rework 复用同一 Draft PR（不新建第 2 个 PR）"
+        if ok else "未声明 rework 复用同 PR（不新建第 2 个 PR）",
+        found="rework_same_pr_stated" if ok else "no '不新建第 2 个 PR' statement",
+    ))
+
+
+def check_final_acceptance_blocking(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_FINAL_ACCEPTANCE_BLOCKING — FINAL_ACCEPTANCE 前 TASK_COMPLETED 不得触发/归档。
+
+    要求文档明确以否定形式声明：TASK_COMPLETED 在 FINAL_ACCEPTANCE 完成前
+    **不得**触发/归档（任务视为阻塞）。若改为"可以提前"则判违。
+    """
+    all_text = "\n".join(doc.get(dk, "") for dk in ALL_DOCS)
+    ok = bool(re.search(r"TASK_COMPLETED[^。\n]{0,15}不得触发/归档", all_text)) or \
+         bool(re.search(r"不得触发/归档[^。\n]{0,15}TASK_COMPLETED", all_text))
+    f.append(Finding(
+        "S_FINAL_ACCEPTANCE_BLOCKING", "ALL", ok,
+        message="FINAL_ACCEPTANCE 完成前 TASK_COMPLETED 不得触发/归档（任务视为阻塞）"
+        if ok else "未声明 FINAL_ACCEPTANCE 前 TASK_COMPLETED 不得触发/归档",
+        found="final_acceptance_blocking_stated" if ok else "no blocking statement",
+    ))
+
+
+def check_role_contract_full_names(f: List[Finding], doc: Dict[str, str]) -> None:
+    """S_ROLE_CONTRACT_FULL_NAMES — 机器可消费文本禁用裸角色简称。
+
+    与 S_ROLE_FULLNAME / S_TABLE_ROLE_ABBREV 互补：扫描**全部文档正文**
+    （含 §0 权威声明与 Phase B 等 prose），先移除 8 个完整权威名，再检查是否
+    残留 Master / Scheduler / Reviewer 歧义简称。
+    """
+    violations: List[str] = []
+    for dk in ALL_DOCS:
+        text = doc.get(dk, "")
+        s = text
+        for name in CANONICAL_ROLES:
+            s = s.replace(name, " ")
+        for abbr in FORBIDDEN_ROLE_ABBREV:
+            if re.search(r"(?<![A-Za-z])" + re.escape(abbr) + r"(?![A-Za-z])", s):
+                violations.append(f"{dk}:contains forbidden role abbrev '{abbr}'")
+    ok = not violations
+    f.append(Finding(
+        "S_ROLE_CONTRACT_FULL_NAMES", "ALL", ok,
+        message="全部文档正文均使用完整权威角色名，无 Master/Scheduler/Reviewer 歧义简称"
+        if ok else "文档正文出现歧义角色简称（未使用完整权威名）",
+        found="; ".join(violations[:10]) if violations else "no forbidden abbrev in docs",
+    ))
+
+
+# ---------------------------------------------------------------------------
 # 总调度
 # ---------------------------------------------------------------------------
 
@@ -999,14 +1485,26 @@ def run_checks(doc_contents: Dict[str, str]) -> List[Finding]:
     check_phase_a_def(f, doc_contents)
     check_draft_pr_responsibility(f, doc_contents)
     check_lifecycle(f, doc_contents)
+    check_max_rounds(f, doc_contents)
+    check_lifecycle_review_on_pr(f, doc_contents)
     check_task_completed_status(f, doc_contents)
     check_final_acceptance_blocked(f, doc_contents)
     check_temp_channel_archive(f, doc_contents)
     check_buzz_gate(f, doc_contents)
     check_pr_order(f, doc_contents)
     check_table_role_abbrev(f, doc_contents)
+    check_role_fullname(f, doc_contents)
     check_no_second_truth(f, doc_contents)
     check_protected_repo(f, doc_contents)
+    # 第二轮补强：生命周期 / 责任冲突语义（9 条）
+    check_deliver_logical_role_unique(f, doc_contents)
+    check_release_agent_start_order(f, doc_contents)
+    check_release_agent_two_stage_duty(f, doc_contents)
+    check_canonical_lifecycle_complete(f, doc_contents)
+    check_phase_b_lifecycle_complete(f, doc_contents)
+    check_rework_same_pr(f, doc_contents)
+    check_final_acceptance_blocking(f, doc_contents)
+    check_role_contract_full_names(f, doc_contents)
     return f
 
 
@@ -1061,7 +1559,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     doc_contents: Dict[str, str] = {}
     missing: List[str] = []
     for dk in ALL_DOCS:
-        path = os.path.join(args.docs_dir, dk)
+        # 路径安全：仅读取 docs_dir 内固定文件名，防穿越 / 符号链接越界。
+        try:
+            path = _safe_doc_path(args.docs_dir, dk)
+        except ValueError as exc:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
+            else:
+                print("ERROR: " + str(exc))
+            return 2
         if not os.path.isfile(path):
             missing.append(path)
             continue
