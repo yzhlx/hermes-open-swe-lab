@@ -7,7 +7,8 @@
 
 ## 0. 核心约束
 
-- **Hermes Learning OS 开发可尽早继续，不必等待整个协作平台完善。** 早期步骤必须**非阻塞**。
+- **Hermes Learning OS 自动化开发当前未激活。** 须先通过「Hermes Learning OS Activation Gate」（见 S1 之后专节）才能在 `yzhlx/hermes-learning-os` 开展自动化；在此之前，当前协作架构仅在 `yzhlx/hermes-open-swe-smoke-test`（运行时代码 `ALLOWED_GITHUB_REPOS` 唯一允许仓库）完成真实闭环验证。早期步骤必须**非阻塞**。
+- **交付物 PR 状态（本审计）**：PR #6（`d4-delivery-layer`→`d3-design`）= **checkpoint，Draft，not for merge**；PR #7（本审计文档，`audit/buzz-openship-reuse-20260726`→`d4-delivery-layer`）= **Draft，not for merge**。两者均不得自动合并，须用户审阅后决策。
 - **零 REPLACE**：本计划只做"冻结 / 保持 / 可选接入"，不做任何"停止自研改用外部"。
 - **不引入第二事实源、不复制外部源码、不 fork、不 commit**（由 team-lead 提交）。
 - 所有"接入"步骤均为**可选**或**延后 MVP-0 后**，且可独立回滚。
@@ -19,7 +20,7 @@
 | 序 | 步骤 | 阻塞 Hermes Learning OS? | 可选/延后 |
 |----|------|------------------------|----------|
 | S0 | 冻结通用平台扩张（已做） | 否 | — |
-| S1 | 用现有 GitHub 中心循环继续交付 Hermes Learning OS | 否 | — |
+| S1 | 在 Smoke Test 仓库完成真实闭环验证（HLO 自动化开发未激活） | 否 | — |
 | S2 | 标记 KEEP 核心为"冻结接口契约"，建立事实源边界守卫 | 否 | — |
 | S3 | 补齐 Reviewer/复审/Scheduler/CI 等缺引擎能力的自研路线（按需求） | 否 | 按需 |
 | S4 | （可选）若需第二 agent 运行时，经 ACP 适配器接 `buzz-agent` | 否 | 可选 |
@@ -41,15 +42,39 @@
 
 ---
 
-## S1. 用现有 GitHub 中心循环继续交付 Hermes Learning OS
+## S1. 在 Smoke Test 仓库完成真实闭环验证（Hermes Learning OS 自动化开发未激活）
 
-- **目标**：以当前已离线测试通过的控制平面 + 投递层 + Docker 沙箱 + 上游 Open SWE agent，持续开发/测试/评审 Hermes Learning OS。
+- **目标**：以当前已离线测试通过的控制平面 + 投递层 + Docker 沙箱 + 上游 Open SWE agent，在 `yzhlx/hermes-open-swe-smoke-test`（运行时代码 `ALLOWED_GITHUB_REPOS` 的唯一允许值）完成真实闭环验证。
 - **修改范围**：无（沿用 `webhook_receiver` → `control_plane` → `worker` → `sandbox` → Open SWE → `delivery` → Draft PR 流程）。
+- **运行时代码硬约束（已核实 `hermes_worker/constants.py`）**：`ALLOWED_GITHUB_REPOS = {"yzhlx/hermes-open-swe-smoke-test"}`；`PROTECTED_REPOS = {"yzhlx/hermes-learning-os"}`。当前自动化**不能**访问、修改或向 Hermes Learning OS 投递 Draft PR。
 - **前置条件**：`8806010` 离线测试 107 passed（2 个 `test_redact` 预存失败已知）。
-- **验收标准**：每个 Hermes Learning OS 迭代仍走 GitHub Issue → Draft PR → 人类合并；人类最终合并边界 intact。
+- **验收标准**：在 Smoke Test 仓库走通 GitHub Issue → Draft PR → 人类合并；人类最终合并边界 intact；Hermes Learning OS 自动化开发**保持未激活**。
 - **回滚方法**：N/A（现行流程）。
-- **是否需用户操作**：否（开发者照常提 Issue/Review）。
-- **是否阻塞 Hermes Learning OS 继续开发**：**否**（这正是主干路径）。
+- **是否需用户操作**：否（开发者在 Smoke Test 仓库照常提 Issue/Review）。
+- **是否阻塞 Hermes Learning OS 继续开发**：**否**（Smoke Test 验证路径非阻塞；但 HLO 仓库的自动化开发仍受 Activation Gate 约束，未解锁）。
+
+> **结论**：当前协作架构可以继续在 Smoke Test 仓库完成真实闭环验证；Hermes Learning OS 的自动化开发尚未激活。
+
+---
+
+## Hermes Learning OS Activation Gate（解锁前置条件）
+
+当前协作架构**不能**自动访问、修改或向 `yzhlx/hermes-learning-os` 投递 Draft PR（`PROTECTED_REPOS` 硬拒，`ALLOWED_GITHUB_REPOS` 仅含 smoke-test）。Hermes Learning OS 的自动化开发**保持未激活**，直到以下全部条件满足：
+
+1. **先在 Smoke Test 仓库完成真实 GitHub E2E**：Issue → Worker → Sandbox → Commit → Push → Draft PR → CI → Reviewer → 返工 → 二轮复审，全链路真实通过（非离线/模拟）。
+2. **真实 Provider 与真实 GitHub App Token Broker 验证**：Provider 适配器（P1–P6）与 `GitHubAppTokenBroker` 短期安装令牌在真实环境验证通过。
+3. **用户明确授权后**，才能调整 `PROTECTED_REPOS` / `ALLOWED_GITHUB_REPOS` 以纳入 Hermes Learning OS；任何调整须经用户显式确认，不得自动生效。
+4. **Hermes Learning OS 初次只允许**（最小暴露面）：
+   - 专用非默认分支；
+   - Draft PR（绝不自动合并）；
+   - 禁止直接 Push 默认分支；
+   - 禁止 Merge 与 Auto Merge；
+   - 仓库级最小权限 GitHub App（仅 Hermes Learning OS 仓库、仅必要作用域）；
+   - 单任务、单 Worker、单 Reviewer。
+5. **首次真实任务必须是低风险、小范围、可回滚任务**（如文档/测试修补），不得首发高风险变更。
+6. **首次 Pilot 通过后**，才能声明 Hermes Learning OS 开发真正解锁；此前均视为未激活。
+
+> 在 Activation Gate 全部满足前，S1 的「真实闭环验证」仅限 Smoke Test 仓库；任何涉及 Hermes Learning OS 的自动化投递均被运行时代码硬拒（fail-closed）。
 
 ---
 
@@ -138,4 +163,4 @@
 
 ## 结论
 
-> **Hermes Learning OS 现在就能继续开发（S0+S1 已就位且非阻塞）。** 所有外部接入均为可选或延后，且每一步都可独立回滚、不引入第二事实源。无任何 REPLACE、无 fork、无源码复制。
+> **当前协作架构可继续在 Smoke Test 仓库完成真实闭环验证（S0+S1 已就位且非阻塞）；Hermes Learning OS 的自动化开发尚未激活**，须通过 Hermes Learning OS Activation Gate 后方可解锁。所有外部接入均为可选或延后，且每一步都可独立回滚、不引入第二事实源。无任何 REPLACE、无 fork、无源码复制。

@@ -55,6 +55,8 @@
 - **KEEP + INTEGRATE(延后)：1 项**（#22 部署 Runbook→Openship scoped-MCP，MVP-0 后）
 - **REPLACE：0 项**
 
+> **统计口径（统一，与 `RECOMMENDED-TARGET-ARCHITECTURE-2026-07-26.md` 一致）**：24 项 Hermes 能力，**0 项 REPLACE**；**21 项纯 KEEP**（无任何外部接入）+ **2 项 KEEP+可选 INTEGRATE**（#6、#7）+ **1 项 KEEP+INTEGRATE 延后**（#22）。即「全部 24 项能力均保持自研 KEEP 基底，仅 3 项叠加外部接入（2 可选 + 1 延后）」。文档中「KEEP 20」指 KEEP 核心叙述清单行数（含 #6/#7/#22 作为自研核心，其外部接入见 §2/§3），与「21 项纯 KEEP」不矛盾。
+
 > 结论：**无任何 REPLACE**。所有能力要么由 Hermes 维持（KEEP），要么仅以标准接口（MCP/ACP/独立服务）可选/延后接入外部（INTEGRATE），且接入优先级严格遵守 现有接口 → 服务/二进制 → 薄适配器 → fork → 复制源码(最后)。
 
 ---
@@ -82,7 +84,7 @@
 
 | 能力 | Openship 模块（证据） | 与 Hermes 关系 | 建议 | 理由 / 风险 | 是否需 Fork | 上游成熟度 | 迁移复杂度 |
 |------|---------------------|--------------|------|-----------|-----------|-----------|-----------|
-| 完整部署能力（git 驱动部署 / 构建 / 容器部署 / 环境变量 / 日志 / 健康检查 / 版本历史 / **回滚** / Preview-Staging-Prod / 域名 / TLS / 数据卷 / RBAC / 稳定 REST API / **一等 MCP 服务**） | `packages/core/*`,`apps/api/modules/*`,`apps/api/src/modules/mcp/` (`HARD_DENY=[tokens,auth,mcp]`, `filterToolsForPrincipal` 只读/角色/受限授权, `annotations` 标 destructive) | 直接重叠 #22 未来部署 Runbook | **INTEGRATE（延后 MVP-0 后）** | Hermes 当前不需要（prod 部署出 MVP-0 范围）；作为**独立 scoped-MCP 服务**接入，不复制源码；`HARD_DENY`+ 授权域天然限制 Agent 仅 status-view / test-deploy，**不授生产 grant 即结构性禁生产** | 否（运行服务，Apache-2.0） | v0.3.0 pre-1.0 | MED（延后） |
+| 完整部署能力（git 驱动部署 / 构建 / 容器部署 / 环境变量 / 日志 / 健康检查 / 版本历史 / **回滚** / Preview-Staging-Prod / 域名 / TLS / 数据卷 / RBAC / REST API（源码已检视，pre-1.0 未构建/未实测验证） / **一等 MCP 服务**） | `packages/core/*`,`apps/api/modules/*`,`apps/api/src/modules/mcp/` (`HARD_DENY=[tokens,auth,mcp]`, `filterToolsForPrincipal` 只读/角色/受限授权, `annotations` 标 destructive) | 直接重叠 #22 未来部署 Runbook | **INTEGRATE（延后 MVP-0 后）** | Hermes 当前不需要（prod 部署出 MVP-0 范围）；作为**独立 scoped-MCP 服务**接入，不复制源码；`HARD_DENY`+ 授权域天然限制 Agent 仅 status-view / test-deploy，**不授生产 grant 即结构性禁生产** | 否（运行服务，Apache-2.0） | v0.3.0 pre-1.0 | MED（延后） |
 | Agent 部署调用 | 经 MCP：`mcp-tools.ts` 每路由→工具，经真实 Hono app 派发 | 重叠 #22 接入方式 | **INTEGRATE（随上，延后）** | 只读 MCP token→status-view；受限 token 仅授 preview/test 项目→test-deploy | 否 | pre-1.0 | MED |
 
 ---

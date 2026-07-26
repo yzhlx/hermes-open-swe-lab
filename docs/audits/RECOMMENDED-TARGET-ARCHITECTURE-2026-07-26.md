@@ -9,7 +9,11 @@
 
 Hermes Learning OS 是**最终产品**。协作架构的**唯一目的**是加速 Hermes Learning OS 的开发/测试/评审/部署/迭代，**不应演化为独立平台**。集成外部能力必须满足：不创建第二事实源、安全边界可接受、可隔离部署、有回滚计划、迁移成本低于继续自研成本。
 
-基于复用矩阵（见 `BUZZ-OPENSHIP-REUSE-MATRIX-2026-07-26.md`），**结论：0 项 REPLACE；全部 KEEP，少数可选/延后 INTEGRATE。**
+基于复用矩阵（见 `BUZZ-OPENSHIP-REUSE-MATRIX-2026-07-26.md`），**结论：0 项 REPLACE；全部 24 项能力保持自研 KEEP 基底（21 项纯 KEEP + 2 项可选 INTEGRATE + 1 项延后 INTEGRATE），无外部替换。**
+
+**证据来源（与复用矩阵 §4 一致）**：Buzz/Openship 能力判定均基于 `gh api` 只读远程源码检视；未做本地克隆、未构建、未运行（source-verified-but-unbuilt），证据强度低于本地构建+测试。Hermes 侧判定基于 `8806010` 源码 + 离线测试。
+
+**注意**：当前运行时代码 `ALLOWED_GITHUB_REPOS` 仅含 `yzhlx/hermes-open-swe-smoke-test`，`PROTECTED_REPOS` 含 `yzhlx/hermes-learning-os`；Hermes Learning OS 自动化开发**尚未激活**（解锁条件见迁移计划「Hermes Learning OS Activation Gate」）。
 
 ---
 
@@ -38,7 +42,7 @@ Hermes Learning OS 是**最终产品**。协作架构的**唯一目的**是加�
 19. **云端校验策略**（`AGENTS.md §9`，出 MVP-0）。
 20. **Provider 适配器**（`hermes_open_swe_relay/` + `scripts/provider_preflight.py`）— 薄 opt-in relay 适配器。
 
-> 以上 20 项 = KEEP。**没有稳定 OSS 覆盖 Hermes 特有任务/验收规则、用户授权边界、Worker/Reviewer 角色分离、证据门、人类合并边界、GitHub 唯一代码事实源**，故必须自研维持。
+> 以上为 **KEEP 核心叙述清单**（20 条叙述行，覆盖全部 24 项能力；其中 #6 沙箱、#7 Agent 的可选外部接入见 §2，#22 部署 Runbook 的延后外部接入见 §3）。**严格计数（统一口径）：21 项纯 KEEP + 2 项 KEEP+可选 INTEGRATE（#6、#7）+ 1 项 KEEP+INTEGRATE 延后（#22）= 24 项，0 项 REPLACE。** 没有稳定 OSS 覆盖 Hermes 特有任务/验收规则、用户授权边界、Worker/Reviewer 角色分离、证据门、人类合并边界、GitHub 唯一代码事实源，故必须自研维持。
 
 ---
 
@@ -67,7 +71,7 @@ Hermes Learning OS 是**最终产品**。协作架构的**唯一目的**是加�
 
 | 能力 | 接入方式 | 接口 | 状态 | 条件 / 风险 |
 |------|---------|------|------|-----------|
-| 完整部署面（git 驱动部署 / 构建 / 容器部署 / 环境变量 / 日志 / 健康检查 / 版本历史 / **回滚** / Preview-Staging-Prod / 域名 / TLS / 数据卷 / RBAC / REST / **一等 MCP**） | 作为**独立 scoped-MCP 服务**运行，**不复制源码、不 fork** | MCP（路由生成、consent 门控） | **延后 MVP-0 后** | Hermes 当前不需要（prod 部署出 MVP-0）；`HARD_DENY=[tokens,auth,mcp]` + `filterToolsForPrincipal` 天然限制 Agent 仅 status-view / test-deploy |
+| 完整部署面（git 驱动部署 / 构建 / 容器部署 / 环境变量 / 日志 / 健康检查 / 版本历史 / **回滚** / Preview-Staging-Prod / 域名 / TLS / 数据卷 / RBAC / REST API（源码已检视，pre-1.0 未构建/未实测验证） / **一等 MCP**） | 作为**独立 scoped-MCP 服务**运行，**不复制源码、不 fork** | MCP（路由生成、consent 门控） | **延后 MVP-0 后** | Hermes 当前不需要（prod 部署出 MVP-0）；`HARD_DENY=[tokens,auth,mcp]` + `filterToolsForPrincipal` 天然限制 Agent 仅 status-view / test-deploy |
 
 **安全接入约束（来自 Openship MCP 层）：**
 - Agent 拿**只读 MCP token** → 仅 GET → status-view。
