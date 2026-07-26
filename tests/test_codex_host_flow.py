@@ -74,9 +74,12 @@ class FakePopen:
         self.kwargs = dict(kwargs)
         self.cwd = kwargs["cwd"]
         self.env = dict(kwargs["env"])
-        output_path = Path(args[args.index("--output-last-message") + 1])
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.final_message is not None:
+        if "--output-last-message" in args:
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            output_path = None
+        if self.final_message is not None and output_path is not None:
             output_path.write_text(self.final_message, encoding="utf-8")
         return FakeProcess(
             self,
@@ -215,6 +218,69 @@ class CodexCliRunnerTests(unittest.TestCase):
             self.assertFalse(result.workspace_binding_ok)
             self.assertEqual(result.stderr_summary, "WORKSPACE_BINDING_FAILURE")
             self.assertIsNone(fake.args)
+
+    def test_wsl2_command_uses_linux_paths_stdin_and_credential_unset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp))
+            diagnostics = Path(tmp) / "diagnostics"
+            fake = FakePopen(
+                stdout=json.dumps({"type": "turn.completed"}),
+                final_message=None,
+            )
+            real_run = subprocess.run
+
+            def convert_windows_path(args, **kwargs):
+                if args[0] == "wsl.exe" and "wslpath" in args:
+                    windows_path = str(args[-1]).replace("\\", "/")
+                    drive = windows_path[0].lower()
+                    converted = f"/mnt/{drive}{windows_path[2:]}\n"
+                    return subprocess.CompletedProcess(args, 0, converted, "")
+                return real_run(args, **kwargs)
+
+            runner = CodexCliRunner(
+                codex_binary="codex",
+                popen_factory=fake,
+                environ={
+                    "PATH": os.environ.get("PATH", ""),
+                    "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
+                    "HERMES_GITHUB_APP_ID": "forbidden",
+                    "GITHUB_TOKEN": FAKE_TOKEN,
+                },
+                tree_terminator=lambda process: process.kill(),
+                artifacts_root=diagnostics,
+                wsl_distribution="Ubuntu-22.04",
+            )
+            with mock.patch(
+                "hermes_worker.codex_cli_runner.subprocess.run",
+                side_effect=convert_windows_path,
+            ):
+                result = runner.run(repo, "write through stdin", 10)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(fake.stdin, "write through stdin")
+            self.assertEqual(fake.cwd, str(repo.resolve()))
+            self.assertEqual(
+                fake.args[:7],
+                [
+                    "wsl.exe", "-d", "Ubuntu-22.04", "--exec",
+                    "bash", "-lc", fake.args[6],
+                ],
+            )
+            self.assertIn("exec codex --ask-for-approval never exec", fake.args[6])
+            self.assertIn("--model gpt-5.4", fake.args[6])
+            self.assertIn("--sandbox workspace-write", fake.args[6])
+            self.assertIn("unset HERMES_GITHUB_APP_ID", fake.args[6])
+            self.assertTrue(fake.args[-2].startswith("/mnt/"))
+            self.assertTrue(fake.args[-1].startswith("/mnt/"))
+            self.assertNotIn("HERMES_GITHUB_APP_ID", fake.env)
+            self.assertNotIn("GITHUB_TOKEN", fake.env)
+            evidence = json.loads(Path(
+                result.workspace_evidence_path
+            ).read_text(encoding="utf-8"))
+            self.assertEqual(
+                evidence["execution_backend"], "wsl2:Ubuntu-22.04"
+            )
+            self.assertEqual(evidence["wsl_repo_path"], fake.args[-2])
 
     def test_nonzero_exit_is_captured_and_redacted(self):
         with tempfile.TemporaryDirectory() as tmp:

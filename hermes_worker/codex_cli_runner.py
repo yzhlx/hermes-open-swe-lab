@@ -128,6 +128,7 @@ class CodexCliRunner:
         clock: Callable[[], float] = time.monotonic,
         tree_terminator: Optional[Callable] = None,
         artifacts_root: Optional[Path] = None,
+        wsl_distribution: Optional[str] = None,
     ):
         self.codex_binary = codex_binary
         self._popen = popen_factory
@@ -139,6 +140,31 @@ class CodexCliRunner:
             if artifacts_root is not None
             else Path(tempfile.gettempdir()) / "hermes-codex-diagnostics"
         )
+        self._wsl_distribution = wsl_distribution
+
+    def _wsl_path(self, path: Path, child_env: Mapping[str, str]) -> str:
+        result = subprocess.run(
+            [
+                "wsl.exe",
+                "-d",
+                self._wsl_distribution,
+                "--exec",
+                "wslpath",
+                "-a",
+                "-u",
+                str(path),
+            ],
+            env=dict(child_env),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        converted = result.stdout.strip()
+        if result.returncode != 0 or not converted.startswith("/"):
+            raise RuntimeError("WSL path conversion failed")
+        return converted
 
     def _child_environment(self) -> dict[str, str]:
         by_upper = {key.upper(): (key, value) for key, value in self._environ.items()}
@@ -276,21 +302,54 @@ class CodexCliRunner:
         events_path = run_dir / "events.jsonl"
         final_message_path = run_dir / "final-message.txt"
         workspace_evidence_path = run_dir / "workspace-evidence.json"
-        command = [
-            self.codex_binary,
-            "--ask-for-approval",
-            "never",
-            "exec",
-            "--cd",
-            str(repo_path),
-            "--sandbox",
-            "workspace-write",
-            "--ephemeral",
-            "--json",
-            "--output-last-message",
-            str(final_message_path),
-            "-",
-        ]
+        child_env = self._child_environment()
+        wsl_repo_path = ""
+        wsl_diagnostic_path = ""
+        if self._wsl_distribution:
+            wsl_repo_path = self._wsl_path(repo_path, child_env)
+            wsl_diagnostic_path = self._wsl_path(
+                final_message_path, child_env
+            )
+            wsl_command = (
+                'export PATH="$HOME/.local/bin:$HOME/bin:$PATH"; '
+                "unset HERMES_GITHUB_APP_ID "
+                "HERMES_GITHUB_INSTALLATION_ID "
+                "HERMES_GITHUB_APP_PRIVATE_KEY_PATH "
+                "HERMES_GIT_INSTALLATION_TOKEN GITHUB_TOKEN GH_TOKEN "
+                "JWT OPENAI_API_KEY ANTHROPIC_API_KEY; "
+                "exec codex --ask-for-approval never exec "
+                "--model gpt-5.4 "
+                '--cd "$1" --sandbox workspace-write --ephemeral --json '
+                '--output-last-message "$2" -'
+            )
+            command = [
+                "wsl.exe",
+                "-d",
+                self._wsl_distribution,
+                "--exec",
+                "bash",
+                "-lc",
+                wsl_command,
+                "hermes-codex-wsl",
+                wsl_repo_path,
+                wsl_diagnostic_path,
+            ]
+        else:
+            command = [
+                self.codex_binary,
+                "--ask-for-approval",
+                "never",
+                "exec",
+                "--cd",
+                str(repo_path),
+                "--sandbox",
+                "workspace-write",
+                "--ephemeral",
+                "--json",
+                "--output-last-message",
+                str(final_message_path),
+                "-",
+            ]
         command_redacted = redact(subprocess.list2cmdline(command))
         git_root_result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -339,6 +398,12 @@ class CodexCliRunner:
             "initial_status": redact(status_result.stdout),
             "command": command_redacted,
             "binding_ok": binding_ok,
+            "execution_backend": (
+                f"wsl2:{self._wsl_distribution}"
+                if self._wsl_distribution else "windows"
+            ),
+            "wsl_repo_path": redact(wsl_repo_path),
+            "wsl_diagnostic_path": redact(wsl_diagnostic_path),
         }
         workspace_evidence_path.write_text(
             json.dumps(workspace_evidence, ensure_ascii=False, indent=2) + "\n",
@@ -361,7 +426,6 @@ class CodexCliRunner:
                 workspace_evidence_path=str(workspace_evidence_path),
                 workspace_binding_ok=False,
             )
-        child_env = self._child_environment()
         popen_kwargs = {
             "cwd": str(repo_path),
             "env": child_env,
