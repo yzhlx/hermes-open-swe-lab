@@ -1,0 +1,101 @@
+name: Collaboration Docs Semantic Check
+
+on:
+  pull_request:
+    branches:
+      - "**"
+    paths:
+      - "docs/architecture/**"
+      - "tools/check_collaboration_docs.py"
+      - "tests/test_collaboration_docs_checker.py"
+      - "tests/fixtures/collab_docs_builder.py"
+      - ".github/workflows/collaboration-docs-check.yml"
+  workflow_dispatch:
+
+# 只读权限，绝不访问任何 secret / 受保护仓库。
+permissions:
+  contents: read
+
+jobs:
+  # 受信任策略闸门（F-01 修复）：使用 BASE SHA 的冻结版检查器校验 PR 的文档内容。
+  # 即使 PR 弱化了自己携带的检查器，闸门仍基于基线版本判定，从根本上杜绝
+  # "PR 自带检查器自我宽松放行 / 自我 approve" 的信任自举漏洞。
+  trusted-policy-gate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          path: pr-head
+
+      - name: Fetch base commit for trusted checker
+        working-directory: pr-head
+        run: |
+          git fetch origin "${{ github.event.pull_request.base.sha }}" --depth=1
+
+      - name: Verify trusted checker exists on BASE
+        working-directory: pr-head
+        run: |
+          if git cat-file -e "${{ github.event.pull_request.base.sha }}:tools/check_collaboration_docs.py" 2>/dev/null; then
+            echo "trusted checker present on base ${{ github.event.pull_request.base.sha }}"
+          else
+            # Bootstrap 情况：base ref 尚无 checker，不得静默跳过，明确失败。
+            echo "TRUSTED_CHECKER_NOT_PRESENT_ON_BASE"
+            exit 1
+          fi
+
+      - name: Extract BASE SHA checker (trusted)
+        working-directory: pr-head
+        run: |
+          if ! git show "${{ github.event.pull_request.base.sha }}:tools/check_collaboration_docs.py" \
+               > tools/check_collaboration_docs.py 2>/dev/null; then
+            echo "TRUSTED_CHECKER_NOT_PRESENT_ON_BASE"
+            exit 1
+          fi
+          git show "${{ github.event.pull_request.base.sha }}:tests/fixtures/collab_docs_builder.py" \
+            > tests/fixtures/collab_docs_builder.py 2>/dev/null || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Run TRUSTED checker against PR docs
+        working-directory: pr-head
+        run: python tools/check_collaboration_docs.py --docs-dir docs/architecture
+
+  # 候选回归（F-01 修复）：运行 PR 自带检查器 + 测试套件，确保新代码自身正确。
+  candidate-regression:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip pytest
+      - name: Run PR checker on real docs
+        run: python tools/check_collaboration_docs.py --docs-dir docs/architecture
+      - name: Run PR test suite
+        run: python -m pytest tests/test_collaboration_docs_checker.py -v
+
+  # CODEOWNERS 约束校验（F-01）：不自动创建；若已存在则校验工具文件路径归属。
+  codeowners-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify CODEOWNERS covers tooling paths (if present)
+        run: |
+          if [ -f .github/CODEOWNERS ]; then
+            echo "CODEOWNERS present; verifying tooling paths are owned."
+            grep -q "tools/check_collaboration_docs.py" .github/CODEOWNERS \
+              || echo "WARN: tools/check_collaboration_docs.py not explicitly owned"
+          else
+            echo "CODEOWNERS_REQUIRES_HUMAN_OWNER_CONFIGURATION"
+          fi
