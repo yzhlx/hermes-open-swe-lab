@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import subprocess
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -64,6 +65,9 @@ class CodexRunResult:
     stderr_summary: str
     changed_files: list[str]
     command_redacted: str
+    diagnostic_dir: str = ""
+    workspace_evidence_path: str = ""
+    workspace_binding_ok: bool = True
 
 
 def _text(value) -> str:
@@ -123,12 +127,18 @@ class CodexCliRunner:
         environ: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.monotonic,
         tree_terminator: Optional[Callable] = None,
+        artifacts_root: Optional[Path] = None,
     ):
         self.codex_binary = codex_binary
         self._popen = popen_factory
         self._environ = dict(os.environ if environ is None else environ)
         self._clock = clock
         self._tree_terminator = tree_terminator or self._terminate_process_tree
+        self._artifacts_root = Path(
+            artifacts_root
+            if artifacts_root is not None
+            else Path(tempfile.gettempdir()) / "hermes-codex-diagnostics"
+        )
 
     def _child_environment(self) -> dict[str, str]:
         by_upper = {key.upper(): (key, value) for key, value in self._environ.items()}
@@ -250,14 +260,29 @@ class CodexCliRunner:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
-        self._ensure_artifacts_ignored(repo_path)
-        run_dir = repo_path / ".hermes" / "codex" / uuid.uuid4().hex
+        artifacts_root = self._artifacts_root.resolve()
+        try:
+            artifacts_root.relative_to(repo_path)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Codex diagnostic artifacts must be outside repo_path")
+        if any((parent / ".git").exists()
+               for parent in (artifacts_root, *artifacts_root.parents)):
+            raise ValueError("Codex diagnostic artifacts must be outside Git repositories")
+
+        run_dir = artifacts_root / uuid.uuid4().hex
         run_dir.mkdir(parents=True, exist_ok=False)
         events_path = run_dir / "events.jsonl"
         final_message_path = run_dir / "final-message.txt"
+        workspace_evidence_path = run_dir / "workspace-evidence.json"
         command = [
             self.codex_binary,
+            "--ask-for-approval",
+            "never",
             "exec",
+            "--cd",
+            str(repo_path),
             "--sandbox",
             "workspace-write",
             "--ephemeral",
@@ -267,6 +292,75 @@ class CodexCliRunner:
             "-",
         ]
         command_redacted = redact(subprocess.list2cmdline(command))
+        git_root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        branch_result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        git_root_text = git_root_result.stdout.strip()
+        try:
+            git_root = Path(git_root_text).resolve()
+        except (OSError, ValueError):
+            git_root = Path()
+        popen_cwd = repo_path
+        binding_ok = (
+            git_root_result.returncode == 0
+            and os.path.normcase(str(repo_path))
+            == os.path.normcase(str(popen_cwd))
+            == os.path.normcase(str(git_root))
+        )
+        workspace_evidence = {
+            "repo_path": redact(str(repo_path)),
+            "popen_cwd": redact(str(popen_cwd)),
+            "git_root": redact(str(git_root_text)),
+            "branch": redact(branch_result.stdout.strip()),
+            "initial_status": redact(status_result.stdout),
+            "command": command_redacted,
+            "binding_ok": binding_ok,
+        }
+        workspace_evidence_path.write_text(
+            json.dumps(workspace_evidence, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if not binding_ok:
+            events_path.write_text("", encoding="utf-8")
+            final_message_path.write_text("", encoding="utf-8")
+            return CodexRunResult(
+                exit_code=125,
+                timed_out=False,
+                duration_seconds=0.0,
+                events_jsonl_path=str(events_path),
+                final_message_path=str(final_message_path),
+                stdout_summary="events=0; workspace_binding=false",
+                stderr_summary="WORKSPACE_BINDING_FAILURE",
+                changed_files=[],
+                command_redacted=command_redacted,
+                diagnostic_dir=str(run_dir),
+                workspace_evidence_path=str(workspace_evidence_path),
+                workspace_binding_ok=False,
+            )
         child_env = self._child_environment()
         popen_kwargs = {
             "cwd": str(repo_path),
@@ -338,4 +432,7 @@ class CodexCliRunner:
             stderr_summary=_summary(stderr),
             changed_files=self._changed_files(repo_path),
             command_redacted=command_redacted,
+            diagnostic_dir=str(run_dir),
+            workspace_evidence_path=str(workspace_evidence_path),
+            workspace_binding_ok=True,
         )

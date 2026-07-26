@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from hermes_worker.codex_cli_runner import CodexCliRunner, CodexRunResult
 from hermes_worker.codex_job_runner import CodexJobRunner, main as codex_job_main
@@ -134,6 +135,7 @@ class CodexCliRunnerTests(unittest.TestCase):
                 popen_factory=fake,
                 environ=env,
                 tree_terminator=lambda process: process.kill(),
+                artifacts_root=Path(tmp) / "diagnostics",
             )
             result = runner.run(repo, "implement from stdin", 30)
 
@@ -143,9 +145,14 @@ class CodexCliRunnerTests(unittest.TestCase):
             self.assertEqual(fake.cwd, str(repo.resolve()))
             self.assertEqual(fake.kwargs["encoding"], "utf-8")
             self.assertEqual(fake.kwargs["errors"], "replace")
-            self.assertEqual(fake.args[0:2], ["codex-test", "exec"])
+            self.assertEqual(
+                fake.args[0:4],
+                ["codex-test", "--ask-for-approval", "never", "exec"],
+            )
+            self.assertEqual(fake.args[fake.args.index("--cd") + 1],
+                             str(repo.resolve()))
             for arg in ("--sandbox", "workspace-write", "--ephemeral", "--json",
-                        "--output-last-message", "-"):
+                        "--output-last-message", "--cd", "-"):
                 self.assertIn(arg, fake.args)
             self.assertNotIn("implement from stdin", fake.args)
             for key in (
@@ -164,6 +171,50 @@ class CodexCliRunnerTests(unittest.TestCase):
                 Path(result.final_message_path).read_text(encoding="utf-8"), "done"
             )
             self.assertNotIn("implement from stdin", result.command_redacted)
+            self.assertTrue(result.workspace_binding_ok)
+            self.assertFalse(
+                Path(result.diagnostic_dir).is_relative_to(repo.resolve())
+            )
+            workspace_evidence = json.loads(Path(
+                result.workspace_evidence_path
+            ).read_text(encoding="utf-8"))
+            self.assertTrue(workspace_evidence["binding_ok"])
+            self.assertEqual(workspace_evidence["repo_path"], str(repo.resolve()))
+            self.assertEqual(workspace_evidence["popen_cwd"], str(repo.resolve()))
+            self.assertEqual(
+                Path(workspace_evidence["git_root"]).resolve(), repo.resolve()
+            )
+
+    def test_workspace_binding_mismatch_fails_before_codex_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp))
+            fake = FakePopen()
+            real_run = subprocess.run
+
+            def mismatched_git_root(args, **kwargs):
+                if args == ["git", "rev-parse", "--show-toplevel"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, str(Path(tmp) / "different-repo") + "\n", ""
+                    )
+                return real_run(args, **kwargs)
+
+            runner = CodexCliRunner(
+                codex_binary="codex-test",
+                popen_factory=fake,
+                environ={"PATH": os.environ.get("PATH", "")},
+                tree_terminator=lambda process: process.kill(),
+                artifacts_root=Path(tmp) / "diagnostics",
+            )
+            with mock.patch(
+                "hermes_worker.codex_cli_runner.subprocess.run",
+                side_effect=mismatched_git_root,
+            ):
+                result = runner.run(repo, "task", 10)
+
+            self.assertEqual(result.exit_code, 125)
+            self.assertFalse(result.workspace_binding_ok)
+            self.assertEqual(result.stderr_summary, "WORKSPACE_BINDING_FAILURE")
+            self.assertIsNone(fake.args)
 
     def test_nonzero_exit_is_captured_and_redacted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,6 +228,7 @@ class CodexCliRunnerTests(unittest.TestCase):
                 popen_factory=fake,
                 environ={"PATH": os.environ.get("PATH", "")},
                 tree_terminator=lambda process: process.kill(),
+                artifacts_root=Path(tmp) / "diagnostics",
             ).run(repo, "task", 10)
             self.assertEqual(result.exit_code, 7)
             self.assertNotIn(FAKE_TOKEN, result.stderr_summary)
@@ -195,6 +247,7 @@ class CodexCliRunnerTests(unittest.TestCase):
                 popen_factory=fake,
                 environ={"PATH": os.environ.get("PATH", "")},
                 tree_terminator=terminate,
+                artifacts_root=Path(tmp) / "diagnostics",
             ).run(repo, "task", 1)
             self.assertTrue(result.timed_out)
             self.assertEqual(result.exit_code, 124)
@@ -215,6 +268,7 @@ class CodexCliRunnerTests(unittest.TestCase):
                 popen_factory=fake,
                 environ={"PATH": os.environ.get("PATH", "")},
                 tree_terminator=lambda process: process.kill(),
+                artifacts_root=Path(tmp) / "diagnostics",
             ).run(repo, "task", 10)
             self.assertEqual(result.changed_files, ["feature.py"])
             self.assertFalse(any(path.startswith(".hermes") for path in result.changed_files))
