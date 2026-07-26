@@ -40,8 +40,12 @@ def _deploy_service_user():
       root. If it is missing/invalid, fail loudly (no skip, no root fallback).
     check_config.sh refuses both a root process and a HERMES_SERVICE_USER mismatch,
     so the deploy always runs check_config as this non-root user via `runuser`.
+
+    `os.geteuid` is POSIX-only; on non-POSIX hosts there is no root concept, so we
+    fall through to the non-root branch (behavior-preserving on Linux).
     """
-    if os.geteuid() == 0:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() == 0:
         user = os.environ.get("SUDO_USER", "").strip()
         if not user or user == "root":
             raise AssertionError(
@@ -54,6 +58,33 @@ def _deploy_service_user():
     if user == "root":
         raise AssertionError("service user must not be root")
     return user
+
+
+def _grant_traversal(path):
+    """Relax o+x on the pytest temp chain so a dropped service user can traverse.
+
+    The root-required deploy tests run under `sudo -E`, so pytest's temp root
+    (/tmp/pytest-of-root) is created 0700 root-owned. deploy_control_plane.sh
+    chowns APP_HOME to the service user, but the ancestor dirs above APP_HOME stay
+    root-only, so `runuser -u <service_user>` cannot exec the installed
+    check_config.sh (EACCES: Permission denied). Relax o+x on the chain up to
+    /tmp so the non-root service user can traverse into the installed scripts.
+    No production file is modified and no security gate is weakened. On non-Linux
+    or non-/tmp layouts this is a safe no-op.
+    """
+    d = os.path.abspath(path)
+    while True:
+        if d == "/tmp" or d.startswith("/tmp/"):
+            try:
+                os.chmod(d, 0o755)
+            except OSError:
+                pass
+        if d in ("/tmp", "/"):
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
 
 
 def _posix(p):
@@ -288,6 +319,7 @@ def test_log_rotation(tmp_path):
 # --------------------------------------------------------------------------
 def test_deploy_idempotency(tmp_path):
     repo = build_git_repo(tmp_path)
+    _grant_traversal(tmp_path)
     sha_a = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo),
                            capture_output=True, text=True).stdout.strip()
     app_home = tmp_path / "install"
@@ -314,6 +346,7 @@ def test_deploy_idempotency(tmp_path):
 
 def test_rollback(tmp_path):
     repo = build_git_repo(tmp_path)
+    _grant_traversal(tmp_path)
     (repo / "deploy" / "DEPLOY_MARKER").write_text("A")
     sha_a = commit(repo, "marker A")
     (repo / "deploy" / "DEPLOY_MARKER").write_text("B")
