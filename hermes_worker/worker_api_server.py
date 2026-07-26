@@ -124,6 +124,19 @@ def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
                 elif path.startswith("/worker/jobs/") and path.endswith("/complete"):
                     jid = int(path.split("/")[-2])
                     res = cp.complete(tok, jid, body.get("result"))
+                elif path.startswith("/worker/jobs/") and path.endswith(
+                        "/request-final-acceptance"):
+                    # Open the gate (worker token; CI must already be green).
+                    jid = int(path.split("/")[-2])
+                    res = cp.request_final_acceptance(tok, jid)
+                elif path.startswith("/worker/jobs/") and path.endswith(
+                        "/final-accept"):
+                    # Human-Owner acceptance. The Human Owner token travels on a
+                    # DEDICATED header, never on X-Worker-Token, so a worker
+                    # token can never impersonate the Human Owner (PB-23 req 6).
+                    jid = int(path.split("/")[-2])
+                    res = cp.final_accept(
+                        self.headers.get("X-Human-Owner-Token", ""), jid)
                 elif path.startswith("/worker/jobs/") and path.endswith("/fail"):
                     jid = int(path.split("/")[-2])
                     res = cp.fail(tok, jid, body.get("error"))
