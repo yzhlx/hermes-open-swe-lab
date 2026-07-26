@@ -1,0 +1,36 @@
+name: Baseline pytest
+
+on:
+  pull_request:
+    branches:
+      - phase-1-smoke
+  push:
+    branches:
+      - phase-1-smoke
+
+permissions:
+  contents: read
+
+jobs:
+  baseline-pytest:
+    name: baseline-pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install test runner
+        run: |
+          python -m pip install --disable-pip-version-check pytest==9.1.1
+
+      - name: Collect tests
+        run: |
+          python -m pytest tests/ --collect-only -q -p no:cacheprovider
+
+      - name: Run full baseline test suite
+        run: |
+          python -m pytest tests/ -v -p no:cacheprovider -rA
