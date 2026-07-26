@@ -87,6 +87,25 @@ CREATE TABLE IF NOT EXISTS issue_tasks (
     created_at    REAL,
     PRIMARY KEY (repo, issue_number)
 );
+
+-- Controlled-delivery layer idempotency + recovery state (D4). One row per
+-- stable key (repository|task_id|commit_sha|remote_branch). Stored in the SAME
+-- shared DB file / connection as the rest of the worker so there is exactly
+-- one SQLite store and one schema owner (db.py). A separate, second registry
+-- is intentionally NOT used.
+CREATE TABLE IF NOT EXISTS delivery_state (
+    key           TEXT PRIMARY KEY,
+    state         TEXT NOT NULL,
+    repository    TEXT,
+    task_id       TEXT,
+    commit_sha    TEXT,
+    remote_branch TEXT,
+    pr_url        TEXT,
+    pr_number     INTEGER,
+    updated_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_state_branch
+    ON delivery_state(repository, task_id, remote_branch);
 """
 
 
@@ -120,3 +139,70 @@ def connect(path: str) -> sqlite3.Connection:
     conn.isolation_level = None
     conn.execute("PRAGMA busy_timeout=15000;")
     return conn
+
+
+# --------------------------------------------------------------------------
+# Controlled-delivery layer idempotency / recovery state (D4)
+# --------------------------------------------------------------------------
+
+def upsert_delivery_state(
+    conn: sqlite3.Connection, *, key: str, state: str,
+    repository: str = None, task_id: str = None, commit_sha: str = None,
+    remote_branch: str = None, pr_url: str = None, pr_number=None,
+    updated_at: float = None,
+) -> None:
+    """Insert or update a delivery-state row. Single source of truth for D4
+    idempotency so the layer never opens its own second SQLite store."""
+    import time as _time
+    ts = updated_at if updated_at is not None else _time.time()
+    conn.execute(
+        """INSERT INTO delivery_state(
+               key, state, repository, task_id, commit_sha, remote_branch,
+               pr_url, pr_number, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(key) DO UPDATE SET
+             state=excluded.state, repository=excluded.repository,
+             task_id=excluded.task_id, commit_sha=excluded.commit_sha,
+             remote_branch=excluded.remote_branch, pr_url=excluded.pr_url,
+             pr_number=excluded.pr_number, updated_at=excluded.updated_at""",
+        (key, state, repository, task_id, commit_sha, remote_branch,
+         pr_url, pr_number, ts))
+    conn.commit()
+
+
+def select_delivery_state(conn: sqlite3.Connection, key: str) -> Optional[dict]:
+    """Return the delivery-state row for ``key`` or ``None`` if absent."""
+    row = conn.execute(
+        "SELECT key, state, repository, task_id, commit_sha, remote_branch, "
+        "pr_url, pr_number FROM delivery_state WHERE key=?",
+        (key,)).fetchone()
+    if not row:
+        return None
+    return {
+        "key": row["key"], "state": row["state"],
+        "repository": row["repository"], "task_id": row["task_id"],
+        "commit_sha": row["commit_sha"], "remote_branch": row["remote_branch"],
+        "pr_url": row["pr_url"], "pr_number": row["pr_number"],
+    }
+
+
+def select_delivery_state_by_task(
+    conn: sqlite3.Connection, *, repository: str, task_id: str,
+    remote_branch: str,
+) -> Optional[dict]:
+    """Return the most recent delivery-state row for a (repo, task, branch),
+    used to detect a changed commit on the same task/branch (conflict)."""
+    row = conn.execute(
+        "SELECT key, state, repository, task_id, commit_sha, remote_branch, "
+        "pr_url, pr_number FROM delivery_state "
+        "WHERE repository=? AND task_id=? AND remote_branch=? "
+        "ORDER BY updated_at DESC LIMIT 1",
+        (repository, task_id, remote_branch)).fetchone()
+    if not row:
+        return None
+    return {
+        "key": row["key"], "state": row["state"],
+        "repository": row["repository"], "task_id": row["task_id"],
+        "commit_sha": row["commit_sha"], "remote_branch": row["remote_branch"],
+        "pr_url": row["pr_url"], "pr_number": row["pr_number"],
+    }

@@ -25,3 +25,21 @@ ROUND2_LABEL = "round-2"
 
 # Maximum rework rounds before the loop stops and escalates to the user.
 MAX_ROUNDS = 2
+# Host Codex Worker lifecycle. These states retain an active lease until a
+# terminal state is written through ``ControlPlane.finish_state``.
+HOST_WORKER_ACTIVE_STATES = (
+    "running",
+    "REPOSITORY_PREPARING",
+    "CODEX_RUNNING",
+    "TESTING",
+    "COMMITTING",
+    "PUSHING",
+)
+
+HOST_WORKER_TERMINAL_STATES = (
+    "CODEX_FAILED",
+    "CODEX_NO_CHANGES",
+    "TEST_FAILED",
+    "PR_CREATED",
+    "BLOCKED",
+)
