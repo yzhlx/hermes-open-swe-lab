@@ -65,7 +65,6 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from hermes_worker import constants
 from hermes_worker.constants import (
     ALLOWED_GITHUB_REPOS,
     ROLE_RELEASE_AGENT,
@@ -251,6 +250,7 @@ class DemoRunner:
             db_path=os.path.join(
                 tempfile.gettempdir(), f"demo-cp-{uuid.uuid4().hex}.db"),
             mode="dev",
+            human_owner_token=self.human_owner_token,
         )
 
         # Canonical delivery controller (the only writer of Draft PRs).
@@ -413,13 +413,13 @@ class DemoRunner:
             )
         self.accepted = True
         # Drive the formal production acceptance gate (PB-23). ControlPlane
-        # final_accept requires the independent HUMAN_OWNER_TOKEN (never the
-        # demo-supplied token, never a worker token), emits a single
-        # FINAL_ACCEPTED event, and is idempotent. We read the live module
-        # attribute (constants.HUMAN_OWNER_TOKEN) rather than a snapshot import
-        # so it always matches what ControlPlane compares against, regardless of
-        # test-module global mutation / collection order.
-        self.cp.final_accept(constants.HUMAN_OWNER_TOKEN, self.job_id)
+        # final_accept requires the independent Human-Owner token (never a
+        # worker token) and emits a single FINAL_ACCEPTED event. We pass this
+        # demo instance's own self.human_owner_token into ControlPlane at
+        # construction time and again into final_accept here, so the token the
+        # gate compares against is exactly the one injected — no global module
+        # constant (constants.HUMAN_OWNER_TOKEN) is used.
+        self.cp.final_accept(self.human_owner_token, self.job_id)
         return self._set_state(
             DemoState.ACCEPTED, message="Human Owner accepted FINAL_ACCEPTANCE"
         )

@@ -125,23 +125,25 @@ class ProductionModeExplicit(unittest.TestCase):
 
     def test_event_router_prod_valid_constructs(self):
         r = er_mod.EventRouter(self.db, "secret",
-                               allowed_token_hashes=self.hashes, mode="production")
+                               allowed_token_hashes=self.hashes, mode="production",
+                               human_owner_token=OWNER)
         self.assertEqual(r.mode, "production")
 
     def test_webhook_receiver_prod_valid_constructs(self):
         r = wr_mod.WebhookReceiver(self.db, "secret",
-                                   allowed_token_hashes=self.hashes, mode="production")
+                                   allowed_token_hashes=self.hashes, mode="production",
+                                   human_owner_token=OWNER)
         self.assertEqual(r.mode, "production")
 
     def test_control_plane_prod_valid_mode_and_register(self):
         cp = ControlPlane(self.db, allowed_token_hashes=self.hashes,
-                          mode="production")
+                          mode="production", human_owner_token=OWNER)
         self.assertEqual(cp.mode, "production")
         self.assertEqual(cp.register(VALID)["ok"], True)
 
     def test_unlisted_worker_rejected(self):
         cp = ControlPlane(self.db, allowed_token_hashes=self.hashes,
-                          mode="production")
+                          mode="production", human_owner_token=OWNER)
         with self.assertRaises(ControlPlaneError) as ctx:
             cp.register(UNLISTED)
         self.assertEqual(str(ctx.exception), "worker_not_allowlisted")
@@ -151,7 +153,8 @@ class ProductionModeExplicit(unittest.TestCase):
         # production entry actually builds ControlPlane(mode="production",
         # allowed_token_hashes=<valid set>) — never dev allow-all.
         r = er_mod.EventRouter(self.db, "secret",
-                               allowed_token_hashes=self.hashes, mode="production")
+                               allowed_token_hashes=self.hashes, mode="production",
+                               human_owner_token=OWNER)
         captured = {}
         real_cp = er_mod.ControlPlane
 
@@ -183,10 +186,12 @@ class ProductionModeExplicit(unittest.TestCase):
             er_mod.ControlPlane = real_cp
         self.assertEqual(captured.get("mode"), "production")
         self.assertEqual(captured.get("allowed_token_hashes"), self.hashes)
+        self.assertEqual(captured.get("human_owner_token"), OWNER)
 
     def test_webhook_receiver_handle_builds_production_controlplane(self):
         r = wr_mod.WebhookReceiver(self.db, "secret",
-                                   allowed_token_hashes=self.hashes, mode="production")
+                                   allowed_token_hashes=self.hashes, mode="production",
+                                   human_owner_token=OWNER)
         captured = {}
         real_cp = wr_mod.ControlPlane
 
@@ -222,6 +227,7 @@ class ProductionModeExplicit(unittest.TestCase):
             wr_mod.ControlPlane = real_cp
         self.assertEqual(captured.get("mode"), "production")
         self.assertEqual(captured.get("allowed_token_hashes"), self.hashes)
+        self.assertEqual(captured.get("human_owner_token"), OWNER)
 
 
 class NoTokenLeak(unittest.TestCase):
@@ -241,7 +247,7 @@ class NoTokenLeak(unittest.TestCase):
 
     def test_rejected_register_no_token_in_logs(self):
         cp = ControlPlane(self.db, allowed_token_hashes=self.hashes,
-                          mode="production")
+                          mode="production", human_owner_token=OWNER)
         try:
             cp.register(UNLISTED)
         except ControlPlaneError:
@@ -296,7 +302,8 @@ class ProductionMainsFailClosed(unittest.TestCase):
         # the token value must never be printed.
         env = {"ALLOWED_WORKER_TOKENS": SENTINEL,
                "HERMES_HUMAN_OWNER_TOKEN": SENTINEL}
-        for module in ("deploy.cloud.control_plane_app",
+        for module in ("hermes_worker.worker_api_server",
+                       "deploy.cloud.control_plane_app",
                        "hermes_worker.webhook_receiver",
                        "hermes_worker.event_router"):
             with self.subTest(module=module):
@@ -304,6 +311,46 @@ class ProductionMainsFailClosed(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2)
                 self.assertNotIn(SENTINEL, proc.stderr)
                 self.assertNotIn(SENTINEL, proc.stdout)
+
+
+class ProductionEntrypointsHumanOwnerFailClosed(unittest.TestCase):
+    """All 4 production entry points must abort (exit 2, no token leak) when
+    ``HERMES_HUMAN_OWNER_TOKEN`` is missing / empty / whitespace / placeholder,
+    even when ``ALLOWED_WORKER_TOKENS`` is valid. Startup fails BEFORE the
+    socket binds (no port listen, no allow-all fallback)."""
+
+    MODULES = ("hermes_worker.worker_api_server",
+               "hermes_worker.event_router",
+               "hermes_worker.webhook_receiver",
+               "deploy.cloud.control_plane_app")
+
+    def _run_entry(self, module, env_extra):
+        env = dict(os.environ)
+        env.pop("ALLOWED_WORKER_TOKENS", None)
+        env.pop("HERMES_HUMAN_OWNER_TOKEN", None)
+        env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, "-m", module], cwd=ROOT, env=env,
+            capture_output=True, text=True, timeout=30)
+
+    def test_valid_worker_but_missing_owner_aborts(self):
+        for module in self.MODULES:
+            with self.subTest(module=module):
+                proc = self._run_entry(module, {"ALLOWED_WORKER_TOKENS": VALID})
+                self.assertEqual(proc.returncode, 2)
+                self.assertNotIn(SENTINEL, proc.stderr)
+                self.assertNotIn(SENTINEL, proc.stdout)
+
+    def test_placeholder_owner_aborts_and_leaks_no_token(self):
+        for module in self.MODULES:
+            with self.subTest(module=module):
+                # The placeholder string itself must never reach stdout/stderr.
+                proc = self._run_entry(
+                    module, {"ALLOWED_WORKER_TOKENS": VALID,
+                             "HERMES_HUMAN_OWNER_TOKEN": "change-me-human-owner-token"})
+                self.assertEqual(proc.returncode, 2)
+                self.assertNotIn("change-me-human-owner-token", proc.stderr)
+                self.assertNotIn("change-me-human-owner-token", proc.stdout)
 
 
 if __name__ == "__main__":

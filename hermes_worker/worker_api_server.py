@@ -24,6 +24,7 @@ import hmac
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
 from urllib.parse import urlparse
 
 from .control_plane import ControlPlane, ControlPlaneError
@@ -84,12 +85,7 @@ def resolve_production_worker_token_hashes(env_value):
     tokens = resolve_production_worker_tokens(env_value)
     # Guard: the Human Owner token must remain independent from worker tokens.
     owner = os.environ.get("HERMES_HUMAN_OWNER_TOKEN", "")
-    if owner:
-        for t in tokens:
-            if hmac.compare_digest(t, owner):
-                raise WorkerTokenConfigError(
-                    "HERMES_HUMAN_OWNER_TOKEN must not be listed as an "
-                    "ALLOWED_WORKER_TOKENS value (fail-closed)")
+    _assert_owner_not_worker_token(tokens, owner)
     hashes = {hash_token(t) for t in tokens}
     if not hashes:
         raise WorkerTokenConfigError(
@@ -98,8 +94,57 @@ def resolve_production_worker_token_hashes(env_value):
     return hashes
 
 
+def resolve_production_human_owner_token(env_value):
+    """Fail-closed resolve of ``HERMES_HUMAN_OWNER_TOKEN`` for PRODUCTION.
+
+    Returns a non-empty, non-placeholder, control-character-free token string.
+    Raises ``WorkerTokenConfigError`` when the value is unset, empty,
+    whitespace-only, or still equals the removed placeholder default. The raw
+    token is NEVER returned to logs or echoed. This is the SINGLE source of
+    truth for the Human-Owner token — every production entry point MUST call
+    this rather than reading the environment directly.
+
+    The Human-Owner token is an INDEPENDENT secret from worker tokens; it must
+    never be the same value as any ``ALLOWED_WORKER_TOKENS`` entry (enforced in
+    ``ControlPlane.__init__`` via a hash comparison).
+    """
+    if env_value is None or not str(env_value).strip():
+        raise WorkerTokenConfigError(
+            "HERMES_HUMAN_OWNER_TOKEN is not set; production requires an "
+            "explicit Human-Owner token (fail-closed)")
+    token = str(env_value).strip()
+    if token == "change-me-human-owner-token":
+        raise WorkerTokenConfigError(
+            "HERMES_HUMAN_OWNER_TOKEN still uses the placeholder default; "
+            "set a real secret (fail-closed)")
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in token):
+        raise WorkerTokenConfigError(
+            "HERMES_HUMAN_OWNER_TOKEN contains invalid control characters "
+            "(fail-closed)")
+    return token
+
+
+def _assert_owner_not_worker_token(worker_tokens, owner):
+    """Fail-closed: the Human-Owner token must never equal any worker token.
+
+    Shared by both ``resolve_production_worker_token_hashes`` (used by three
+    entry points) and ``worker_api_server.main`` (which resolves raw worker
+    tokens for ``run_server``). Keeping the check in one place guarantees every
+    production entry point refuses a Human-Owner token that collides with a
+    worker token.
+    """
+    if not owner:
+        return
+    for t in worker_tokens:
+        if hmac.compare_digest(t, owner):
+            raise WorkerTokenConfigError(
+                "HERMES_HUMAN_OWNER_TOKEN must not be listed as an "
+                "ALLOWED_WORKER_TOKENS value (fail-closed)")
+
+
 def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
-                lease_seconds: int = 1200, broker=None, mode: str = "dev"):
+                lease_seconds: int = 1200, broker=None, mode: str = "dev",
+                human_owner_token: Optional[str] = None):
     parsed = [t.strip() for t in (allowed_tokens or []) if isinstance(t, str) and t.strip()]
     allowed_hashes = {hash_token(t) for t in parsed} or None
     if mode == "production" and not allowed_hashes:
@@ -113,7 +158,8 @@ def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
         def _cp(self) -> ControlPlane:
             return ControlPlane(db_path, allowed_token_hashes=allowed_hashes,
                                 replay_window=replay_window,
-                                lease_seconds=lease_seconds, mode=mode)
+                                lease_seconds=lease_seconds, mode=mode,
+                                human_owner_token=human_owner_token)
 
         def _send(self, code, obj):
             body = json.dumps(obj).encode("utf-8")
@@ -207,7 +253,8 @@ def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
 
 def run_server(host="0.0.0.0", port=8080, db_path="runtime/events.db",
                allowed_tokens=None, replay_window=300, lease_seconds=1200,
-               broker=None, mode: str = "dev"):
+               broker=None, mode: str = "dev",
+               human_owner_token: Optional[str] = None):
     """Create and return the Worker API server WITHOUT blocking.
 
     The caller is responsible for starting the serve loop (e.g. in a daemon
@@ -218,12 +265,13 @@ def run_server(host="0.0.0.0", port=8080, db_path="runtime/events.db",
     ``mode`` is ``"dev"`` by default (allow-all when no tokens are supplied, for
     offline tests). The production entry point ``main()`` always passes
     ``mode="production"``, which makes the server fail-closed when no worker
-    tokens are configured.
+    tokens are configured. ``human_owner_token`` is injected into the control
+    plane for the final-acceptance gate (fail-closed in production).
     """
     return ThreadingHTTPServer(
         (host, port),
         make_handler(db_path, allowed_tokens, replay_window, lease_seconds,
-                     broker, mode))
+                     broker, mode, human_owner_token=human_owner_token))
 
 
 def main():
@@ -244,9 +292,22 @@ def main():
     except WorkerTokenConfigError as e:
         print(f"FATAL: {e}", file=sys.stderr)
         sys.exit(2)
+    try:
+        owner = resolve_production_human_owner_token(
+            os.environ.get("HERMES_HUMAN_OWNER_TOKEN"))
+    except WorkerTokenConfigError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        sys.exit(2)
+    # Guard: the Human-Owner token must not collide with a worker token (the
+    # two trust chains stay independent). Fail-closed before the socket binds.
+    try:
+        _assert_owner_not_worker_token(allowed, owner)
+    except WorkerTokenConfigError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        sys.exit(2)
     srv = run_server(args.host, args.port, args.db,
                      allowed_tokens=allowed, replay_window=args.replay_window,
-                     mode="production")
+                     mode="production", human_owner_token=owner)
     print(f"Hermes Worker API listening on {args.host}:{args.port} (db={args.db})",
           flush=True)
     srv.serve_forever()

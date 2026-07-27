@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 from .control_plane import ControlPlane, ControlPlaneError
 from .worker_api_server import (
     resolve_production_worker_token_hashes, WorkerTokenConfigError,
+    resolve_production_human_owner_token,
 )
 
 # Only the smoke-test repo may ever create a job through the webhook.
@@ -61,7 +62,7 @@ class WebhookReceiver:
                  allowed_repos: Optional[set] = None,
                  require_tls: bool = False,
                  allowed_token_hashes=None, replay_window: int = 300,
-                 mode: str = "dev"):
+                 mode: str = "dev", human_owner_token: Optional[str] = None):
         self.db_path = db_path
         self.secret = secret
         self.allowed_repos = allowed_repos or ALLOWED_REPOS
@@ -77,6 +78,10 @@ class WebhookReceiver:
                 "production WebhookReceiver requires a non-empty "
                 "allowed_token_hashes (fail-closed)")
         self.mode = mode
+        # Threaded through to ControlPlane for the final-acceptance gate. In
+        # production the control plane construction refuses unless main()
+        # injected a validated token.
+        self.human_owner_token = human_owner_token
 
     def handle(self, *, delivery_id: str, signature: str, event: str,
                raw_body: bytes, repo: Optional[str] = None,
@@ -95,7 +100,8 @@ class WebhookReceiver:
         cp = ControlPlane(self.db_path,
                           allowed_token_hashes=self.allowed_token_hashes,
                           replay_window=self.replay_window,
-                          mode=self.mode)
+                          mode=self.mode,
+                          human_owner_token=self.human_owner_token)
         try:
             # Delivery-id dedup (GitHub guarantees uniqueness per delivery).
             try:
@@ -186,9 +192,16 @@ def main():
         print(f"FATAL: {e}", file=sys.stderr)
         sys.exit(2)
 
+    try:
+        owner = resolve_production_human_owner_token(
+            os.environ.get("HERMES_HUMAN_OWNER_TOKEN"))
+    except WorkerTokenConfigError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        sys.exit(2)
+
     secret = os.environ.get(args.secret_env, "")
     recv = WebhookReceiver(args.db, secret, allowed_token_hashes=hashes,
-                           mode="production")
+                           mode="production", human_owner_token=owner)
     srv = recv.run_server(args.host, args.port)
     print(f"Hermes Webhook Receiver on {args.host}:{args.port} "
           f"(db={args.db}, mode=production)", flush=True)

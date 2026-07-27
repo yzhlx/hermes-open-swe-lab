@@ -38,6 +38,8 @@ from hermes_worker.db import hash_token                 # noqa: E402
 VALID = "pb5-valid-worker-token-001"
 UNLISTED = "pb5-unlisted-worker-token-002"
 FAKE = "pb5-fake-dev-token-003"
+# Independent Human-Owner token for production-mode ControlPlane constructions.
+OWNER = "pb5-human-owner-token-004"
 
 
 def _clean(db):
@@ -50,13 +52,17 @@ def _clean(db):
                 pass
 
 
-def _post(base, path, token, nonce, body):
+def _post(base, path, token, nonce, body, owner=None):
     data = json.dumps(body or {}).encode()
+    headers = {"Content-Type": "application/json",
+               "X-Worker-Token": token, "X-Nonce": nonce,
+               "X-Timestamp": str(int(time.time()))}
+    # The Human-Owner acceptance gate uses a DEDICATED header (never the worker
+    # token) so a worker token can never impersonate the Human Owner.
+    if owner:
+        headers["X-Human-Owner-Token"] = owner
     req = urllib.request.Request(
-        base + path, data=data,
-        headers={"Content-Type": "application/json",
-                 "X-Worker-Token": token, "X-Nonce": nonce,
-                 "X-Timestamp": str(int(time.time()))}, method="POST")
+        base + path, data=data, headers=headers, method="POST")
     try:
         r = urllib.request.urlopen(req, timeout=10)
         return r.status, json.loads(r.read().decode())
@@ -81,12 +87,14 @@ class ProductionControlPlaneFailClosed(unittest.TestCase):
 
     def test_prod_valid_set_ok(self):
         cp = ControlPlane(self.db, mode="production",
-                          allowed_token_hashes={hash_token(VALID)})
+                          allowed_token_hashes={hash_token(VALID)},
+                          human_owner_token=OWNER)
         self.assertEqual(cp.register(VALID)["ok"], True)
 
     def test_prod_unlisted_rejected_and_no_token_leak(self):
         cp = ControlPlane(self.db, mode="production",
-                          allowed_token_hashes={hash_token(VALID)})
+                          allowed_token_hashes={hash_token(VALID)},
+                          human_owner_token=OWNER)
         with self.assertRaises(ControlPlaneError) as ctx:
             cp.register(UNLISTED)
         # Error is a generic digest; it must not contain the raw token.
@@ -128,7 +136,7 @@ class ProductionServerFailClosed(unittest.TestCase):
         db = tempfile.mktemp(suffix=".db")
         try:
             srv = run_server("127.0.0.1", 0, db, allowed_tokens=[VALID],
-                             mode="production")
+                             mode="production", human_owner_token=OWNER)
             port = srv.server_address[1]
             base = f"http://127.0.0.1:{port}"
             threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -147,23 +155,40 @@ class ProductionServerFailClosed(unittest.TestCase):
             self.assertNotIn(UNLISTED, json.dumps(body2))
             self.assertNotIn(VALID, json.dumps(body2))
 
-            # Full flow for the allowed token: heartbeat -> claim -> complete.
+            # Full flow for the allowed token: heartbeat -> claim -> final
+            # acceptance (worker opens the gate after green CI) -> Human-Owner
+            # acceptance -> complete. Production complete() is gated on
+            # FINAL_ACCEPTED (PB-23 P0), so the acceptance chain must run first.
             st3, _ = _post(base, "/worker/heartbeat", VALID, "n-h-1", {})
             self.assertEqual(st3, 200)
 
             cp = ControlPlane(db, mode="production",
-                              allowed_token_hashes={hash_token(VALID)})
+                              allowed_token_hashes={hash_token(VALID)},
+                              human_owner_token=OWNER)
             jid = cp.create_job({"command": "x"})
 
             st4, b4 = _post(base, "/worker/jobs/claim", VALID, "n-c-1", {})
             self.assertEqual(st4, 200)
             self.assertEqual(b4["job_id"], jid)
 
+            # Mark CI green, then open the final-acceptance gate (worker token).
+            cp.store_agent_result(jid, {"ci_status": "success"})
+            st_ra, _ = _post(base, f"/worker/jobs/{jid}/request-final-acceptance",
+                            VALID, "n-ra-1", {})
+            self.assertEqual(st_ra, 200)
+
+            # Human-Owner accepts via the dedicated header (independent secret).
+            st_fa, _ = _post(base, f"/worker/jobs/{jid}/final-accept", VALID,
+                            "n-fa-1", {}, owner=OWNER)
+            self.assertEqual(st_fa, 200)
+
+            # Now production completion is authorized.
             st5, _ = _post(base, f"/worker/jobs/{jid}/complete", VALID,
                           "n-co-1", {"result": {"exit_code": 0}})
             self.assertEqual(st5, 200)
 
-            # An unlisted token cannot submit results.
+            # An unlisted token cannot submit results (rejected before any
+            # completion event is written).
             st6, body6 = _post(base, f"/worker/jobs/{jid}/complete", UNLISTED,
                               "n-co-2", {"result": {}})
             self.assertEqual(st6, 400)
@@ -183,7 +208,7 @@ class NoTokenLeakInLogs(unittest.TestCase):
         root.addHandler(handler)
         try:
             srv = run_server("127.0.0.1", 0, db, allowed_tokens=[VALID],
-                             mode="production")
+                             mode="production", human_owner_token=OWNER)
             port = srv.server_address[1]
             base = f"http://127.0.0.1:{port}"
             threading.Thread(target=srv.serve_forever, daemon=True).start()

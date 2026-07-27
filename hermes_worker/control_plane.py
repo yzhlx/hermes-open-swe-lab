@@ -65,7 +65,8 @@ class ControlPlane:
                  lease_seconds: int = 1200,
                  allowed_token_hashes: Optional[set] = None,
                  replay_window: int = 300,
-                 mode: str = "dev"):
+                 mode: str = "dev",
+                 human_owner_token: Optional[str] = None):
         """Control-plane task queue / worker registry.
 
         ``mode`` selects the worker-token trust policy:
@@ -79,6 +80,15 @@ class ControlPlane:
 
         The production entry point (``worker_api_server.main``) always passes
         ``mode="production"``.
+
+        ``human_owner_token`` is the independent secret for the
+        ``final_accept`` Human-Owner gate (PB-23 P1). It MUST be injected
+        explicitly; there is no module-level placeholder default (the former
+        ``"change-me-human-owner-token"`` default was removed because it let
+        production start in an insecure state). Production construction rejects
+        a missing / empty / whitespace-only / placeholder / worker-token-equal
+        value so the Human-Owner and worker trust chains can never be the same
+        secret.
         """
         self.db_path = db_path
         self._now = now or time.time
@@ -92,6 +102,19 @@ class ControlPlane:
             # Fail-closed: never start with an unconfigured worker allowlist.
             # The message carries no token value.
             raise ControlPlaneError("worker_tokens_not_configured_production")
+        # Human-Owner token (PB-23 P1): independent secret for final_accept.
+        # Reject weak / colliding values in production so the two trust chains
+        # stay distinct. We compare by hash against the worker allowlist so a
+        # Human-Owner token that equals any configured worker token is refused.
+        self.human_owner_token = human_owner_token
+        if mode == "production":
+            if not human_owner_token or not str(human_owner_token).strip():
+                raise ControlPlaneError("human_owner_token_not_configured")
+            if str(human_owner_token) == "change-me-human-owner-token":
+                raise ControlPlaneError("human_owner_token_is_placeholder")
+            if (self.allowed_token_hashes is not None
+                    and hash_token(human_owner_token) in self.allowed_token_hashes):
+                raise ControlPlaneError("human_owner_token_equals_worker_token")
         # Replay-protection window in seconds (D3 hardening, item 3).
         self.replay_window = replay_window
         self.conn = init_db(db_path)
@@ -324,7 +347,7 @@ class ControlPlane:
         if self._has_event(job_id, constants.FINAL_ACCEPTED):
             return {"ok": True, "already_accepted": True,
                     "state": constants.FINAL_ACCEPTED}
-        if not hmac.compare_digest(str(token), str(constants.HUMAN_OWNER_TOKEN)):
+        if not hmac.compare_digest(str(token), str(self.human_owner_token)):
             raise ControlPlaneError("acceptance_token_mismatch")
         self._emit_once(job_id, constants.FINAL_ACCEPTED,
                         f"final-accepted:{job_id}",
@@ -443,6 +466,20 @@ class ControlPlane:
         job = self._get_job(job_id)
         if job["worker_token_hash"] != h:
             raise ControlPlaneError("job_not_owned_by_worker")
+        # Deny-by-default: validate the ENTIRE batch first and reject it
+        # atomically (no partial insert) if ANY event type is not in the
+        # worker-writable allowlist. This runs BEFORE any INSERT so a
+        # job-owning worker can never forge a control-plane reserved event
+        # (FINAL_ACCEPTANCE / FINAL_ACCEPTED / TASK_COMPLETED /
+        # USER_ACTION_REQUIRED) or any other acceptance / completion /
+        # authorization state change. Reserved events are produced ONLY by the
+        # trusted internal methods (request_final_acceptance / final_accept /
+        # complete) and the internal append_event path — never by post_events.
+        # Applies identically in "dev" and "production" mode.
+        for ev in events:
+            etype = ev.get("type") if isinstance(ev, dict) else None
+            if etype not in constants.WORKER_WRITABLE_EVENTS:
+                raise ControlPlaneError("worker_event_type_not_allowed")
         seq = 0
         accepted = 0
         for ev in events:
@@ -501,6 +538,21 @@ class ControlPlane:
         self.conn.commit()
         return {"ok": True, "state": final_state}
 
+    def _assert_job_owned_by_worker(self, token: str, job_id: int) -> dict:
+        """Authorize ``token`` to mutate ``job_id`` (PB-23 P0 auth-before-write).
+
+        Centralized worker authorization used by ``complete``: the token must
+        be a known worker (``unknown_worker_token``) and must own the job lease
+        (``job_not_owned_by_worker``). This runs BEFORE any acceptance /
+        completion event is written, so a wrong or foreign token can never
+        produce a ``TASK_COMPLETED`` event or change job state.
+        """
+        h = self._check_token(token)            # unknown_worker_token
+        job = self._get_job(job_id)
+        if job["worker_token_hash"] != h:
+            raise ControlPlaneError("job_not_owned_by_worker")
+        return job
+
     def complete(self, token, job_id, result: dict = None) -> dict:
         upd = {}
         if result:
@@ -512,19 +564,30 @@ class ControlPlane:
                       "exit_code", "commit_sha", "ci_status", "model", "role"):
                 if k in result and result[k] is not None:
                     upd[k] = result[k]
-        # PB-23 gate: once a job has entered the final-acceptance pipeline (a
-        # FINAL_ACCEPTANCE event exists), TASK_COMPLETED may ONLY follow a
-        # FINAL_ACCEPTED event. This makes complete() reject when CI is not
-        # green (req 2) and require Human-Owner acceptance (req 5). Jobs that
-        # never enter the pipeline complete via the legacy path, preserving
-        # existing non-gated flows.
+        # 1) Authorize the worker BEFORE any event write or state change.
+        job = self._assert_job_owned_by_worker(token, job_id)
+        # 2) Already-finished jobs are an idempotent no-op: no TASK_COMPLETED
+        #    event, no state change. This must precede the acceptance gate so a
+        #    repeat complete() stays silent (PB-23 req 3 / 5 idempotency).
+        if job["state"] in ("completed", "failed"):
+            return {"ok": True, "already_finished": True, "state": job["state"]}
+        # 3) Acceptance-chain gate.
+        #    (a) If the job entered the final-acceptance pipeline (a
+        #        FINAL_ACCEPTANCE event exists) but was never accepted, reject
+        #        unconditionally (dev AND production).
+        #    (b) In PRODUCTION, completion is forbidden unless a FINAL_ACCEPTED
+        #        event exists — independent of whether FINAL_ACCEPTANCE exists.
+        #        This removes the legacy completion bypass that previously let a
+        #        job skip human acceptance entirely (PB-23 P0).
+        #    (c) In DEV/test, a job that never entered the pipeline may still
+        #        complete via the legacy path (preserves non-gated flows).
         if self._has_event(job_id, constants.FINAL_ACCEPTANCE) and \
                 not self._has_event(job_id, constants.FINAL_ACCEPTED):
             raise ControlPlaneError("completion_before_acceptance")
-        # TASK_COMPLETED is emitted exactly once (idempotent event_id). On a
-        # repeat complete() the insert is a no-op and _finish() returns the
-        # original already_finished result, preserving legacy idempotency
-        # semantics (e.g. test_d1_offline.test_04).
+        if self.mode == "production" and \
+                not self._has_event(job_id, constants.FINAL_ACCEPTED):
+            raise ControlPlaneError("completion_before_acceptance")
+        # 4) Only now emit TASK_COMPLETED exactly once and finalize.
         self._emit_once(job_id, constants.TASK_COMPLETED,
                         f"task-completed:{job_id}", {})
         return self._finish(token, job_id, "completed", upd)

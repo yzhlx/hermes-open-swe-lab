@@ -76,8 +76,43 @@ ROLE_HUMAN_OWNER = "human_owner"
 # The Human Owner acceptance token. It is a SECRET INDEPENDENT from worker
 # tokens: it must be supplied via a dedicated channel (never X-Worker-Token),
 # is compared only via ``hmac.compare_digest``, and is NEVER stored, logged, or
-# embedded in any event payload or error text. Production MUST set
-# HERMES_HUMAN_OWNER_TOKEN; the placeholder below exists only for offline tests.
-import os as _os
-HUMAN_OWNER_TOKEN = _os.environ.get("HERMES_HUMAN_OWNER_TOKEN",
-                                    "change-me-human-owner-token")
+# embedded in any event payload or error text.
+#
+# There is intentionally NO module-level default constant here. The former
+# ``"change-me-human-owner-token"`` placeholder let production start in an
+# insecure state (workers could pass the placeholder through ``final_accept``
+# when HERMES_HUMAN_OWNER_TOKEN was unset), so it has been removed. Production
+# MUST inject the token explicitly through
+# ``ControlPlane(human_owner_token=...)`` — resolved by the production entry
+# points from ``HERMES_HUMAN_OWNER_TOKEN``. ``ControlPlane.__init__`` and the
+# shared resolver reject the placeholder and any missing/empty/colliding value.
+
+# ---------------------------------------------------------------------------
+# PB-23 / D3: Worker-writable event types for the event store (deny-by-default)
+# ---------------------------------------------------------------------------
+# ``ControlPlane.post_events`` is the ONLY worker/client-facing path that
+# accepts caller-supplied event types. It is deny-by-default: ONLY the types
+# below — ordinary execution / telemetry events the worker itself generates —
+# are accepted. EVERYTHING else is rejected before any row is written, so a
+# job-owning worker can never forge an acceptance / completion / authorization
+# event. This closes the post_events event-forgery bypass (CVE-class): a worker
+# could previously POST a forged ``FINAL_ACCEPTED`` and then call ``complete``
+# without any Human-Owner token, defeating P0 (completion-before-acceptance)
+# and P1 (independent owner secret).
+#
+# The allowlist is the EXACT set of event types the production worker
+# (``hermes_worker.worker.HermesWorker._run_job``) submits via the
+# ``/worker/jobs/{id}/events`` endpoint: ``sandbox_create``, ``execute``,
+# ``write_file``. No other event type reaches ``post_events`` — the
+# control-plane RESERVED events (FINAL_ACCEPTANCE, FINAL_ACCEPTED,
+# TASK_COMPLETED, USER_ACTION_REQUIRED) and all scheduler / release-agent /
+# event-router events (commit_created, release_handoff_requested, follow_up,
+# round2_label, ci_fail, review, await_user, escalated, push_completed,
+# draft_pr_created, ci_pending, delivery_idempotent_reuse, delivery_blocked)
+# are written exclusively through the trusted internal ``append_event`` method,
+# never through ``post_events``.
+WORKER_WRITABLE_EVENTS = frozenset({
+    "sandbox_create",
+    "execute",
+    "write_file",
+})
