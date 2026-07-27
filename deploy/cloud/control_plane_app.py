@@ -29,6 +29,9 @@ from urllib.parse import urlparse
 
 from hermes_worker.control_plane import ControlPlane, ControlPlaneError
 from hermes_worker.db import init_db
+from hermes_worker.worker_api_server import (
+    resolve_production_worker_token_hashes, WorkerTokenConfigError,
+)
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
@@ -72,13 +75,16 @@ def guard_startup(cfg: dict) -> None:
         sys.exit(3)
 
 
-def make_handler(db_path: str):
+def make_handler(db_path: str, allowed_token_hashes=None, mode: str = "dev"):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def _cp(self) -> ControlPlane:
             # Fresh per-request connection: sqlite connections are thread-bound.
-            return ControlPlane(db_path)
+            # Production mode is fail-closed: an empty/None allowlist raises at
+            # construction, so the server never admits any worker by default.
+            return ControlPlane(db_path, allowed_token_hashes=allowed_token_hashes,
+                                mode=mode)
 
         def _send(self, code, obj):
             body = json.dumps(obj).encode("utf-8")
@@ -157,14 +163,30 @@ def make_handler(db_path: str):
     return Handler
 
 
-def run_server(cfg: dict) -> ThreadingHTTPServer:
+def run_server(cfg: dict, allowed_token_hashes=None, mode: str = "dev") -> ThreadingHTTPServer:
     """Build the server WITHOUT blocking (library-friendly)."""
     return ThreadingHTTPServer((cfg["host"], cfg["port"]),
-                               make_handler(cfg["db_path"]))
+                               make_handler(cfg["db_path"], allowed_token_hashes, mode))
 
 
 def main():
     cfg = load_config()
+
+    # Fail-closed startup: production requires an explicit, non-empty worker
+    # allowlist from ALLOWED_WORKER_TOKENS. Missing / empty / malformed /
+    # owner-token-collision -> the process refuses to start with a SECURITY
+    # summary on stderr (no token is ever printed) and never falls back to dev
+    # allow-all. Resolution happens BEFORE the socket binds.
+    try:
+        allowed_hashes = resolve_production_worker_token_hashes(
+            os.environ.get("ALLOWED_WORKER_TOKENS"))
+    except WorkerTokenConfigError as e:
+        print(f"SECURITY: Control Plane startup aborted — {e}. "
+              f"Set a non-empty ALLOWED_WORKER_TOKENS (comma-separated) and "
+              f"restart. The service will NOT fall back to dev allow-all.",
+              file=sys.stderr)
+        sys.exit(2)
+
     guard_startup(cfg)
 
     # Ensure runtime dir exists with safe perms before opening the DB.
@@ -175,7 +197,7 @@ def main():
     except OSError:
         pass
 
-    srv = run_server(cfg)
+    srv = run_server(cfg, allowed_token_hashes=allowed_hashes, mode="production")
     stop = threading.Event()
 
     def _handle(signum, frame):  # noqa: ANN001
@@ -190,7 +212,7 @@ def main():
 
     scheme = "http" if cfg["localhost_test"] else "http(loopback,fronted-by-TLS)"
     print(f"Hermes Control Plane on {cfg['host']}:{cfg['port']} "
-          f"(db={cfg['db_path']}, mode={scheme})", flush=True)
+          f"(db={cfg['db_path']}, mode=production, {scheme})", flush=True)
     srv.serve_forever()
     print("Hermes Control Plane stopped.", flush=True)
 
