@@ -6,7 +6,7 @@ on:
       - demo/one-day-integrated-vertical-slice-20260727
   pull_request:
     branches:
-      - canonical/phase-b-baseline-20260726
+      - phase-1-smoke
 
 permissions:
   contents: read
