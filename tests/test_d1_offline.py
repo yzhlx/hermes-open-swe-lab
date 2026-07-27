@@ -72,7 +72,7 @@ class D1OfflineTest(unittest.TestCase):
                     time.sleep(0.1)
 
     def test_01_register_idempotent(self):
-        w = HermesWorker(self.base, self.token)
+        w = HermesWorker(self.base, self.token, insecure_local_ok=True)
         w.register()
         w.register()  # second call must not error / duplicate
         rows = self.cp.conn.execute("SELECT * FROM workers").fetchall()
@@ -82,7 +82,7 @@ class D1OfflineTest(unittest.TestCase):
         jid = self.cp.create_job(
             {"command": "echo hi", "model": "m", "role": "coding_agent"},
             task_id="T1", issue_number=1, pr_number=2)
-        w = HermesWorker(self.base, self.token)
+        w = HermesWorker(self.base, self.token, insecure_local_ok=True)
         self.assertTrue(w.run_once())
         job = self.cp.get_job(jid)
         self.assertEqual(job["state"], "completed")
@@ -96,7 +96,7 @@ class D1OfflineTest(unittest.TestCase):
         self.assertIn("write_file", types)
 
     def test_03_empty_claim(self):
-        w = HermesWorker(self.base, self.token)
+        w = HermesWorker(self.base, self.token, insecure_local_ok=True)
         self.assertFalse(w.run_once())  # no jobs left
 
     def test_04_idempotent_complete(self):

@@ -1,0 +1,403 @@
+"""Offline / safe-environment tests for the cloud Control Plane deployment.
+
+These run locally (Git Bash + managed Python) without touching the cloud host,
+real GitHub, or any secret. They validate the deployment *assets*: config check,
+systemd unit structure, app security gates, health endpoints, restart, SQLite
+backup/restore, log rotation, deploy idempotency, and rollback.
+"""
+from __future__ import annotations
+
+import getpass
+import os
+import pytest
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+
+from conftest import WORKTREE, run_bash, start_control_plane, wait_for_health, \
+    build_git_repo, commit, free_port
+
+import deploy.cloud.control_plane_app as cpa
+from hermes_worker import db as hermes_db
+
+
+def _current_user():
+    import subprocess as _sp
+    r = _sp.run(["id", "-un"], capture_output=True, text=True)
+    return r.stdout.strip() or getpass.getuser()
+
+
+def _deploy_service_user():
+    """Resolve the non-root service user for the root-required deploy tests.
+
+    Security contract (fail-closed, never skip):
+    - euid != 0: use the effective user (`id -un`); it must not be root.
+    - euid == 0 (running under `sudo -E`): the harness is root, so the current
+      process user is root and must NOT become HERMES_SERVICE_USER. Read the
+      original non-root runner user from SUDO_USER; it must exist and must not be
+      root. If it is missing/invalid, fail loudly (no skip, no root fallback).
+    check_config.sh refuses both a root process and a HERMES_SERVICE_USER mismatch,
+    so the deploy always runs check_config as this non-root user via `runuser`.
+
+    `os.geteuid` is POSIX-only; on non-POSIX hosts there is no root concept, so we
+    fall through to the non-root branch (behavior-preserving on Linux).
+    """
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() == 0:
+        user = os.environ.get("SUDO_USER", "").strip()
+        if not user or user == "root":
+            raise AssertionError(
+                "root test harness requires a non-root SUDO_USER"
+            )
+        return user
+    user = subprocess.check_output(
+        ["id", "-un"], text=True, encoding="utf-8"
+    ).strip()
+    if user == "root":
+        raise AssertionError("service user must not be root")
+    return user
+
+
+def _grant_traversal(path):
+    """Relax o+x on the pytest temp chain so a dropped service user can traverse.
+
+    The root-required deploy tests run under `sudo -E`, so pytest's temp root
+    (/tmp/pytest-of-root) is created 0700 root-owned. deploy_control_plane.sh
+    chowns APP_HOME to the service user, but the ancestor dirs above APP_HOME stay
+    root-only, so `runuser -u <service_user>` cannot exec the installed
+    check_config.sh (EACCES: Permission denied). Relax o+x on the chain up to
+    /tmp so the non-root service user can traverse into the installed scripts.
+    No production file is modified and no security gate is weakened. On non-Linux
+    or non-/tmp layouts this is a safe no-op.
+    """
+    d = os.path.abspath(path)
+    while True:
+        if d == "/tmp" or d.startswith("/tmp/"):
+            try:
+                os.chmod(d, 0o755)
+            except OSError:
+                pass
+        if d in ("/tmp", "/"):
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+
+
+def _make_source_executable(repo):
+    """Make the source tree's shell scripts executable inside the test repo.
+
+    rollback_control_plane.sh exec's `$SRC/scripts/deploy_control_plane.sh`
+    directly (not via `bash`), so the source script must carry an execute bit.
+    In the git checkout the script is 0644, and under the root-run privileged
+    suite the temp repo is root-owned, so even root cannot exec a file without
+    an execute bit. Chmod the source scripts to 0755 in the test's temp repo
+    only — this does NOT modify the production repository.
+    """
+    for name in ("deploy_control_plane.sh", "check_config.sh",
+                 "rollback_control_plane.sh"):
+        p = os.path.join(str(repo), "scripts", name)
+        if os.path.exists(p):
+            try:
+                os.chmod(p, 0o755)
+            except OSError:
+                pass
+
+
+def _posix(p):
+    return str(p).replace("\\", "/")
+
+
+# --------------------------------------------------------------------------
+# check_config.sh (fail-closed)
+# --------------------------------------------------------------------------
+def _required_env(extra=None):
+    e = {
+        "HERMES_DB_PATH": "runtime/events.db",
+        "HERMES_RUNTIME_DIR": "runtime",
+        "HERMES_LOG_DIR": "logs",
+        "HERMES_LISTEN_HOST": "127.0.0.1",
+        "HERMES_LISTEN_PORT": "8080",
+    }
+    if extra:
+        e.update(extra)
+    return e
+
+
+def test_check_config_missing_vars():
+    rc, _ = run_bash("scripts/check_config.sh", {"HERMES_LISTEN_HOST": "127.0.0.1"})
+    assert rc != 0, "missing required vars must fail closed"
+
+
+def test_check_config_secret_in_env():
+    rc, _ = run_bash("scripts/check_config.sh",
+                     _required_env({"HERMES_API_KEY": "sk-xxxx"}))
+    assert rc != 0, "secret in env file must be rejected"
+
+
+def test_check_config_non_loopback():
+    rc, _ = run_bash("scripts/check_config.sh",
+                     _required_env({"HERMES_LISTEN_HOST": "0.0.0.0"}))
+    assert rc != 0, "non-loopback bind must be rejected"
+
+
+def test_check_config_wrong_user():
+    rc, _ = run_bash("scripts/check_config.sh",
+                     _required_env({"HERMES_SERVICE_USER": "hermes-swe"}))
+    assert rc != 0, "non-hermes-swe identity must be rejected"
+
+
+def test_check_config_ok():
+    rc, _ = run_bash("scripts/check_config.sh",
+                     _required_env({"HERMES_SERVICE_USER": _current_user()}))
+    assert rc == 0, "valid config must pass"
+
+
+# --------------------------------------------------------------------------
+# systemd unit structure (offline stand-in for `systemd-analyze verify`)
+# --------------------------------------------------------------------------
+def test_systemd_unit_structure():
+    text = (WORKTREE / "systemd" / "hermes-swe-control-plane.service").read_text()
+    assert "[Unit]" in text and "[Service]" in text and "[Install]" in text
+    assert "User=hermes-swe" in text
+    assert "Restart=on-failure" in text
+    assert "ExecStartPre=" in text and "check_config.sh" in text
+    assert "EnvironmentFile=" in text
+    # Belt-and-suspenders: no public bind literal anywhere in the unit.
+    assert "0.0.0.0" not in text
+    # Hardening present.
+    assert "NoNewPrivileges=true" in text
+
+
+# --------------------------------------------------------------------------
+# App security gates (deterministic via monkeypatch)
+# --------------------------------------------------------------------------
+def test_app_refuses_root(monkeypatch):
+    monkeypatch.setattr(cpa.os, "geteuid", lambda: 0, raising=False)
+    with __import__("pytest").raises(SystemExit) as e:
+        cpa.guard_startup({"host": "127.0.0.1", "port": 8080,
+                            "localhost_test": True, "log_dir": "logs",
+                            "db_path": "runtime/events.db"})
+    assert e.value.code == 2
+
+
+def test_app_refuses_non_loopback(monkeypatch):
+    monkeypatch.setattr(cpa.os, "geteuid", lambda: 1, raising=False)
+    with __import__("pytest").raises(SystemExit) as e:
+        cpa.guard_startup({"host": "0.0.0.0", "port": 8080,
+                            "localhost_test": True, "log_dir": "logs",
+                            "db_path": "runtime/events.db"})
+    assert e.value.code == 3
+
+
+def test_check_config_refuses_root():
+    """check_config.sh must fail-closed when HERMES_SERVICE_USER does not match.
+
+    Guards the security gate that the Control Plane never runs as root: on a
+    non-root runner this exercises the user-mismatch gate (HERMES_SERVICE_USER is
+    set to "root" while the invoking user is not root); under `sudo -E` it would
+    additionally hit the root-process gate. No skip — always executed.
+    """
+    rc, _ = run_bash("scripts/check_config.sh",
+                     _required_env({"HERMES_SERVICE_USER": "root"}))
+    assert rc != 0, "check_config.sh must refuse a non-matching service user (security gate)"
+
+
+def test_service_user_non_root_returns_current(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    user = _deploy_service_user()
+    assert user and user != "root"
+
+
+def test_service_user_root_with_valid_sudo_user(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setenv("SUDO_USER", "runner")
+    assert _deploy_service_user() == "runner"
+
+
+def test_service_user_root_missing_sudo_user_fails(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    with pytest.raises(AssertionError):
+        _deploy_service_user()
+
+
+def test_service_user_root_sudo_user_is_root_fails(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setenv("SUDO_USER", "root")
+    with pytest.raises(AssertionError):
+        _deploy_service_user()
+
+
+# --------------------------------------------------------------------------
+# Health + restart (real subprocess)
+# --------------------------------------------------------------------------
+def test_healthz_readyz():
+    port = free_port()
+    db = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"hermes-hc-{port}.db")
+    if os.path.exists(db):
+        os.remove(db)
+    p = start_control_plane(port, db)
+    try:
+        assert wait_for_health(port, 15)
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/readyz",
+                                    timeout=2) as r:
+            assert r.status == 200
+    finally:
+        p.terminate()
+        p.wait(timeout=10)
+
+
+def test_service_restart():
+    port = free_port()
+    db = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"hermes-rs-{port}.db")
+    if os.path.exists(db):
+        os.remove(db)
+    p1 = start_control_plane(port, db)
+    try:
+        assert wait_for_health(port, 15)
+    finally:
+        p1.terminate(); p1.wait(timeout=10)
+    # Restart on the same port (proves clean shutdown + rebind).
+    p2 = start_control_plane(port, db)
+    try:
+        assert wait_for_health(port, 15)
+    finally:
+        p2.terminate(); p2.wait(timeout=10)
+
+
+# --------------------------------------------------------------------------
+# SQLite backup / restore
+# --------------------------------------------------------------------------
+def test_sqlite_backup_restore(tmp_path):
+    src = str(tmp_path / "events.db")
+    conn = hermes_db.init_db(src)
+    conn.execute("INSERT INTO jobs(task_id, state) VALUES (?,?)", ("t1", "pending"))
+    conn.commit(); conn.close()
+
+    bk_dir = tmp_path / "backups"
+    r = subprocess.run([sys.executable, "scripts/backup_sqlite.py",
+                        "--src", src, "--dst-dir", str(bk_dir)],
+                       cwd=str(WORKTREE), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    backups = list(bk_dir.glob("events-*.db"))
+    assert backups, "backup file expected"
+
+    restore_target = str(tmp_path / "restored.db")
+    # Without --force on an existing target -> refused (fail-closed).
+    open(restore_target, "w").close()
+    r2 = subprocess.run([sys.executable, "scripts/restore_sqlite.py",
+                         "--backup", str(backups[0]), "--target", restore_target],
+                        cwd=str(WORKTREE), capture_output=True, text=True)
+    assert r2.returncode == 2, "restore must require --force over existing target"
+
+    r3 = subprocess.run([sys.executable, "scripts/restore_sqlite.py",
+                         "--backup", str(backups[0]), "--target", restore_target,
+                         "--force"],
+                        cwd=str(WORKTREE), capture_output=True, text=True)
+    assert r3.returncode == 0, r3.stderr
+    rc = sqlite3.connect(restore_target)
+    n = rc.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    rc.close()
+    assert n == 1
+
+
+# --------------------------------------------------------------------------
+# Log rotation
+# --------------------------------------------------------------------------
+def test_log_rotation(tmp_path):
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+    big = logdir / "run.jsonl"
+    big.write_text("x" * 100)  # exceeds tiny threshold
+    r = subprocess.run([sys.executable, "scripts/rotate_logs.py", str(logdir),
+                        "--keep", "2", "--max-bytes", "10"],
+                       cwd=str(WORKTREE), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    gz = list(logdir.glob("run.jsonl.*.gz"))
+    assert gz, "expected a rotated .gz"
+    assert not big.exists(), "original should be rotated away"
+
+    # Pruning: drop the existing .gz, then create several *.jsonl files that
+    # exceed the threshold; rotation should keep only `keep` (2) gz files.
+    for g in logdir.glob("*.gz"):
+        g.unlink()
+    for i in range(5):
+        (logdir / f"r{i}.jsonl").write_text("y" * 100)
+    subprocess.run([sys.executable, "scripts/rotate_logs.py", str(logdir),
+                    "--keep", "2", "--max-bytes", "10"],
+                   cwd=str(WORKTREE), capture_output=True)
+    assert len(list(logdir.glob("*.jsonl.*.gz"))) == 2
+
+
+# --------------------------------------------------------------------------
+# Deploy idempotency + rollback
+# --------------------------------------------------------------------------
+def test_deploy_idempotency(tmp_path):
+    repo = build_git_repo(tmp_path)
+    _grant_traversal(tmp_path)
+    _make_source_executable(repo)
+    sha_a = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo),
+                           capture_output=True, text=True).stdout.strip()
+    app_home = tmp_path / "install"
+    env = dict(os.environ)
+    env.update({
+        "HERMES_APP_HOME": _posix(app_home),
+        "HERMES_DEPLOY_SRC": _posix(repo),
+        "HERMES_SERVICE_USER": _deploy_service_user(),
+        "HERMES_AUTOSTART": "0",
+        "HERMES_DB_PATH": _posix(app_home / "runtime" / "events.db"),
+        "HERMES_RUNTIME_DIR": _posix(app_home / "runtime"),
+        "HERMES_LOG_DIR": _posix(app_home / "logs"),
+        "HERMES_LISTEN_HOST": "127.0.0.1",
+        "HERMES_LISTEN_PORT": "8080",
+        "PYTHONPATH": _posix(WORKTREE),
+    })
+    rc1, out1 = run_bash("scripts/deploy_control_plane.sh", env)
+    assert rc1 == 0, out1
+    rc2, out2 = run_bash("scripts/deploy_control_plane.sh", env)
+    assert rc2 == 0, out2
+    assert (app_home / "deploy" / "cloud" / "control_plane_app.py").exists()
+    assert (app_home / "DEPLOYED_SHA").read_text().strip() == sha_a
+
+
+def test_rollback(tmp_path):
+    repo = build_git_repo(tmp_path)
+    _grant_traversal(tmp_path)
+    _make_source_executable(repo)
+    (repo / "deploy" / "DEPLOY_MARKER").write_text("A")
+    sha_a = commit(repo, "marker A")
+    (repo / "deploy" / "DEPLOY_MARKER").write_text("B")
+    sha_b = commit(repo, "marker B")
+
+    subprocess.run(["git", "checkout", "-q", sha_a], cwd=str(repo), check=True)
+    app_home = tmp_path / "installB"
+    env = dict(os.environ)
+    env.update({
+        "HERMES_APP_HOME": _posix(app_home),
+        "HERMES_DEPLOY_SRC": _posix(repo),
+        "HERMES_SERVICE_USER": _deploy_service_user(),
+        "HERMES_AUTOSTART": "0",
+        "HERMES_DB_PATH": _posix(app_home / "runtime" / "events.db"),
+        "HERMES_RUNTIME_DIR": _posix(app_home / "runtime"),
+        "HERMES_LOG_DIR": _posix(app_home / "logs"),
+        "HERMES_LISTEN_HOST": "127.0.0.1",
+        "HERMES_LISTEN_PORT": "8080",
+        "PYTHONPATH": _posix(WORKTREE),
+    })
+    rc, _ = run_bash("scripts/deploy_control_plane.sh", env)
+    assert rc == 0
+    assert (app_home / "deploy" / "DEPLOY_MARKER").read_text() == "A"
+
+    subprocess.run(["git", "checkout", "-q", sha_b], cwd=str(repo), check=True)
+    rc, _ = run_bash("scripts/deploy_control_plane.sh", env)
+    assert rc == 0
+    assert (app_home / "deploy" / "DEPLOY_MARKER").read_text() == "B"
+
+    rc, out = run_bash("scripts/rollback_control_plane.sh", env)
+    assert rc == 0, out
+    assert (app_home / "deploy" / "DEPLOY_MARKER").read_text() == "A"
