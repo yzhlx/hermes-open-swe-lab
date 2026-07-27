@@ -28,13 +28,22 @@ jobs:
           python -m pip install --disable-pip-version-check pytest==9.1.1
 
       # --- Collect the full, real test set on the remote. T is the unique total
-      #     test count and is NOT hardcoded; it comes from the live collection. ---
+      #     test count and is NOT hardcoded; it comes from the live collection.
+      #     NOTE: pytest wraps summary lines in '====' delimiters, so we never
+      #     anchor on '^[0-9]+' — we match the count substring instead. ---
       - name: Collect tests (total T)
         id: collect
         run: |
-          T=$(python -m pytest --collect-only -q -p no:cacheprovider | grep -E '^[0-9]+ tests collected' | grep -oE '^[0-9]+' | head -1)
-          echo "T=$T"
+          set +e -uo pipefail
+          RAW=$(python -m pytest --collect-only -q -p no:cacheprovider 2>&1) || true
+          echo "$RAW"
+          T=$(echo "$RAW" | grep -oE '[0-9]+ (tests collected|items)' | grep -oE '[0-9]+' | head -1)
+          if [ -z "$T" ]; then
+            echo "COLLECT_FAILED: could not determine T from collect-only output"
+            exit 1
+          fi
           echo "total=$T" >> "$GITHUB_OUTPUT"
+          echo "T=$T"
 
       # --- Non-root suite: every baseline test EXCEPT the two deployment tests
       #     that legitimately require root (run separately with sudo -E below).
@@ -44,16 +53,20 @@ jobs:
       - name: Run non-root baseline test suite
         id: ordinary
         run: |
-          set -euo pipefail
+          set +e -uo pipefail
           OUT=$(python -m pytest tests/ -v -p no:cacheprovider -rA \
             --deselect tests/deployment/test_cloud.py::test_deploy_idempotency \
             --deselect tests/deployment/test_cloud.py::test_rollback 2>&1) || true
           echo "$OUT"
-          SUMMARY=$(echo "$OUT" | grep -E '^[0-9]+ (passed|failed|error|skipped|xfailed|xpassed)' | tail -1)
-          PASSED=$(echo "$SUMMARY" | grep -oE '^[0-9]+' | head -1)
-          DESEL=$(echo "$SUMMARY" | grep -oE '[0-9]+ deselected' | grep -oE '^[0-9]+' | head -1)
-          echo "ordinary_passed=$PASSED" >> "$GITHUB_OUTPUT"
-          echo "ordinary_deselected=$DESEL" >> "$GITHUB_OUTPUT"
+          SUMMARY=$(echo "$OUT" | grep -E '[0-9]+ (passed|failed|error|skipped|xfailed|xpassed)' | tail -1)
+          PASSED=$(echo "$SUMMARY" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+          DESEL=$(echo "$SUMMARY" | grep -oE '[0-9]+ deselected' | grep -oE '[0-9]+' | head -1)
+          echo "ordinary_passed=${PASSED:-0}" >> "$GITHUB_OUTPUT"
+          echo "ordinary_deselected=${DESEL:-0}" >> "$GITHUB_OUTPUT"
+          if [ -z "$SUMMARY" ]; then
+            echo "ORDINARY_PARSE_FAIL: no summary line found in pytest output"
+            exit 1
+          fi
           if echo "$SUMMARY" | grep -qE '(failed|error|skipped|xfailed|xpassed)'; then
             echo "INTEGRITY_VIOLATION: non-root suite contains failed/error/skipped/xfailed/xpassed"
             exit 1
@@ -66,18 +79,22 @@ jobs:
       - name: Run root-required deployment tests (sudo)
         id: privileged
         run: |
-          set -euo pipefail
+          set +e -uo pipefail
           PYBIN="$(which python)"
           OUT=$(sudo -E "$PYBIN" -m pytest \
             tests/deployment/test_cloud.py::test_deploy_idempotency \
             tests/deployment/test_cloud.py::test_rollback \
             -v -p no:cacheprovider -rA 2>&1) || true
           echo "$OUT"
-          SUMMARY=$(echo "$OUT" | grep -E '^[0-9]+ (passed|failed|error|skipped|xfailed|xpassed)' | tail -1)
-          PASSED=$(echo "$SUMMARY" | grep -oE '^[0-9]+' | head -1)
-          echo "privileged_passed=$PASSED" >> "$GITHUB_OUTPUT"
+          SUMMARY=$(echo "$OUT" | grep -E '[0-9]+ (passed|failed|error|skipped|xfailed|xpassed)' | tail -1)
+          PASSED=$(echo "$SUMMARY" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+          echo "privileged_passed=${PASSED:-0}" >> "$GITHUB_OUTPUT"
+          if [ -z "$SUMMARY" ]; then
+            echo "PRIVILEGED_PARSE_FAIL: no summary line found in pytest output"
+            exit 1
+          fi
           if echo "$SUMMARY" | grep -qE '(failed|error|skipped|xfailed|xpassed)'; then
-            echo "INTEGRITY_VIOLATION: privileged suite contains failed/error/skipped/xfailed/xpassed"
+            echo "PRIVILEGED_VIOLATION: privileged suite contains failed/error/skipped/xfailed/xpassed"
             exit 1
           fi
 
@@ -86,7 +103,7 @@ jobs:
       #     tests passed, and every other test executed exactly once. ---
       - name: Integrity check (ordinary + privileged == T)
         run: |
-          set -euo pipefail
+          set +e -uo pipefail
           T="${{ steps.collect.outputs.total }}"
           O="${{ steps.ordinary.outputs.ordinary_passed }}"
           P="${{ steps.privileged.outputs.privileged_passed }}"
