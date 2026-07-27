@@ -49,6 +49,16 @@ def start_control_plane(port: int, db_path: str, localhost_test: bool = True,
     env["HERMES_LOCALHOST_TEST"] = "1" if localhost_test else "0"
     env["HERMES_RUNTIME_DIR"] = os.path.dirname(db_path) or "."
     env["HERMES_LOG_DIR"] = os.path.dirname(db_path) or "."
+    # The production Control Plane requires an explicit, non-empty
+    # ALLOWED_WORKER_TOKENS (fail-closed). Deployment tests boot the REAL
+    # entry point, so they must supply a valid allowlist that matches the
+    # worker token used by the test. Overridable via ``extra``.
+    env["ALLOWED_WORKER_TOKENS"] = "test-worker-token"
+    # The production Control Plane also requires an explicit, non-empty,
+    # non-placeholder Human-Owner token (fail-closed P1 remediation). It must
+    # not equal the worker token. Deployment tests boot the REAL entry point,
+    # so they must supply it or the process exits(2) before binding.
+    env["HERMES_HUMAN_OWNER_TOKEN"] = "test-human-owner-token"
     if extra:
         env.update(extra)
     p = subprocess.Popen(

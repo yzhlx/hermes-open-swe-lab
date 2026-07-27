@@ -270,6 +270,63 @@ def test_service_restart():
         p2.terminate(); p2.wait(timeout=10)
 
 
+def test_app_refuses_missing_owner_token_at_process_level(tmp_path):
+    """Fail-closed at the REAL booted-process level (mirrors the entrypoint-unit
+    check but exercises the full process via the deployment helper): an empty
+    HERMES_HUMAN_OWNER_TOKEN must make the cloud entry point exit(2) before
+    binding — it must never serve /healthz or /readyz, and never admit workers.
+    """
+    db = str(tmp_path / "events.db")
+    port = free_port()
+    p = start_control_plane(port, db, extra={"HERMES_HUMAN_OWNER_TOKEN": ""})
+    try:
+        # Process must abort fail-closed (rc==2) before it ever binds.
+        rc = None
+        for _ in range(50):  # ~5s budget
+            rc = p.poll()
+            if rc is not None:
+                break
+            time.sleep(0.1)
+        assert rc == 2, f"expected fail-closed rc==2, got {rc}"
+        # And it must never have bound: health is unreachable.
+        assert wait_for_health(port, 3) is False
+    finally:
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            pass
+        if p.poll() is None:
+            p.terminate()
+
+
+def test_app_refuses_placeholder_owner_token_at_process_level(tmp_path):
+    """Same as the missing-token case, but the token is the removed placeholder
+    default 'change-me-human-owner-token' — the resolver must also refuse it and
+    the process must exit(2) before binding.
+    """
+    db = str(tmp_path / "events.db")
+    port = free_port()
+    p = start_control_plane(
+        port, db,
+        extra={"HERMES_HUMAN_OWNER_TOKEN": "change-me-human-owner-token"})
+    try:
+        rc = None
+        for _ in range(50):  # ~5s budget
+            rc = p.poll()
+            if rc is not None:
+                break
+            time.sleep(0.1)
+        assert rc == 2, f"expected fail-closed rc==2, got {rc}"
+        assert wait_for_health(port, 3) is False
+    finally:
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            pass
+        if p.poll() is None:
+            p.terminate()
+
+
 # --------------------------------------------------------------------------
 # SQLite backup / restore
 # --------------------------------------------------------------------------

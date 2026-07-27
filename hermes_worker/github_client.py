@@ -17,11 +17,56 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
-from .constants import ALLOWED_GITHUB_REPOS
+from .constants import ALLOWED_GITHUB_REPOS, PROTECTED_REPOS
 
 
 class GitHubClientError(Exception):
     pass
+
+
+def normalize_repo(full_name: Optional[str]) -> Optional[str]:
+    """Canonical ``owner/repo`` form for EXACT-match allowlist checks.
+
+    Lower-cases, trims whitespace, and strips a trailing ``.git``. It does NOT
+    do prefix/substring matching — callers test set-membership of the returned
+    value, so ``yzhlx/hermes-open-swe-smoke-test-evil`` is never a match for
+    ``yzhlx/hermes-open-swe-smoke-test``.
+    """
+    if full_name is None:
+        return None
+    s = full_name.strip().lower()
+    if not s:
+        return None
+    if s.endswith(".git"):
+        s = s[:-4]
+    return s
+
+
+def require_allowed_repo(full_name: Optional[str],
+                         allowed=None,
+                         protected=None) -> str:
+    """Fail-closed guard for any gh/GitHub-backed read or write (PB-6).
+
+    Raises :class:`GitHubClientError` with ``repo_not_allowed`` when:
+      * the repo is not configured (``None``/empty) -> production fail-closed;
+      * the repo is in ``PROTECTED_REPOS`` -> explicit deny (defense-in-depth);
+      * the repo is not an exact, normalized member of ``allowed``.
+
+    Otherwise returns the normalized ``owner/repo`` string. The error message
+    never references a token, and no GitHub call is made before this returns.
+    """
+    if allowed is None:
+        allowed = ALLOWED_GITHUB_REPOS
+    if protected is None:
+        protected = PROTECTED_REPOS
+    norm = normalize_repo(full_name)
+    if norm is None:
+        raise GitHubClientError("repo_not_allowed")
+    if norm in {normalize_repo(p) for p in protected}:
+        raise GitHubClientError("repo_not_allowed")
+    if norm not in {normalize_repo(a) for a in allowed}:
+        raise GitHubClientError("repo_not_allowed")
+    return norm
 
 
 class GitHubClient:
@@ -38,9 +83,10 @@ class GitHubClient:
         raise NotImplementedError
     def set_ci_status(self, pr_number: int, status: str) -> None:
         raise NotImplementedError
-    def get_ci_status(self, pr_number: int) -> str:
+    def get_ci_status(self, pr_number: int, repo: Optional[str] = None) -> str:
         raise NotImplementedError
-    def add_label(self, pr_number: int, label: str) -> None:
+    def add_label(self, pr_number: int, label: str,
+                  repo: Optional[str] = None) -> None:
         raise NotImplementedError
     def merge_pr(self, pr_number: int) -> None:
         raise NotImplementedError
@@ -109,10 +155,17 @@ class FakeGitHubClient(GitHubClient):
     def set_ci_status(self, pr_number: int, status: str) -> None:
         self._ci[pr_number] = status
 
-    def get_ci_status(self, pr_number: int) -> str:
+    def get_ci_status(self, pr_number: int, repo: Optional[str] = None) -> str:
+        # PB-6: enforce allowlist when a repo is supplied. Offline callers that
+        # omit repo keep their existing behavior (trusted in-memory harness).
+        if repo is not None:
+            require_allowed_repo(repo)
         return self._ci.get(pr_number, "pending")
 
-    def add_label(self, pr_number: int, label: str) -> None:
+    def add_label(self, pr_number: int, label: str,
+                  repo: Optional[str] = None) -> None:
+        if repo is not None:
+            require_allowed_repo(repo)
         self._labels.setdefault(pr_number, set()).add(label)
 
     def has_label(self, pr_number: int, label: str) -> bool:
@@ -162,7 +215,10 @@ class RealGitHubClient(GitHubClient):
             "legacy_pr_create_disabled_use_github_rest_client"
         )
 
-    def get_ci_status(self, pr_number: int) -> str:
+    def get_ci_status(self, pr_number: int, repo: Optional[str] = None) -> str:
+        # PB-6: enforce repo allowlist BEFORE any gh call (fail-closed). An
+        # unallowed / protected / unconfigured repo raises and never reaches gh.
+        require_allowed_repo(repo)
         out = subprocess.run(
             [self.gh, "pr", "checks", str(pr_number), "--json", "state"],
             check=True, capture_output=True, text=True)
@@ -177,7 +233,10 @@ class RealGitHubClient(GitHubClient):
     def set_ci_status(self, pr_number: int, status: str) -> None:  # pragma: no cover
         raise NotImplementedError("CI status is set by GitHub Actions, not the client")
 
-    def add_label(self, pr_number: int, label: str) -> None:
+    def add_label(self, pr_number: int, label: str,
+                  repo: Optional[str] = None) -> None:
+        # PB-6: enforce repo allowlist BEFORE any gh call (fail-closed).
+        require_allowed_repo(repo)
         subprocess.run([self.gh, "pr", "edit", str(pr_number), "--add-label", label],
                        check=True, capture_output=True, text=True)
 

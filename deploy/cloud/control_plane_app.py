@@ -29,6 +29,10 @@ from urllib.parse import urlparse
 
 from hermes_worker.control_plane import ControlPlane, ControlPlaneError
 from hermes_worker.db import init_db
+from hermes_worker.worker_api_server import (
+    resolve_production_worker_token_hashes, WorkerTokenConfigError,
+    resolve_production_human_owner_token,
+)
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
@@ -72,13 +76,17 @@ def guard_startup(cfg: dict) -> None:
         sys.exit(3)
 
 
-def make_handler(db_path: str):
+def make_handler(db_path: str, allowed_token_hashes=None, mode: str = "dev",
+                 human_owner_token=None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def _cp(self) -> ControlPlane:
             # Fresh per-request connection: sqlite connections are thread-bound.
-            return ControlPlane(db_path)
+            # Production mode is fail-closed: an empty/None allowlist raises at
+            # construction, so the server never admits any worker by default.
+            return ControlPlane(db_path, allowed_token_hashes=allowed_token_hashes,
+                                mode=mode, human_owner_token=human_owner_token)
 
         def _send(self, code, obj):
             body = json.dumps(obj).encode("utf-8")
@@ -157,14 +165,46 @@ def make_handler(db_path: str):
     return Handler
 
 
-def run_server(cfg: dict) -> ThreadingHTTPServer:
+def run_server(cfg: dict, allowed_token_hashes=None, mode: str = "dev",
+               human_owner_token=None) -> ThreadingHTTPServer:
     """Build the server WITHOUT blocking (library-friendly)."""
     return ThreadingHTTPServer((cfg["host"], cfg["port"]),
-                               make_handler(cfg["db_path"]))
+                               make_handler(cfg["db_path"], allowed_token_hashes,
+                                            mode, human_owner_token=human_owner_token))
 
 
 def main():
     cfg = load_config()
+
+    # Fail-closed startup: production requires an explicit, non-empty worker
+    # allowlist from ALLOWED_WORKER_TOKENS. Missing / empty / malformed /
+    # owner-token-collision -> the process refuses to start with a SECURITY
+    # summary on stderr (no token is ever printed) and never falls back to dev
+    # allow-all. Resolution happens BEFORE the socket binds.
+    try:
+        allowed_hashes = resolve_production_worker_token_hashes(
+            os.environ.get("ALLOWED_WORKER_TOKENS"))
+    except WorkerTokenConfigError as e:
+        print(f"SECURITY: Control Plane startup aborted — {e}. "
+              f"Set a non-empty ALLOWED_WORKER_TOKENS (comma-separated) and "
+              f"restart. The service will NOT fall back to dev allow-all.",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # Fail-closed: the Human-Owner token must also be explicitly configured for
+    # production. This runs BEFORE the socket binds / guard_startup so the
+    # control plane never starts without the independent final-acceptance
+    # secret (no port listen, no allow-all fallback).
+    try:
+        owner = resolve_production_human_owner_token(
+            os.environ.get("HERMES_HUMAN_OWNER_TOKEN"))
+    except WorkerTokenConfigError as e:
+        print(f"SECURITY: Control Plane startup aborted — {e}. "
+              f"Set HERMES_HUMAN_OWNER_TOKEN to a real secret and restart. "
+              f"The service will NOT fall back to a placeholder default.",
+              file=sys.stderr)
+        sys.exit(2)
+
     guard_startup(cfg)
 
     # Ensure runtime dir exists with safe perms before opening the DB.
@@ -175,7 +215,8 @@ def main():
     except OSError:
         pass
 
-    srv = run_server(cfg)
+    srv = run_server(cfg, allowed_token_hashes=allowed_hashes, mode="production",
+                     human_owner_token=owner)
     stop = threading.Event()
 
     def _handle(signum, frame):  # noqa: ANN001
@@ -190,7 +231,7 @@ def main():
 
     scheme = "http" if cfg["localhost_test"] else "http(loopback,fronted-by-TLS)"
     print(f"Hermes Control Plane on {cfg['host']}:{cfg['port']} "
-          f"(db={cfg['db_path']}, mode={scheme})", flush=True)
+          f"(db={cfg['db_path']}, mode=production, {scheme})", flush=True)
     srv.serve_forever()
     print("Hermes Control Plane stopped.", flush=True)
 

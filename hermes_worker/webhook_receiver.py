@@ -21,11 +21,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import sqlite3
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .control_plane import ControlPlane, ControlPlaneError
+from .worker_api_server import (
+    resolve_production_worker_token_hashes, WorkerTokenConfigError,
+    resolve_production_human_owner_token,
+)
 
 # Only the smoke-test repo may ever create a job through the webhook.
 ALLOWED_REPOS = {"yzhlx/hermes-open-swe-smoke-test"}
@@ -55,13 +61,27 @@ class WebhookReceiver:
     def __init__(self, db_path: str, secret: str,
                  allowed_repos: Optional[set] = None,
                  require_tls: bool = False,
-                 allowed_token_hashes=None, replay_window: int = 300):
+                 allowed_token_hashes=None, replay_window: int = 300,
+                 mode: str = "dev", human_owner_token: Optional[str] = None):
         self.db_path = db_path
         self.secret = secret
         self.allowed_repos = allowed_repos or ALLOWED_REPOS
         self.require_tls = require_tls
         self.allowed_token_hashes = allowed_token_hashes
         self.replay_window = replay_window
+        # Fail-closed: a production WebhookReceiver MUST carry an explicit,
+        # non-empty worker allowlist. Missing/empty -> construction refuses, so
+        # no ControlPlane is ever created and no webhook is processed in an
+        # allow-all state. dev/test modes are opt-in only.
+        if mode == "production" and not allowed_token_hashes:
+            raise WorkerTokenConfigError(
+                "production WebhookReceiver requires a non-empty "
+                "allowed_token_hashes (fail-closed)")
+        self.mode = mode
+        # Threaded through to ControlPlane for the final-acceptance gate. In
+        # production the control plane construction refuses unless main()
+        # injected a validated token.
+        self.human_owner_token = human_owner_token
 
     def handle(self, *, delivery_id: str, signature: str, event: str,
                raw_body: bytes, repo: Optional[str] = None,
@@ -79,7 +99,9 @@ class WebhookReceiver:
 
         cp = ControlPlane(self.db_path,
                           allowed_token_hashes=self.allowed_token_hashes,
-                          replay_window=self.replay_window)
+                          replay_window=self.replay_window,
+                          mode=self.mode,
+                          human_owner_token=self.human_owner_token)
         try:
             # Delivery-id dedup (GitHub guarantees uniqueness per delivery).
             try:
@@ -148,3 +170,43 @@ class WebhookReceiver:
     def run_server(self, host="0.0.0.0", port=8081):
         """Return (do NOT start) the threaded webhook server."""
         return ThreadingHTTPServer((host, port), self.make_handler())
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Hermes GitHub Webhook Receiver (production)")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8081)
+    ap.add_argument("--db", default="runtime/events.db")
+    ap.add_argument("--secret-env", default="GITHUB_WEBHOOK_SECRET")
+    args = ap.parse_args()
+
+    # Fail-closed startup: production requires an explicit worker allowlist.
+    # Missing / empty / malformed / owner-token-collision -> exit before the
+    # socket binds (no ControlPlane created, no webhook processed). The error
+    # carries no token value.
+    try:
+        hashes = resolve_production_worker_token_hashes(
+            os.environ.get("ALLOWED_WORKER_TOKENS"))
+    except WorkerTokenConfigError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        owner = resolve_production_human_owner_token(
+            os.environ.get("HERMES_HUMAN_OWNER_TOKEN"))
+    except WorkerTokenConfigError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    secret = os.environ.get(args.secret_env, "")
+    recv = WebhookReceiver(args.db, secret, allowed_token_hashes=hashes,
+                           mode="production", human_owner_token=owner)
+    srv = recv.run_server(args.host, args.port)
+    print(f"Hermes Webhook Receiver on {args.host}:{args.port} "
+          f"(db={args.db}, mode=production)", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
