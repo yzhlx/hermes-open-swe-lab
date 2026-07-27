@@ -20,6 +20,7 @@ across threads.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,6 +62,40 @@ def resolve_production_worker_tokens(env_value):
                 "ALLOWED_WORKER_TOKENS contains invalid control characters "
                 "(fail-closed)")
     return tokens
+
+
+def resolve_production_worker_token_hashes(env_value):
+    """Fail-closed resolve of ``ALLOWED_WORKER_TOKENS`` into a validated,
+    non-empty ``set`` of sha256 token hashes for PRODUCTION use.
+
+    This is the SINGLE source of truth for worker-token parsing — every
+    production entry point (``worker_api_server``, ``event_router``,
+    ``webhook_receiver``, ``control_plane_app``) MUST call this rather than
+    re-implementing comma-split / whitespace-strip / control-char rejection.
+
+    Structural guarantees (production config principles):
+    * reuses :func:`resolve_production_worker_tokens` for parse + validation;
+    * the Human-Owner token (``HERMES_HUMAN_OWNER_TOKEN``) is NEVER accepted as
+      a worker token — listing it in ``ALLOWED_WORKER_TOKENS`` is rejected with
+      ``WorkerTokenConfigError`` (the two trust chains stay independent);
+    * the result is always a non-empty set (fail-closed otherwise);
+    * raw tokens are hashed in-process and NEVER returned, logged, or echoed.
+    """
+    tokens = resolve_production_worker_tokens(env_value)
+    # Guard: the Human Owner token must remain independent from worker tokens.
+    owner = os.environ.get("HERMES_HUMAN_OWNER_TOKEN", "")
+    if owner:
+        for t in tokens:
+            if hmac.compare_digest(t, owner):
+                raise WorkerTokenConfigError(
+                    "HERMES_HUMAN_OWNER_TOKEN must not be listed as an "
+                    "ALLOWED_WORKER_TOKENS value (fail-closed)")
+    hashes = {hash_token(t) for t in tokens}
+    if not hashes:
+        raise WorkerTokenConfigError(
+            "ALLOWED_WORKER_TOKENS yielded no usable token hashes "
+            "(fail-closed)")
+    return hashes
 
 
 def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
