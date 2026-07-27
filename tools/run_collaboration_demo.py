@@ -1,8 +1,8 @@
 """ONE-DAY-COLLABORATION-DEMO-RUNNER — end-to-end single-task Demo orchestrator.
 
-This is **Agent F**'s vertical-slice deliverable for the one-day collaboration
-demo. It is a *new, self-contained* file: it orchestrates the *existing,
-approved* canonical components and never modifies them.
+This is the one-day collaboration demo vertical slice. It is a *new,
+self-contained* file: it orchestrates the *existing, approved* canonical
+components and never modifies them.
 
 What it does
 ------------
@@ -14,11 +14,11 @@ Given a single task it runs a repeatable, auditable pipeline:
     4. obtain or reuse a Draft PR
     5. read CI status for that PR
     6. if CI is not green -> STOP at CI_PENDING (never pretend success)
-    7. once CI is green -> produce FINAL_ACCEPTANCE
+    7. once CI is green -> open the production FINAL_ACCEPTANCE gate
     8. wait for the Human Owner to call ``final_accept(token)``
     9. call ``complete()``
-   10. emit TASK_COMPLETED
-   11. emit a structured status summary that another agent ("Buzz") can read
+    10. emit TASK_COMPLETED
+    11. emit a structured status summary that another agent ("Buzz") can read
 
 Two modes
 ---------
@@ -35,9 +35,17 @@ Hard boundaries (enforced, never relaxed)
 * Merge is structurally impossible (no merge method is ever called).
 * A failure is never re-labelled as success (fail-closed state machine).
 
-This module contains no production delivery / git / GitHub logic of its own;
-it *reuses* ``hermes_worker.delivery.DeliveryController`` and the canonical
-clients. The ``ReleaseAgent`` here is the demo-scoped coordinator role.
+Wiring to the production components
+------------------------------------
+* The Release Agent is the **production** ``hermes_worker.release_delivery_coordinator
+  .ReleaseAgent`` (PB-1): the single, controlled delivery entry point. This module
+  deliberately keeps NO second, demo-local ReleaseAgent implementation.
+* The final-acceptance / completion gate is the **production**
+  ``ControlPlane`` chain (PB-23): ``request_final_acceptance`` (worker token) ->
+  ``final_accept`` (independent HUMAN_OWNER_TOKEN) -> ``complete`` (worker token).
+  The demo drives the same real gate so the one-day vertical slice exercises the
+  genuine PB-23 acceptance chain end to end. Tokens are NEVER written to logs,
+  events, or errors.
 """
 from __future__ import annotations
 
@@ -45,8 +53,11 @@ import hmac
 import json
 import os
 import sys
+import tempfile
 import time
 import typing as _t
+import uuid
+
 
 # Make the repo root importable so this tool also runs as a standalone script
 # (e.g. `python tools/run_collaboration_demo.py`) from any cwd.
@@ -54,6 +65,13 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from hermes_worker import constants
+from hermes_worker.constants import (
+    ALLOWED_GITHUB_REPOS,
+    ROLE_RELEASE_AGENT,
+)
+from hermes_worker.control_plane import ControlPlane
+from hermes_worker.db import hash_token
 from hermes_worker.delivery import (
     DeliveryController,
     DeliveryAuthorization,
@@ -64,8 +82,8 @@ from hermes_worker.delivery import (
     InMemoryDeliveryRegistry,
     LocalGitWorkspaceInspector,
 )
-from hermes_worker.constants import ALLOWED_GITHUB_REPOS
 from hermes_worker.github_client import GitHubRestClient, RealGitHubClient
+from hermes_worker.release_delivery_coordinator import ReleaseAgent
 from hermes_worker.repository import HostGitOperations
 
 
@@ -88,6 +106,12 @@ SUMMARY_SCHEMA = "hermes.demo.one_day_collaboration.v1"
 
 # CI statuses considered "green".
 CI_GREEN = ("success",)
+
+# A demo-scoped worker token, intentionally DISTINCT from the Human-Owner
+# acceptance token. It is used only to drive the formal ControlPlane job /
+# final-acceptance gate in `dev` mode; the demo never touches the production
+# worker server or any real credential.
+DEMO_WORKER_TOKEN = "demo-internal-worker-token"
 
 
 class DemoState:
@@ -124,50 +148,13 @@ class DemoRejected(DemoError):
 
 
 # --------------------------------------------------------------------------
-# Release Agent — the only role permitted to call DeliveryController.deliver()
+# Release Agent — the ONLY role permitted to call DeliveryController.deliver()
 # --------------------------------------------------------------------------
-class ReleaseAgent:
-    """Demo-scoped coordinator role.
-
-    The Demo orchestrator may NOT call ``DeliveryController.deliver`` directly;
-    it must go through this role, which builds the explicit, task+repo+commit
-    scoped ``DeliveryAuthorization`` and delegates to the canonical controller.
-    """
-
-    ROLE = "release_agent"
-
-    def __init__(self, controller: DeliveryController):
-        self.controller = controller
-
-    def deliver_task(
-        self,
-        *,
-        task_id: str,
-        repository: str,
-        local_commit_sha: str,
-        expected_sha: str,
-        title: str,
-        body: str,
-        test_summary: str = "demo automated",
-        security_summary: str = "demo automated",
-    ):
-        authorization = DeliveryAuthorization(
-            task_id=task_id,
-            repository=repository,
-            commit_sha=local_commit_sha,
-            grant=DeliveryAuthorization.REQUIRED_GRANT,
-        )
-        return self.controller.deliver(
-            task_id=task_id,
-            repository=repository,
-            local_commit_sha=local_commit_sha,
-            expected_sha=expected_sha,
-            authorization=authorization,
-            title=title,
-            body=body,
-            test_summary=test_summary,
-            security_summary=security_summary,
-        )
+# The Demo orchestrator reuses the PRODUCTION ReleaseAgent
+# (hermes_worker.release_delivery_coordinator.ReleaseAgent) rather than keeping
+# a second, demo-local ReleaseAgent implementation. The production agent is the
+# single, controlled delivery entry point (PB-1); it requires a ControlPlane so
+# it can record the canonical delivery events on the event store.
 
 
 # --------------------------------------------------------------------------
@@ -180,6 +167,11 @@ class DemoRunner:
     registry, CI client) are injected so the runner is fully deterministic in
     ``offline`` mode and re-runnable (shared registry + GitHub client across
     runs => the Draft PR is reused, never re-created).
+
+    The runner also owns a **production** ``ControlPlane`` instance (dev mode)
+    and drives the real PB-23 final-acceptance gate (request_final_acceptance
+    -> final_accept -> complete) so the demo exercises the genuine acceptance
+    chain rather than a demo-only stub.
     """
 
     def __init__(
@@ -250,6 +242,17 @@ class DemoRunner:
         self.registry = registry
         self.ci_provider = ci_provider
 
+        # Formal production ControlPlane (dev mode: the demo does NOT enforce the
+        # production worker-token allowlist — that lives in the worker server).
+        # The DemoRunner drives the SAME production final-acceptance gate
+        # (request_final_acceptance -> final_accept -> complete) so the one-day
+        # vertical slice exercises the real PB-23 chain end to end.
+        self.cp = ControlPlane(
+            db_path=os.path.join(
+                tempfile.gettempdir(), f"demo-cp-{uuid.uuid4().hex}.db"),
+            mode="dev",
+        )
+
         # Canonical delivery controller (the only writer of Draft PRs).
         self.controller = DeliveryController(
             git=self.git,
@@ -259,8 +262,10 @@ class DemoRunner:
             registry=self.registry,
             allowed_repos=set(ALLOWED_GITHUB_REPOS),
         )
-        # The Demo orchestrator only ever delivers through this role.
-        self.release_agent = ReleaseAgent(self.controller)
+        # The Demo orchestrator only ever delivers through the PRODUCTION
+        # ReleaseAgent (PB-1): the single, controlled delivery entry point.
+        self.release_agent = ReleaseAgent(
+            cp=self.cp, delivery=self.controller, repository=self.repository)
 
         # --- mutable run state -------------------------------------------------
         self.state = DemoState.INIT
@@ -274,6 +279,7 @@ class DemoRunner:
         self.rejection = None
         self.message = ""
         self._commit_fail_reason = None
+        self.job_id = None
 
     # -- internal helpers ----------------------------------------------------
     def _set_state(self, state: str, **fields) -> "DemoRunner":
@@ -321,14 +327,28 @@ class DemoRunner:
             )
         self._set_state(DemoState.COMMIT_VERIFIED, message="local commit verified")
 
-        # Steps 2-4: hand the Commit to the ReleaseAgent -> DeliveryController.
+        # Steps 2-4: register the demo worker, open a ControlPlane job, and hand
+        # the Commit to the PRODUCTION ReleaseAgent -> DeliveryController.
+        self.cp.register(DEMO_WORKER_TOKEN, name="demo-worker")
+        self.job_id = self.cp.create_job(
+            payload={"task_id": self.task_id, "repository": self.repository},
+            task_id=self.task_id,
+            repo=self.repository,
+            role=ROLE_RELEASE_AGENT,
+        )
+        self.cp.update_job(
+            self.job_id, worker_token_hash=hash_token(DEMO_WORKER_TOKEN))
+
         dstatus = self.release_agent.deliver_task(
+            self.job_id,
             task_id=self.task_id,
             repository=self.repository,
-            local_commit_sha=self.local_commit_sha,
+            commit_sha=self.local_commit_sha,
             expected_sha=self.expected_sha,
             title=self.title,
             body=self.body,
+            test_summary="demo automated",
+            security_summary="demo automated",
         )
         self.delivery_status = dstatus
         # Fail-closed: a blocked delivery never masquerades as success.
@@ -358,7 +378,12 @@ class DemoRunner:
                 message=f"CI not green ({ci}); stopped at CI_PENDING",
             )
 
-        # Step 7: CI green -> produce FINAL_ACCEPTANCE.
+        # Step 7: CI green -> open the formal production final-acceptance gate
+        # (PB-23). request_final_acceptance is invoked by the worker role using
+        # the demo worker token; it emits FINAL_ACCEPTANCE and moves the job to
+        # USER_ACTION_REQUIRED. The token is NEVER written to logs or events.
+        self.cp.update_job(self.job_id, ci_status="success")
+        self.cp.request_final_acceptance(DEMO_WORKER_TOKEN, self.job_id)
         return self._set_state(
             DemoState.FINAL_ACCEPTANCE_READY,
             ci_status=ci,
@@ -387,6 +412,14 @@ class DemoRunner:
                 "Human Owner acceptance token mismatch",
             )
         self.accepted = True
+        # Drive the formal production acceptance gate (PB-23). ControlPlane
+        # final_accept requires the independent HUMAN_OWNER_TOKEN (never the
+        # demo-supplied token, never a worker token), emits a single
+        # FINAL_ACCEPTED event, and is idempotent. We read the live module
+        # attribute (constants.HUMAN_OWNER_TOKEN) rather than a snapshot import
+        # so it always matches what ControlPlane compares against, regardless of
+        # test-module global mutation / collection order.
+        self.cp.final_accept(constants.HUMAN_OWNER_TOKEN, self.job_id)
         return self._set_state(
             DemoState.ACCEPTED, message="Human Owner accepted FINAL_ACCEPTANCE"
         )
@@ -400,6 +433,12 @@ class DemoRunner:
             )
         self.completed = True
         self.result = TASK_COMPLETED
+        # Drive the formal production completion gate (PB-23). complete() is
+        # only callable after FINAL_ACCEPTED and emits TASK_COMPLETED exactly
+        # once. It is invoked with the worker token (the release/worker role,
+        # never the Human-Owner token).
+        self.cp.complete(DEMO_WORKER_TOKEN, self.job_id,
+                         result={"result": TASK_COMPLETED})
         self._set_state(DemoState.COMPLETED, message="TASK_COMPLETED")
         if self.summary_path:
             self.write_summary_json(self.summary_path)
@@ -428,7 +467,7 @@ class DemoRunner:
             "repository": self.repository,
             "state": self.state,
             "result": self.result,
-            "delivery_state": dstatus.state if dstatus else None,
+            "delivery_state": dstatus.status_code if dstatus else None,
             "delivery_status_code": dstatus.status_code if dstatus else None,
             "pr_number": self.pr_number,
             "pr_url": self.pr_url,
