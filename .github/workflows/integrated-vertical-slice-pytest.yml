@@ -37,8 +37,10 @@ jobs:
           set +e -uo pipefail
           RAW=$(python -m pytest --collect-only -q -p no:cacheprovider 2>&1) || true
           echo "$RAW"
-          T=$(echo "$RAW" | grep -oE '[0-9]+ (tests collected|items)' | grep -oE '[0-9]+' | head -1)
-          if [ -z "$T" ]; then
+          # pytest -q collect-only emits per-file "path: N" lines and NO total
+          # summary line, so sum the per-file counts to obtain the real T.
+          T=$(echo "$RAW" | awk -F': ' '/:[[:space:]]*[0-9]+$/{s+=$2} END{print s+0}')
+          if [ -z "$T" ] || [ "$T" = "0" ]; then
             echo "COLLECT_FAILED: could not determine T from collect-only output"
             exit 1
           fi
