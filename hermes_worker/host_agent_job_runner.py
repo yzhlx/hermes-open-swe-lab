@@ -43,6 +43,34 @@ def _safe_delivery_fragment(delivery_id: str) -> str:
     return (value or "delivery")[:12]
 
 
+def _job_allowed_paths(payload: dict) -> Optional[frozenset[str]]:
+    raw_paths = payload.get("allowed_paths")
+    if raw_paths is None:
+        return None
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise ControlPlaneError("job_allowed_paths_invalid")
+    normalized: set[str] = set()
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ControlPlaneError("job_allowed_paths_invalid")
+        if (
+            "\\" in raw_path
+            or "\x00" in raw_path
+            or raw_path.startswith("/")
+            or re.match(r"^[A-Za-z]:", raw_path)
+            or raw_path.endswith("/")
+        ):
+            raise ControlPlaneError("job_allowed_paths_invalid")
+        parts = raw_path.split("/")
+        if (
+            any(part in {"", ".", ".."} for part in parts)
+            or any(part.lower() == ".git" for part in parts)
+        ):
+            raise ControlPlaneError("job_allowed_paths_invalid")
+        normalized.add(raw_path)
+    return frozenset(normalized)
+
+
 _PRIVATE_KEY_BLOCK_RE = re.compile(
     r"-----BEGIN (?P<label>(?:[A-Z0-9]+ )*PRIVATE KEY)-----"
     r".*?"
@@ -503,6 +531,7 @@ class HostAgentJobRunner:
             raise ControlPlaneError("repo_not_allowed")
         job = self.cp.get_job(job_id)
         payload = json.loads(job.get("payload") or "{}")
+        allowed_paths = _job_allowed_paths(payload)
         expected_delivery = payload.get("delivery_id")
         existing_pr_number = job.get("pr_number")
         previous_commit_sha = job.get("commit_sha")
@@ -665,6 +694,22 @@ class HostAgentJobRunner:
                         "command": agent_result.command_redacted,
                         "role": ROLE_CODING_AGENT,
                     },
+                )
+            if (
+                allowed_paths is not None
+                and not set(changed_files).issubset(allowed_paths)
+            ):
+                return self._finish(
+                    job_id,
+                    worker_token,
+                    "BLOCKED",
+                    repo_path=prepared.repo_path,
+                    result={
+                        "exit_code": 2,
+                        "modified_files": changed_files,
+                        "role": ROLE_CODING_AGENT,
+                    },
+                    error="changed_files_outside_job_allowlist",
                 )
 
             self._transition(job_id, worker_token, "TESTING", {

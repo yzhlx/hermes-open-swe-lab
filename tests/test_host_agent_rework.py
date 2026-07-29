@@ -11,7 +11,11 @@ from unittest import mock
 import pytest
 
 from hermes_worker.pi_cli_runner import AgentRunResult
-from hermes_worker.host_agent_job_runner import HostAgentJobRunner, _load_broker
+from hermes_worker.host_agent_job_runner import (
+    HostAgentJobRunner,
+    _job_allowed_paths,
+    _load_broker,
+)
 from hermes_worker.control_plane import ControlPlane, ControlPlaneError
 from hermes_worker.db import hash_token
 from hermes_worker.docker_sandbox import DockerTestResult
@@ -194,6 +198,137 @@ class JsonResponse:
 
 def _event_payload(event: dict) -> dict:
     return json.loads(event["payload"] or "{}")
+
+
+def test_host_runner_blocks_changes_outside_job_allowed_paths():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        control_plane = ControlPlane(
+            str(root / "jobs.sqlite"),
+            allowed_token_hashes={hash_token(WORKER_TOKEN)},
+        )
+        control_plane.register(WORKER_TOKEN, "allowlist-agent")
+        job_id = control_plane.create_job(
+            {
+                "delivery_id": "allowlist-delivery",
+                "allowed_paths": ["automation-smoke-test/README.md"],
+            },
+            task_id="allowlist-task",
+            repo=REPO,
+            role="coding_agent",
+        )
+        broker = RecordingBroker()
+        git = RecordingGitOperations()
+        github = RecordingGitHub()
+        runner = HostAgentJobRunner(
+            control_plane=control_plane,
+            token_broker=broker,
+            agent_runner=RecordingAgent(),
+            repository_preparer=RecordingPreparer(),
+            git_operations=git,
+            docker_backend_factory=lambda _repo_path: (_ for _ in ()).throw(
+                AssertionError("Docker must not run for out-of-allowlist changes")
+            ),
+            github_client=github,
+            work_root=root / "work",
+        )
+
+        result = runner.run(
+            job_id,
+            WORKER_TOKEN,
+            REPO,
+            "main",
+            "change only the approved smoke file",
+            "allowlist-delivery",
+            "python scripts/validate_smoke_contract.py --self-test",
+            60,
+        )
+
+        assert result.state == "BLOCKED"
+        assert result.error == "changed_files_outside_job_allowlist"
+        assert git.commit_calls == 0
+        assert git.pushes == []
+        assert github.pr_calls == 0
+        assert broker.calls == 1
+        control_plane.conn.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [],
+        ["../outside"],
+        ["/absolute"],
+        [r"windows\\path"],
+        ["C:/absolute"],
+        ["automation-smoke-test//README.md"],
+        ["automation-smoke-test/./README.md"],
+        [".git/config"],
+    ],
+)
+def test_job_allowed_paths_rejects_noncanonical_or_protected_values(value):
+    with pytest.raises(ControlPlaneError, match="job_allowed_paths_invalid"):
+        _job_allowed_paths({"allowed_paths": value})
+
+
+def test_job_allowed_paths_accepts_exact_canonical_relative_file():
+    assert _job_allowed_paths({
+        "allowed_paths": ["automation-smoke-test/README.md"],
+    }) == frozenset({"automation-smoke-test/README.md"})
+
+
+def test_host_runner_allows_exact_job_allowed_path():
+    class AllowedGit(RecordingGitOperations):
+        def changed_files(self, repo_path):
+            return ["automation-smoke-test/README.md"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        control_plane = ControlPlane(
+            str(root / "jobs.sqlite"),
+            allowed_token_hashes={hash_token(WORKER_TOKEN)},
+        )
+        try:
+            control_plane.register(WORKER_TOKEN, "allowlist-agent")
+            job_id = control_plane.create_job(
+                {
+                    "delivery_id": "allowlist-positive",
+                    "allowed_paths": ["automation-smoke-test/README.md"],
+                },
+                task_id="allowlist-positive-task",
+                repo=REPO,
+                role="coding_agent",
+            )
+            git = AllowedGit()
+            github = RecordingGitHub()
+            runner = HostAgentJobRunner(
+                control_plane=control_plane,
+                token_broker=RecordingBroker(),
+                agent_runner=RecordingAgent(),
+                repository_preparer=RecordingPreparer(),
+                git_operations=git,
+                docker_backend_factory=lambda _repo_path: PassingDocker(),
+                github_client=github,
+                work_root=root / "work",
+            )
+
+            result = runner.run(
+                job_id,
+                WORKER_TOKEN,
+                REPO,
+                "main",
+                "change only the approved smoke file",
+                "allowlist-positive",
+                "python scripts/validate_smoke_contract.py --self-test",
+                60,
+            )
+
+            assert result.state == "PR_CREATED"
+            assert git.commit_calls == 1
+            assert len(git.pushes) == 1
+            assert github.pr_calls == 1
+        finally:
+            control_plane.conn.close()
 
 
 def test_host_runner_round2_reuses_job_branch_and_draft_pr_with_review_feedback():
