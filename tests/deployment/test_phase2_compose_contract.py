@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ROOT / "deploy" / "cloud" / "docker-compose.phase2.yml"
 DOCKERFILE = ROOT / "deploy" / "cloud" / "Dockerfile.phase2"
+DOCKERIGNORE = ROOT / "deploy" / "cloud" / "Dockerfile.phase2.dockerignore"
 
 
 def test_phase2_compose_isolated_loopback_and_bounded():
@@ -52,6 +53,46 @@ def test_phase2_dockerfile_runs_non_root_minimal_control_plane():
     assert ".env" not in lowered
     assert "copy . " not in lowered
     assert "add . " not in lowered
+
+
+def test_phase2_build_context_is_allowlisted_and_secret_safe():
+    lines = [
+        line.strip()
+        for line in DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert lines[0] == "**"
+    for required in (
+        "!pyproject.toml",
+        "!README.md",
+        "!hermes_worker/**",
+        "!hermes_open_swe_relay/**",
+        "!deploy/**",
+        "**/.git/**",
+        "**/.env.*",
+        "**/*.pem",
+        "**/*.key",
+        "**/secrets/**",
+        "**/credentials/**",
+        "**/.pi-subagents/**",
+        "**/runtime/**",
+        "docs/authorization/**",
+        "CODEX-FINAL-HANDOFF.md",
+    ):
+        assert required in lines
+
+    last_include = max(
+        index for index, line in enumerate(lines) if line.startswith("!")
+    )
+    for index, line in enumerate(lines):
+        if line in {
+            "**/.env.*",
+            "**/*.pem",
+            "**/*.key",
+            "**/secrets/**",
+            "**/credentials/**",
+        }:
+            assert index > last_include
 
 
 def test_compose_uses_separate_secret_files_by_name_only():
