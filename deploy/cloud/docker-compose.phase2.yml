@@ -1,0 +1,70 @@
+services:
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: deploy/cloud/Dockerfile.phase2
+    image: ${HERMES_LAB_IMAGE_TAG:?set an immutable C1 image tag}
+    user: "10001:10001"
+    restart: "no"
+    read_only: true
+    privileged: false
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    cpus: "0.5"
+    mem_limit: 512m
+    ports:
+      - "127.0.0.1:18080:8080"
+    environment:
+      HERMES_DB_PATH: /data/events.db
+      HERMES_RUNTIME_DIR: /data
+      HERMES_LOG_DIR: /data/logs
+      HERMES_LISTEN_HOST: 127.0.0.1
+      HERMES_LISTEN_PORT: "8080"
+      HERMES_LOCALHOST_TEST: "0"
+      HERMES_WORKER_TOKEN_HASHES_FILE: /run/secrets/worker_token_hashes
+      HERMES_HOST_WORKER_TOKEN_HASHES_FILE: /run/secrets/host_worker_token_hashes
+      HERMES_GITHUB_APP_ID_FILE: /run/secrets/github_app_id
+      HERMES_GITHUB_INSTALLATION_ID_FILE: /run/secrets/github_installation_id
+      HERMES_GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github_app_private_key
+    volumes:
+      - /var/lib/hermes-open-swe-lab-phase2:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    secrets:
+      - worker_token_hashes
+      - host_worker_token_hashes
+      - github_app_id
+      - github_installation_id
+      - github_app_private_key
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    networks:
+      - lab-control
+
+networks:
+  lab-control:
+    internal: false
+
+secrets:
+  worker_token_hashes:
+    file: ${HERMES_WORKER_TOKEN_HASHES_SOURCE:?set restricted hash file}
+  host_worker_token_hashes:
+    file: ${HERMES_HOST_WORKER_TOKEN_HASHES_SOURCE:?set restricted host hash file}
+  github_app_id:
+    file: ${HERMES_GITHUB_APP_ID_SOURCE:?set restricted App ID file}
+  github_installation_id:
+    file: ${HERMES_GITHUB_INSTALLATION_ID_SOURCE:?set restricted installation ID file}
+  github_app_private_key:
+    file: ${HERMES_GITHUB_APP_PRIVATE_KEY_SOURCE:?set restricted private key file}

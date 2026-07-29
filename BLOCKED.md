@@ -105,6 +105,17 @@
 
 - 当前状态已统一记录在第 10 节；本节不再维护重复事实，避免出现相互矛盾的当前态。
 
+## 15. Phase 2 C1 / C2 独立 Compose 状态
+
+- 状态：`C1_LOCAL_OFFLINE_TEST_PASS / C2_NOT_AUTHORIZED`
+- 当前事实：C1 已实现独立远程 ControlPlane client、专用 Host Codex runner、强化 cloud adapter 与隔离 Compose contract；本地窄测、回归、acceptance、Secret scan 当前全绿。
+- C1 当前：独立 Haiku review 已完成且无 BLOCKING / IMPORTANT finding；仍需 staged Secret/diff 门禁和本地 Commit。Push 继续需要再次确认。
+- C2 仍阻塞：没有精确 C1 Commit SHA 对应的 immutable image tag/digest、tracked-source archive hash、Secret Store path、cloud backup/build/up/rollback 命令和影响窗口授权。
+- 现有云应用：`/opt/hermes-cloud` 及 `hermes-cloud-hermes-cloud-1` 不属于 C1/C2 写入范围，禁止同步、覆盖、build、restart、stop、exec 或读取业务/Secret 内容。
+- Smoke 仍阻塞：未请求 Installation Token，未创建 smoke Issue/branch/PR，未完成真实 CI/Review/rework；不得升级为 `GITHUB_REAL_WRITE_PASS`。
+- 解锁条件：C1 独立 review 无 BLOCKING finding，记录精确 Commit/测试/Secret scan；随后 Human Owner 批准新的 C2 exact-operation request。
+- 禁止替代：不得把 Compose config、dry-run、旧 cloud 容器健康或离线 HTTP 测试升级为云端部署/真实 GitHub/端到端 PASS。
+
 ## 阻塞处理规则
 
 - `BLOCKED` 不得改写为 PASS、DONE 或“基本可用”。

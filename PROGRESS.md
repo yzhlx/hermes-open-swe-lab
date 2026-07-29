@@ -137,3 +137,25 @@
 | BLOCKED_SCOPE | Operator API Human Owner 本地身份认证仍未纳入本批。 |
 | BLOCKED_SCOPE | 最终人工 approval 前的 live GitHub Head/CI/Review 复验仍未纳入本批。 |
 | NOT_TESTED | 真实 GitHub App scope、Push、Draft PR、Check、Review、Label、round-2 write、Provider、WSL 与云端部署均未执行。 |
+
+## 2026-07-29 Phase 2 C1 独立 Lab Control Plane 本地实现
+
+本节晚于上方最终验证，代表当前 C1 工作树证据。Lab Draft PR #14 已存在，但 C1 尚未 Commit/Push。
+
+| 状态 | 当前实跑证据 |
+|---|---|
+| OFFLINE_TEST_PASS | 新增 value-safe `ControlPlaneHttpClient`、lease-gated `RemoteTokenBroker` 与专用 `codex_worker_runner`；privileged Host routes 使用独立 worker-token-hash allowlist，普通 Worker 不能调用。 |
+| OFFLINE_TEST_PASS | `CodexJobRunner` 保留本地 SQLite 路径，并可通过能力检测使用远程 transition、线程安全 keepalive 与受信 handoff。 |
+| OFFLINE_TEST_PASS | 新增隔离 `Dockerfile.phase2` / `docker-compose.phase2.yml` contract：独立路径、`127.0.0.1:18080`、非 root、无 privileged/Docker socket/Provider/target-repo mount、restart=no。 |
+| OFFLINE_TEST_PASS | C1 narrow：`14 passed`，Exit `0`。 |
+| OFFLINE_TEST_PASS | Host rework、D1/D3 security、cloud/worker deployment compatibility：`78 passed`，Exit `0`。 |
+| OFFLINE_TEST_PASS | Full non-deployment：`208 passed`，Exit `0`。 |
+| OFFLINE_TEST_PASS | Windows deployment：`25 passed`，Exit `0`；WSL 未运行。 |
+| OFFLINE_TEST_PASS | Unified acceptance：Workbench `63`、baseline `43`、host-rework-security `28`、redact `10`，全部 `0 failed / 0 errors / 0 skipped`，Exit `0`。 |
+| PASS | Compose config synthetic/value-free validation Exit `0`；dedicated runner dry-run Exit `0`，报告 `github_writes=false / cloud_writes=false`，且不存在的 token file 未被读取。 |
+| PASS | Secret scan：`19` files、`0` violations、`0` read/Git errors；artifact：`C:\\Windows\\Temp\\hermes-workbench-acceptance-eeca5c36c0b741aebd1daddf2370ea22\\secret-scan.json`。 |
+| PASS | `git diff --check` 与 cached check 均 Exit `0`。 |
+| USER_ATTESTED | 受影响 Provider Key 已在聊天外吊销/轮换；本地配置仅做 value-free `PRESENT` 检查。不得升级为 `PROVIDER_LIVE_PASS`。 |
+| PASS | Independent Haiku C1 review 完成：无 BLOCKING / IMPORTANT finding；artifact：`.pi-subagents/reviews/phase2-c1-final-haiku-review.md`。此前 Haiku/GPT-5.5 quota 403 失败运行仅保留为历史，不计入最终 review。 |
+| NOT_TESTED | C1 未 build image、未运行新 container、未部署、未请求 Installation Token、未写 smoke repo、未执行 Provider live。 |
+| BLOCKED_C2_AUTHORIZATION | 只有 C1 完成独立 review、Commit SHA、镜像/源包计划和新的 C2 精确授权后，才允许创建独立云端路径/镜像/容器。现有 `/opt/hermes-cloud` 必须保持不变。 |

@@ -114,6 +114,46 @@ def test_app_refuses_non_loopback(monkeypatch):
     assert e.value.code == 3
 
 
+def test_production_host_worker_hashes_must_be_allowlisted_subset(
+    tmp_path,
+    monkeypatch,
+):
+    all_workers = tmp_path / "all-worker-hashes"
+    host_workers = tmp_path / "host-worker-hashes"
+    all_workers.write_text("a" * 64 + "\n" + "b" * 64 + "\n")
+    host_workers.write_text("b" * 64 + "\n")
+    cfg = {
+        "host": "127.0.0.1",
+        "port": 8080,
+        "db_path": str(tmp_path / "events.db"),
+        "localhost_test": False,
+        "worker_hashes_file": str(all_workers),
+        "host_worker_hashes_file": str(host_workers),
+        "app_id_file": "synthetic-app-id-file",
+        "installation_id_file": "synthetic-installation-id-file",
+        "private_key_file": "synthetic-private-key-file",
+    }
+    captured = {}
+    marker = object()
+    monkeypatch.setattr(cpa, "_build_broker", lambda _cfg: object())
+
+    def fake_server(*args, **kwargs):
+        captured.update(kwargs)
+        return marker
+
+    monkeypatch.setattr(cpa, "run_worker_server", fake_server)
+    assert cpa.run_server(cfg) is marker
+    assert captured["allowed_token_hashes"] == {"a" * 64, "b" * 64}
+    assert captured["host_worker_token_hashes"] == {"b" * 64}
+
+    host_workers.write_text("c" * 64 + "\n")
+    with __import__("pytest").raises(
+        RuntimeError,
+        match="host_worker_hash_not_allowlisted",
+    ):
+        cpa.run_server(cfg)
+
+
 # --------------------------------------------------------------------------
 # Health + restart (real subprocess)
 # --------------------------------------------------------------------------

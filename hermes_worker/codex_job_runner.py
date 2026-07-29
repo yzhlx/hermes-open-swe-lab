@@ -92,6 +92,10 @@ class CodexJobRunner:
 
     def _transition(self, job_id: int, worker_token: str,
                     state: str, payload: Optional[dict] = None) -> None:
+        transition = getattr(self.cp, "transition_job", None)
+        if transition is not None:
+            transition(worker_token, job_id, state, payload or {})
+            return
         self.cp.set_state(job_id, state)
         self.cp.keepalive(worker_token, job_id)
         self.cp.append_event(job_id, {
@@ -140,7 +144,14 @@ class CodexJobRunner:
 
     def _lease_loop(self, job_id: int, worker_token: str,
                     stop: threading.Event) -> None:
-        cp = ControlPlane(self.cp.db_path, lease_seconds=self.cp.lease_seconds)
+        fork_for_thread = getattr(self.cp, "fork_for_thread", None)
+        if fork_for_thread is not None:
+            cp = fork_for_thread()
+        else:
+            cp = ControlPlane(
+                self.cp.db_path,
+                lease_seconds=self.cp.lease_seconds,
+            )
         try:
             while not stop.wait(self.keepalive_interval):
                 try:
@@ -148,7 +159,11 @@ class CodexJobRunner:
                 except ControlPlaneError:
                     return
         finally:
-            cp.conn.close()
+            close = getattr(cp, "close", None)
+            if close is not None:
+                close()
+            elif hasattr(cp, "conn"):
+                cp.conn.close()
 
     def _pending_review_feedback(
         self,
@@ -278,6 +293,7 @@ class CodexJobRunner:
     def _handoff_for_review(
         self,
         job_id: int,
+        worker_token: str,
         *,
         repo_path: Path,
         result_state: str,
@@ -295,16 +311,30 @@ class CodexJobRunner:
         Scheduler can review it and the same Worker identity can reclaim it for
         round-2 rework.
         """
-        self.cp.store_agent_result(job_id, result)
-        self.cp.append_event(job_id, {
+        handoff = getattr(self.cp, "handoff_for_review", None)
+        event = {
+            "id": (
+                f"host-handoff:{job_id}:{event_type}:"
+                f"{commit_sha or pr_number}"
+            ),
             "type": event_type,
             "payload": event_payload,
             "source_type": "worker",
             "source_id": "host-codex-worker",
             "actor_role": ROLE_CODING_AGENT,
-        })
-        self.cp.set_state(job_id, "agent_done")
-        self.cp.update_job(job_id, lease_expires=None)
+        }
+        if handoff is not None:
+            handoff(
+                worker_token,
+                job_id,
+                event=event,
+                result=result,
+            )
+        else:
+            self.cp.store_agent_result(job_id, result)
+            self.cp.append_event(job_id, event)
+            self.cp.set_state(job_id, "agent_done")
+            self.cp.update_job(job_id, lease_expires=None)
         return CodexJobResult(
             state=result_state,
             job_id=job_id,
@@ -742,6 +772,7 @@ class CodexJobRunner:
             if is_rework:
                 return self._handoff_for_review(
                     job_id,
+                    worker_token,
                     repo_path=prepared.repo_path,
                     result_state="PR_UPDATED",
                     event_type="round2_push",
@@ -814,6 +845,7 @@ class CodexJobRunner:
                 )
             return self._handoff_for_review(
                 job_id,
+                worker_token,
                 repo_path=prepared.repo_path,
                 result_state="PR_CREATED",
                 event_type="pr_created",

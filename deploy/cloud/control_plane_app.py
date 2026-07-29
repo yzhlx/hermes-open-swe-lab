@@ -1,197 +1,182 @@
-"""Cloud Control Plane runnable for deployment verification (line C).
-
-This module is a *deployment-time* wrapper. It does NOT implement the D3 core
-state machine or the relay model adapter — those live in ``hermes_worker``
-(Line A) and are used here as libraries only:
-
-- the task queue / lease / event-store logic is ``hermes_worker.control_plane.ControlPlane``;
-- the SQLite schema + WAL setup is ``hermes_worker.db``.
-
-What this module ADDS (deployment concerns, not business logic):
-
-- ``/healthz`` and ``/readyz`` endpoints (required by the MVP-0 deploy spec);
-- hard security gates (no root, loopback-only bind, no secret logging);
-- a clean ``main()`` entry point the systemd unit launches.
-
-Line A may later replace this wrapper with its own server; the integration
-contract in ``docs/deployment/DEPLOYMENT-INTEGRATION-CONTRACT.md`` pins the
-env vars, entry point, and endpoint surface this deployment expects.
-"""
+"""Separate Hermes Open SWE Lab cloud ControlPlane entry point."""
 from __future__ import annotations
 
-import json
 import os
+from pathlib import Path
+import re
 import signal
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
 
-from hermes_worker.control_plane import ControlPlane, ControlPlaneError
-from hermes_worker.db import init_db
+from hermes_worker.github_app import (
+    GitHubAppTokenBroker,
+    RealAppApiClient,
+)
+from hermes_worker.worker_api_server import run_server as run_worker_server
+
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _env(key: str, default: str) -> str:
+def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
 def load_config() -> dict:
-    """Read deploy-time config from the environment (set by the systemd
-    EnvironmentFile). No secrets are read here — the worker token hash, if
-    needed, is derived at request time from the ``X-Worker-Token`` header and
-    never persisted or logged."""
     return {
         "db_path": _env("HERMES_DB_PATH", "runtime/events.db"),
         "host": _env("HERMES_LISTEN_HOST", "127.0.0.1"),
         "port": int(_env("HERMES_LISTEN_PORT", "8080")),
         "localhost_test": _env("HERMES_LOCALHOST_TEST", "0") == "1",
         "log_dir": _env("HERMES_LOG_DIR", "logs"),
+        "worker_hashes_file": _env("HERMES_WORKER_TOKEN_HASHES_FILE"),
+        "host_worker_hashes_file": _env(
+            "HERMES_HOST_WORKER_TOKEN_HASHES_FILE"
+        ),
+        "app_id_file": _env("HERMES_GITHUB_APP_ID_FILE"),
+        "installation_id_file": _env(
+            "HERMES_GITHUB_INSTALLATION_ID_FILE"
+        ),
+        "private_key_file": _env(
+            "HERMES_GITHUB_APP_PRIVATE_KEY_FILE"
+        ),
     }
 
 
 def guard_startup(cfg: dict) -> None:
-    """Fail-closed startup guards. Any violation prints a clear message to
-    stderr and exits non-zero so systemd marks the start as failed."""
-    # Gate: never run the Control Plane as root.
     try:
         if hasattr(os, "geteuid") and os.geteuid() == 0:
-            print("SECURITY: refusing to start Control Plane as root "
-                  "(use the dedicated 'hermes-swe' service user).", file=sys.stderr)
-            sys.exit(2)
+            print(
+                "SECURITY: refusing to start Control Plane as root",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
     except AttributeError:
-        pass  # non-POSIX platforms (e.g. local Windows test) skip the check
-
-    # Gate: never bind a non-loopback address → no public plaintext HTTP.
+        pass
     if cfg["host"] not in LOOPBACK_HOSTS:
-        print(f"SECURITY: refusing to bind non-loopback host '{cfg['host']}'. "
-              f"The Control Plane must bind loopback only; terminate TLS at the "
-              f"reverse proxy. Set HERMES_LISTEN_HOST=127.0.0.1.",
-              file=sys.stderr)
-        sys.exit(3)
+        print(
+            "SECURITY: refusing to bind a non-loopback host",
+            file=sys.stderr,
+        )
+        raise SystemExit(3)
+    if int(cfg["port"]) < 1 or int(cfg["port"]) > 65_535:
+        print("SECURITY: invalid listen port", file=sys.stderr)
+        raise SystemExit(4)
 
 
-def make_handler(db_path: str):
-    class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def _cp(self) -> ControlPlane:
-            # Fresh per-request connection: sqlite connections are thread-bound.
-            return ControlPlane(db_path)
-
-        def _send(self, code, obj):
-            body = json.dumps(obj).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _body(self):
-            n = int(self.headers.get("Content-Length", 0) or 0)
-            return json.loads(self.rfile.read(n) or b"{}") if n else {}
-
-        def _token(self):
-            # The raw token is used only to compute a sha256 hash in-process.
-            # It is NEVER logged, stored, or echoed.
-            return self.headers.get("X-Worker-Token", "")
-
-        def log_message(self, *args):
-            pass  # silence default logging; no secrets must ever reach logs
-
-        def do_GET(self):
-            path = urlparse(self.path).path
-            if path == "/healthz":
-                self._send(200, {"status": "ok",
-                                 "service": "hermes-swe-control-plane"})
-                return
-            if path == "/readyz":
-                try:
-                    conn = init_db(db_path)
-                    conn.execute("SELECT 1 FROM jobs LIMIT 1")
-                    conn.close()
-                    self._send(200, {"ready": True})
-                except Exception as e:  # noqa: BLE001
-                    self._send(503, {"ready": False,
-                                     "reason": type(e).__name__})
-                return
-            self._send(404, {"error": "not_found"})
-
-        def do_POST(self):
-            cp = self._cp()
-            try:
-                path = urlparse(self.path).path
-                body = self._body()
-                tok = self._token()
-                if path == "/worker/register":
-                    res = cp.register(tok, body.get("name"),
-                                      json.dumps(body.get("capabilities")))
-                elif path == "/worker/heartbeat":
-                    res = cp.heartbeat(tok, body.get("job_id"))
-                elif path == "/worker/jobs/claim":
-                    res = cp.claim(tok)
-                elif path.startswith("/worker/jobs/") and path.endswith("/events"):
-                    jid = int(path.split("/")[-2])
-                    res = cp.post_events(tok, jid, body.get("events", []))
-                elif path.startswith("/worker/jobs/") and path.endswith("/complete"):
-                    jid = int(path.split("/")[-2])
-                    res = cp.complete(tok, jid, body.get("result"))
-                elif path.startswith("/worker/jobs/") and path.endswith("/fail"):
-                    jid = int(path.split("/")[-2])
-                    res = cp.fail(tok, jid, body.get("error"))
-                else:
-                    self._send(404, {"error": "not_found"})
-                    return
-                self._send(200, res)
-            except ControlPlaneError as e:
-                self._send(400, {"error": str(e)})
-            except Exception:  # noqa: BLE001 - surface as 500, never leak secrets
-                self._send(500, {"error": "internal_error"})
-            finally:
-                try:
-                    cp.conn.close()
-                except Exception:
-                    pass
-
-    return Handler
+def _read_required(path_value: str, label: str) -> str:
+    if not path_value:
+        raise RuntimeError(f"missing_{label}_file")
+    path = Path(path_value)
+    if not path.is_file():
+        raise RuntimeError(f"missing_{label}_file")
+    value = path.read_text(encoding="utf-8").strip()
+    if not value:
+        raise RuntimeError(f"empty_{label}_file")
+    return value
 
 
-def run_server(cfg: dict) -> ThreadingHTTPServer:
-    """Build the server WITHOUT blocking (library-friendly)."""
-    return ThreadingHTTPServer((cfg["host"], cfg["port"]),
-                               make_handler(cfg["db_path"]))
+def _load_worker_hashes(path_value: str) -> set[str]:
+    content = _read_required(path_value, "worker_hashes")
+    hashes = {
+        line.strip().lower()
+        for line in content.splitlines()
+        if line.strip()
+    }
+    if not hashes or any(not _SHA256_RE.fullmatch(value) for value in hashes):
+        raise RuntimeError("invalid_worker_hashes_file")
+    return hashes
 
 
-def main():
+def _build_broker(cfg: dict) -> GitHubAppTokenBroker:
+    app_id = _read_required(cfg["app_id_file"], "github_app_id")
+    installation_id = _read_required(
+        cfg["installation_id_file"],
+        "github_installation_id",
+    )
+    private_key = _read_required(
+        cfg["private_key_file"],
+        "github_private_key",
+    )
+    if "PRIVATE KEY" not in private_key:
+        raise RuntimeError("invalid_github_private_key_file")
+    return GitHubAppTokenBroker(
+        app_id=app_id,
+        installation_id=installation_id,
+        private_key_pem=private_key,
+        app_api=RealAppApiClient(),
+    )
+
+
+def run_server(cfg: dict):
+    worker_hashes = (
+        _load_worker_hashes(cfg["worker_hashes_file"])
+        if cfg.get("worker_hashes_file") else None
+    )
+    host_worker_hashes = (
+        _load_worker_hashes(cfg["host_worker_hashes_file"])
+        if cfg.get("host_worker_hashes_file") else None
+    )
+    if host_worker_hashes and (
+        not worker_hashes
+        or not host_worker_hashes.issubset(worker_hashes)
+    ):
+        raise RuntimeError("host_worker_hash_not_allowlisted")
+
+    broker_files = (
+        cfg.get("app_id_file"),
+        cfg.get("installation_id_file"),
+        cfg.get("private_key_file"),
+    )
+    broker = _build_broker(cfg) if all(broker_files) else None
+    if not cfg.get("localhost_test", False):
+        if not worker_hashes:
+            raise RuntimeError("missing_worker_hashes_file")
+        if not host_worker_hashes:
+            raise RuntimeError("missing_host_worker_hashes_file")
+        if broker is None:
+            raise RuntimeError("missing_github_broker_files")
+    return run_worker_server(
+        cfg["host"],
+        cfg["port"],
+        cfg["db_path"],
+        allowed_token_hashes=worker_hashes,
+        host_worker_token_hashes=host_worker_hashes,
+        broker=broker,
+        health_endpoints=True,
+    )
+
+
+def main() -> None:
     cfg = load_config()
     guard_startup(cfg)
 
-    # Ensure runtime dir exists with safe perms before opening the DB.
-    parent = os.path.dirname(cfg["db_path"]) or "."
-    os.makedirs(parent, exist_ok=True)
+    runtime = Path(cfg["db_path"]).parent
+    runtime.mkdir(parents=True, exist_ok=True)
     try:
-        os.chmod(parent, 0o750)
+        runtime.chmod(0o750)
     except OSError:
         pass
 
-    srv = run_server(cfg)
+    server = run_server(cfg)
     stop = threading.Event()
 
-    def _handle(signum, frame):  # noqa: ANN001
+    def handle_signal(_signum, _frame):
         stop.set()
-        threading.Thread(target=srv.shutdown, daemon=True).start()
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
-    for s in (signal.SIGTERM, signal.SIGINT):
+    for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            signal.signal(s, _handle)
+            signal.signal(sig, handle_signal)
         except (ValueError, AttributeError):
-            pass  # not in main thread / unsupported platform
+            pass
 
-    scheme = "http" if cfg["localhost_test"] else "http(loopback,fronted-by-TLS)"
-    print(f"Hermes Control Plane on {cfg['host']}:{cfg['port']} "
-          f"(db={cfg['db_path']}, mode={scheme})", flush=True)
-    srv.serve_forever()
+    print(
+        f"Hermes Control Plane listening on {cfg['host']}:{cfg['port']}",
+        flush=True,
+    )
+    server.serve_forever()
     print("Hermes Control Plane stopped.", flush=True)
 
 
