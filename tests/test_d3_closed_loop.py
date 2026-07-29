@@ -16,7 +16,7 @@ Asserts the invariants required by the integration spec:
  7. The round-2 label can ONLY be set by the Scheduler.
  8. Round 2 reuses the SAME PR number.
  9. Round 2 produces a NEW commit SHA.
-10. The Merge API is never called by the automation.
+10. The automation exposes no Merge API.
 11. A task recovers after a Worker disconnect (re-claim, same job).
 12. An expired Installation Token is re-minted on demand.
 13. The repo allowlist rejects any non-smoke-test repository.
@@ -247,8 +247,8 @@ class D3ClosedLoopTest(unittest.TestCase):
         self.assertEqual(pr1, pr2)                       # same PR number
         self.assertNotEqual(ev1.commit_sha, ev2.commit_sha)  # new head sha
 
-    # ===================== 10) no merge ever =====================
-    def test_10_no_merge_called(self):
+    # ===================== 10) no merge capability =====================
+    def test_10_merge_capability_absent(self):
         jid, _ = self.cp.create_issue_task(self.repo, 204, {"x": 1},
                                            role="coding_agent")
         orch = D3Orchestrator(self.cp, self.github, self.broker, self.agent,
@@ -256,7 +256,9 @@ class D3ClosedLoopTest(unittest.TestCase):
                               EchoSandboxBackend(), self.repo)
         sig = orch.run_job(jid, self.tokens[0], "implement", ci_status="success")
         self.assertEqual(sig["action"], "await_user")
-        self.assertFalse(self.github.merge_called)  # automation never merges
+        self.assertFalse(hasattr(self.github, "merge_pr"))
+        with self.assertRaises(AttributeError):
+            getattr(self.github, "merge_pr")
 
     # ===================== 11) disconnect recovery =====================
     def test_11_disconnect_recovery(self):
@@ -315,7 +317,9 @@ class D3ClosedLoopTest(unittest.TestCase):
         self.assertEqual(len(self.github.pr_numbers()), 1)
         self.assertTrue(self.github.has_label(pr["number"], ROUND2_LABEL))
         self.assertEqual(len(issued), 2)
-        self.assertFalse(self.github.merge_called)
+        self.assertFalse(hasattr(self.github, "merge_pr"))
+        with self.assertRaises(AttributeError):
+            getattr(self.github, "merge_pr")
         # No token in the DB / event store.
         blob = self._serialize_job_and_events(jid)
         for tok in issued:

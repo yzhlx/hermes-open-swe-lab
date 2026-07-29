@@ -172,7 +172,18 @@ class CodexCliRunner:
         for allowed in CODEX_ENV_ALLOWLIST:
             found = by_upper.get(allowed)
             if found is not None:
-                child[allowed] = found[1]
+                value = str(found[1])
+                upper_value = value.upper()
+                if (
+                    redact(value) != value
+                    or "-----BEGIN " in upper_value
+                    and "PRIVATE KEY-----" in upper_value
+                ):
+                    raise ValueError(
+                        "credential-like content forbidden in Codex "
+                        f"environment: {allowed}"
+                    )
+                child[allowed] = value
         # Defense in depth if the allowlist changes later.
         for key in list(child):
             upper = key.upper()
@@ -311,13 +322,18 @@ class CodexCliRunner:
                 final_message_path, child_env
             )
             wsl_command = (
-                'export PATH="$HOME/.local/bin:$HOME/bin:$PATH"; '
+                'codex_home="$HOME/.codex"; '
+                'clean_path="$HOME/.local/bin:$HOME/bin:/snap/bin:'
+                '/usr/local/bin:/usr/bin:/bin"; '
                 "unset HERMES_GITHUB_APP_ID "
                 "HERMES_GITHUB_INSTALLATION_ID "
                 "HERMES_GITHUB_APP_PRIVATE_KEY_PATH "
                 "HERMES_GIT_INSTALLATION_TOKEN GITHUB_TOKEN GH_TOKEN "
                 "JWT OPENAI_API_KEY ANTHROPIC_API_KEY; "
-                "exec codex --ask-for-approval never exec "
+                'exec env -i HOME="$HOME" USER="${USER:-}" '
+                'PATH="$clean_path" CODEX_HOME="$codex_home" '
+                "NO_COLOR=1 LANG=C.UTF-8 LC_ALL=C.UTF-8 "
+                "codex --ask-for-approval never exec "
                 "--model gpt-5.4 "
                 '--cd "$1" --sandbox workspace-write --ephemeral --json '
                 '--output-last-message "$2" -'

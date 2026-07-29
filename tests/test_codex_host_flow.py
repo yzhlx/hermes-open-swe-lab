@@ -245,6 +245,9 @@ class CodexCliRunnerTests(unittest.TestCase):
                     "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
                     "HERMES_GITHUB_APP_ID": "forbidden",
                     "GITHUB_TOKEN": FAKE_TOKEN,
+                    "AZURE_OPENAI_API_KEY": "forbidden",
+                    "GEMINI_API_KEY": "forbidden",
+                    "COHERE_API_KEY": "forbidden",
                 },
                 tree_terminator=lambda process: process.kill(),
                 artifacts_root=diagnostics,
@@ -266,14 +269,27 @@ class CodexCliRunnerTests(unittest.TestCase):
                     "bash", "-lc", fake.args[6],
                 ],
             )
-            self.assertIn("exec codex --ask-for-approval never exec", fake.args[6])
+            self.assertIn("codex --ask-for-approval never exec", fake.args[6])
             self.assertIn("--model gpt-5.4", fake.args[6])
             self.assertIn("--sandbox workspace-write", fake.args[6])
             self.assertIn("unset HERMES_GITHUB_APP_ID", fake.args[6])
+            self.assertIn("exec env -i", fake.args[6])
+            isolated_exec = fake.args[6].split("exec env -i", 1)[1]
+            for marker in (
+                "HERMES_GITHUB",
+                "GITHUB_TOKEN",
+                "API_KEY",
+                "PRIVATE_KEY",
+                "WEBHOOK_SECRET",
+            ):
+                self.assertNotIn(marker, isolated_exec)
             self.assertTrue(fake.args[-2].startswith("/mnt/"))
             self.assertTrue(fake.args[-1].startswith("/mnt/"))
             self.assertNotIn("HERMES_GITHUB_APP_ID", fake.env)
             self.assertNotIn("GITHUB_TOKEN", fake.env)
+            self.assertNotIn("AZURE_OPENAI_API_KEY", fake.env)
+            self.assertNotIn("GEMINI_API_KEY", fake.env)
+            self.assertNotIn("COHERE_API_KEY", fake.env)
             evidence = json.loads(Path(
                 result.workspace_evidence_path
             ).read_text(encoding="utf-8"))
@@ -586,8 +602,12 @@ class CodexJobRunnerStateTests(unittest.TestCase):
         event_types = [event["event_type"] for event in self.cp.get_events(job_id)]
         self.assertLess(event_types.index("CODEX_RUNNING"),
                         event_types.index("TESTING"))
+        self.assertIn("pr_created", event_types)
         job = self.cp.get_job(job_id)
-        self.assertEqual(job["state"], "PR_CREATED")
+        # PR creation completes only the Host Worker delivery phase.  The
+        # product task remains reviewable/reclaimable for round-2.
+        self.assertEqual(job["state"], "agent_done")
+        self.assertIsNone(job["ended_at"])
         self.assertEqual(job["worker_token_hash"], hash_token(self.token))
         self.assertIsNone(job["lease_expires"])
         evidence = json.dumps({

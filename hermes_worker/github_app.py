@@ -23,10 +23,40 @@ import time
 import urllib.error
 import urllib.request
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 from .constants import ALLOWED_GITHUB_REPOS
 from .constants import HOST_WORKER_ACTIVE_STATES
 from .control_plane import ControlPlane, ControlPlaneError
+
+
+def normalize_repository_identifier(value) -> Optional[str]:
+    """Normalize GitHub owner/repo, URL, and API repository objects."""
+    if isinstance(value, dict):
+        value = value.get("full_name") or value.get("html_url")
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().replace("\\", "/")
+    if not candidate:
+        return None
+    if candidate.lower().startswith("git@github.com:"):
+        candidate = candidate.split(":", 1)[1]
+    elif "://" in candidate:
+        parsed = urlparse(candidate)
+        if parsed.hostname is None or parsed.hostname.lower() not in {
+            "github.com", "www.github.com"
+        }:
+            return None
+        candidate = parsed.path
+    elif candidate.lower().startswith("github.com/"):
+        candidate = candidate[len("github.com/"):]
+    candidate = candidate.strip("/")
+    if candidate.lower().endswith(".git"):
+        candidate = candidate[:-4]
+    parts = candidate.split("/")
+    if len(parts) != 2 or not all(parts):
+        return None
+    return f"{parts[0].lower()}/{parts[1].lower()}"
 
 
 class GitHubAppTokenBroker:
@@ -42,7 +72,16 @@ class GitHubAppTokenBroker:
         self.private_key_pem = private_key_pem
         self._jwt_signer = jwt_signer or self._default_jwt_signer
         self._app_api = app_api
-        self.allowed_repos = set(allowed_repos) if allowed_repos else set(ALLOWED_GITHUB_REPOS)
+        configured_repos = (
+            set(ALLOWED_GITHUB_REPOS)
+            if allowed_repos is None
+            else set(allowed_repos)
+        )
+        self.allowed_repos = {
+            normalized
+            for repo in configured_repos
+            if (normalized := normalize_repository_identifier(repo))
+        }
         self.ttl_seconds = int(ttl_seconds)
         self._clock = clock or time.time
         # RLock: _jwt() may be called while the lock is already held by
@@ -75,9 +114,33 @@ class GitHubAppTokenBroker:
             return tok
 
     # ------------------------------------------------------------------ #
+    # Installation-scope attestation
+    # ------------------------------------------------------------------ #
+    def _attest_installation_scope(self, jwt: str) -> None:
+        if self._app_api is None:
+            raise ControlPlaneError("installation_scope_unverified")
+        try:
+            repositories = self._app_api.list_installation_repositories(
+                jwt=jwt,
+                installation_id=self.installation_id,
+            )
+        except Exception as exc:
+            raise ControlPlaneError("installation_scope_unverified") from exc
+        normalized = {
+            repository
+            for value in repositories or []
+            if (repository := normalize_repository_identifier(value))
+        }
+        if len(normalized) != len(repositories or []):
+            raise ControlPlaneError("installation_scope_denied")
+        if normalized != self.allowed_repos:
+            raise ControlPlaneError("installation_scope_denied")
+
+    # ------------------------------------------------------------------ #
     # Installation Token minting + in-memory cache
     # ------------------------------------------------------------------ #
     def mint_installation_token(self, repo: str, ttl: Optional[int] = None) -> str:
+        repo = normalize_repository_identifier(repo)
         if repo not in self.allowed_repos:
             raise ControlPlaneError("repo_not_allowed")
         if self._app_api is None:
@@ -85,11 +148,12 @@ class GitHubAppTokenBroker:
                 "No app_api configured. Inject a FakeAppApiClient for offline tests.")
         now = self._clock()
         ttl = ttl or self.ttl_seconds
+        jwt = self._jwt()
+        self._attest_installation_scope(jwt)
         with self._lock:
             cached = self._tok_cache.get(repo)
             if cached and cached[1] > now + 30:       # refresh before expiry
                 return cached[0]
-            jwt = self._jwt()
             token = self._app_api.exchange_installation_token(
                 jwt=jwt, installation_id=self.installation_id,
                 repositories=[repo], ttl_seconds=ttl)
@@ -111,7 +175,9 @@ class GitHubAppTokenBroker:
             raise ControlPlaneError("job_not_owned_by_worker")
         if job["state"] not in ("claimed", *HOST_WORKER_ACTIVE_STATES):
             raise ControlPlaneError("job_not_active")
-        repo = job.get("repo") or self._repo_for_job(cp, job_id)
+        repo = normalize_repository_identifier(
+            job.get("repo") or self._repo_for_job(cp, job_id)
+        )
         if not repo or repo not in self.allowed_repos:
             raise ControlPlaneError("repo_not_allowed")
         token = self.mint_installation_token(repo)
@@ -135,7 +201,12 @@ class GitHubAppTokenBroker:
 
 
 class AppApiClient:
-    """Interface the broker uses to exchange a JWT for an Installation Token."""
+    """Interface the broker uses for scope attestation and token exchange."""
+    def list_installation_repositories(
+        self, jwt: str, installation_id: str
+    ) -> list:
+        raise NotImplementedError
+
     def exchange_installation_token(self, jwt: str, installation_id: str,
                                     repositories: list, ttl_seconds: int) -> str:
         raise NotImplementedError
@@ -146,6 +217,55 @@ class RealAppApiClient(AppApiClient):
 
     def __init__(self, api_base: str = "https://api.github.com"):
         self.api_base = api_base.rstrip("/")
+
+    def list_installation_repositories(
+        self, jwt: str, installation_id: str
+    ) -> list:
+        preflight_request = urllib.request.Request(
+            f"{self.api_base}/app/installations/{installation_id}/access_tokens",
+            data=json.dumps({
+                "permissions": {"metadata": "read"},
+            }).encode("utf-8"),
+            method="POST",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": "Bearer " + jwt,
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "hermes-host-worker",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(preflight_request, timeout=45) as response:
+                token = json.loads(response.read().decode("utf-8")).get("token")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"GitHub installation scope preflight failed (HTTP {exc.code})"
+            ) from exc
+        if not token:
+            raise RuntimeError("GitHub installation scope preflight omitted token")
+        scope_request = urllib.request.Request(
+            f"{self.api_base}/installation/repositories?per_page=100",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": "Bearer " + token,
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "hermes-host-worker",
+            },
+        )
+        try:
+            with urllib.request.urlopen(scope_request, timeout=45) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"GitHub installation scope query failed (HTTP {exc.code})"
+            ) from exc
+        finally:
+            token = None
+        repositories = body.get("repositories") or []
+        if int(body.get("total_count", len(repositories))) != len(repositories):
+            raise RuntimeError("GitHub installation scope response incomplete")
+        return repositories
 
     def exchange_installation_token(self, jwt: str, installation_id: str,
                                     repositories: list, ttl_seconds: int) -> str:
@@ -185,14 +305,29 @@ class RealAppApiClient(AppApiClient):
 
 
 class FakeAppApiClient(AppApiClient):
-    """Offline stand-in: no real GitHub, no real key, deterministic fake tokens.
-
-    Records the exchanges (installation id + repos + ttl) for assertions, but the
-    returned token values are clearly fake and never persisted.
-    """
-    def __init__(self, clock: Optional[Callable[[], float]] = None):
+    """Offline stand-in with explicit installation-scope evidence."""
+    def __init__(
+        self,
+        clock: Optional[Callable[[], float]] = None,
+        accessible_repositories: Optional[list] = None,
+    ):
         self.clock = clock or time.time
         self.exchanges: list = []
+        self.scope_checks: list = []
+        self.accessible_repositories = list(
+            accessible_repositories
+            if accessible_repositories is not None
+            else sorted(ALLOWED_GITHUB_REPOS)
+        )
+
+    def list_installation_repositories(
+        self, jwt: str, installation_id: str
+    ) -> list:
+        self.scope_checks.append({
+            "installation_id": installation_id,
+            "jwt_present": bool(jwt),
+        })
+        return list(self.accessible_repositories)
 
     def exchange_installation_token(self, jwt: str, installation_id: str,
                                     repositories: list, ttl_seconds: int) -> str:

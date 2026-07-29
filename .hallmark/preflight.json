@@ -1,0 +1,23 @@
+{
+  "scanned_at": "2026-07-28",
+  "framework": "vanilla-html",
+  "entry_runtime": "python-stdlib-http-server",
+  "font_stack": null,
+  "palette": null,
+  "motion_library": null,
+  "spacing_scale": null,
+  "design_md": null,
+  "preserve": [],
+  "introduce": [
+    "Cobalt OKLCH tokens",
+    "4pt spacing scale",
+    "Workbench macrostructure",
+    "state-complete interactions",
+    "responsive verification"
+  ],
+  "evidence": [
+    "pyproject.toml",
+    "hermes_workbench/operator_api.py",
+    "hermes_workbench/runtime.py"
+  ]
+}

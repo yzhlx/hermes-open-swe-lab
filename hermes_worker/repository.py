@@ -201,6 +201,8 @@ class RepositoryPreparer(_GitHost):
         base_branch: str,
         task_branch: str,
         token: str,
+        *,
+        resume_existing_branch: bool = False,
     ) -> RepositoryPrepareResult:
         destination = Path(destination).resolve()
         commands: list[str] = []
@@ -260,6 +262,9 @@ class RepositoryPreparer(_GitHost):
             helper_path: Optional[Path] = None
             with self._askpass(destination.parent, token) as (git_env, helper):
                 helper_path = helper
+                fetch_ref = (
+                    task_branch if resume_existing_branch else base_branch
+                )
                 if not execute(
                     [
                         "-c",
@@ -270,7 +275,7 @@ class RepositoryPreparer(_GitHost):
                         "--depth",
                         "1",
                         "origin",
-                        base_branch,
+                        fetch_ref,
                     ],
                     git_env,
                 ):
@@ -278,7 +283,10 @@ class RepositoryPreparer(_GitHost):
             askpass_cleaned = helper_path is None or not helper_path.exists()
             token_cleared = TOKEN_ENV not in git_env
 
-            if not execute(["checkout", "-b", task_branch, "FETCH_HEAD"]):
+            checkout_mode = "-B" if resume_existing_branch else "-b"
+            if not execute(
+                ["checkout", checkout_mode, task_branch, "FETCH_HEAD"]
+            ):
                 raise RuntimeError("git_checkout_failed")
             return RepositoryPrepareResult(
                 True,

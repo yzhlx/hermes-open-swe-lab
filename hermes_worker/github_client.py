@@ -5,8 +5,8 @@ orchestrator runs fully offline against :class:`FakeGitHubClient` and, in
 production, against a real client backed by ``gh`` + ``git`` (NOT_TESTED from
 this environment — needs credentials + network + the smoke-test repo).
 
-Hard boundary: the automation NEVER calls merge. :meth:`FakeGitHubClient.merge_pr`
-exists only so the test can assert the orchestrator never invokes it.
+Hard boundary: automation clients expose no merge operation. Merging remains a
+user-only action outside this module.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import json
 import subprocess
 import urllib.error
 import urllib.request
-from typing import Optional
+from typing import Callable, Optional
 
 from .constants import ALLOWED_GITHUB_REPOS
 
@@ -38,11 +38,13 @@ class GitHubClient:
         raise NotImplementedError
     def set_ci_status(self, pr_number: int, status: str) -> None:
         raise NotImplementedError
-    def get_ci_status(self, pr_number: int) -> str:
+    def get_ci_status(
+        self,
+        pr_number: int,
+        expected_head: Optional[str] = None,
+    ) -> str:
         raise NotImplementedError
     def add_label(self, pr_number: int, label: str) -> None:
-        raise NotImplementedError
-    def merge_pr(self, pr_number: int) -> None:
         raise NotImplementedError
 
 
@@ -60,7 +62,6 @@ class FakeGitHubClient(GitHubClient):
         self._ci: dict = {}
         self._labels: dict = {}
         self.allowed = set(ALLOWED_GITHUB_REPOS)
-        self.merge_called = False
 
     def _check_repo(self, full_name: str):
         if full_name not in self.allowed:
@@ -109,7 +110,16 @@ class FakeGitHubClient(GitHubClient):
     def set_ci_status(self, pr_number: int, status: str) -> None:
         self._ci[pr_number] = status
 
-    def get_ci_status(self, pr_number: int) -> str:
+    def get_ci_status(
+        self,
+        pr_number: int,
+        expected_head: Optional[str] = None,
+    ) -> str:
+        if (
+            expected_head is not None
+            and self.prs.get(pr_number, {}).get("head_sha") != expected_head
+        ):
+            return "pending"
         return self._ci.get(pr_number, "pending")
 
     def add_label(self, pr_number: int, label: str) -> None:
@@ -117,11 +127,6 @@ class FakeGitHubClient(GitHubClient):
 
     def has_label(self, pr_number: int, label: str) -> bool:
         return label in self._labels.get(pr_number, set())
-
-    def merge_pr(self, pr_number: int) -> None:
-        # Intentionally present ONLY so the test can assert it is never called.
-        self.merge_called = True
-        raise GitHubClientError("merge_not_permitted_for_automation")
 
     # --- test inspection helpers ---
     def ci_map(self) -> dict:
@@ -162,7 +167,15 @@ class RealGitHubClient(GitHubClient):
             "legacy_pr_create_disabled_use_github_rest_client"
         )
 
-    def get_ci_status(self, pr_number: int) -> str:
+    def get_ci_status(
+        self,
+        pr_number: int,
+        expected_head: Optional[str] = None,
+    ) -> str:
+        if expected_head is not None:
+            raise GitHubClientError(
+                "legacy_ci_head_binding_unsupported"
+            )
         out = subprocess.run(
             [self.gh, "pr", "checks", str(pr_number), "--json", "state"],
             check=True, capture_output=True, text=True)
@@ -181,51 +194,156 @@ class RealGitHubClient(GitHubClient):
         subprocess.run([self.gh, "pr", "edit", str(pr_number), "--add-label", label],
                        check=True, capture_output=True, text=True)
 
-    def merge_pr(self, pr_number: int) -> None:
-        # Never called by the automation. User merges via UI/gh.
-        raise GitHubClientError("merge_not_permitted_for_automation")
 class GitHubRestClient:
-    """Minimal host-side GitHub client for Draft PR creation.
+    """Host-side GitHub REST adapter with ephemeral broker credentials."""
 
-    The Installation Token is accepted only in memory and sent as an HTTP
-    header. It is never placed in a command, URL, Git config, or returned data.
-    """
-
-    def __init__(self, api_base: str = "https://api.github.com"):
+    def __init__(
+        self,
+        api_base: str = "https://api.github.com",
+        *,
+        repo: Optional[str] = None,
+        token_provider: Optional[Callable[[], str]] = None,
+    ):
         self.api_base = api_base.rstrip("/")
+        self.repo = repo
+        self._token_provider = token_provider
+
+    @staticmethod
+    def _headers(token: str) -> dict[str, str]:
+        return {
+            "Accept": "application/vnd.github+json",
+            "Authorization": "Bearer " + token,
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "hermes-host-worker",
+            "Content-Type": "application/json",
+        }
+
+    def _request_json(
+        self,
+        path: str,
+        *,
+        token: str,
+        method: str = "GET",
+        payload: Optional[dict] = None,
+        error_prefix: str,
+    ) -> dict:
+        request = urllib.request.Request(
+            f"{self.api_base}{path}",
+            data=(
+                json.dumps(payload).encode("utf-8")
+                if payload is not None
+                else None
+            ),
+            method=method,
+            headers=self._headers(token),
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            raise GitHubClientError(
+                f"{error_prefix}_http_{exc.code}"
+            ) from exc
+        return json.loads(raw.decode("utf-8")) if raw else {}
+
+    def _scheduler_context(self) -> tuple[str, str]:
+        if self.repo not in ALLOWED_GITHUB_REPOS:
+            raise GitHubClientError("repo_not_allowed")
+        if self._token_provider is None:
+            raise GitHubClientError("github_token_provider_unavailable")
+        token = self._token_provider()
+        if not token:
+            raise GitHubClientError("github_token_unavailable")
+        return self.repo, token
 
     def create_draft_pr(self, repo: str, branch: str, base: str, title: str,
                         body: str, token: str) -> dict:
         if repo not in ALLOWED_GITHUB_REPOS:
             raise GitHubClientError("repo_not_allowed")
-        payload = json.dumps({
-            "title": title,
-            "head": branch,
-            "base": base,
-            "body": body,
-            "draft": True,
-        }).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.api_base}/repos/{repo}/pulls",
-            data=payload,
+        result = self._request_json(
+            f"/repos/{repo}/pulls",
+            token=token,
             method="POST",
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": "Bearer " + token,
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "hermes-host-worker",
-                "Content-Type": "application/json",
+            payload={
+                "title": title,
+                "head": branch,
+                "base": base,
+                "body": body,
+                "draft": True,
             },
+            error_prefix="draft_pr_create_failed",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=45) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise GitHubClientError(
-                f"draft_pr_create_failed_http_{exc.code}"
-            ) from exc
         return {
             "number": result["number"],
             "url": result.get("html_url"),
             "draft": bool(result.get("draft", True)),
         }
+
+    def get_pr(self, pr_number: int) -> dict:
+        repo, token = self._scheduler_context()
+        result = self._request_json(
+            f"/repos/{repo}/pulls/{int(pr_number)}",
+            token=token,
+            error_prefix="pr_read_failed",
+        )
+        head = result.get("head") or {}
+        return {
+            "number": result.get("number", int(pr_number)),
+            "head_sha": head.get("sha"),
+            "draft": bool(result.get("draft", False)),
+            "merged": bool(result.get("merged", False)),
+            "state": result.get("state"),
+        }
+
+    def get_ci_status(
+        self,
+        pr_number: int,
+        expected_head: Optional[str] = None,
+    ) -> str:
+        repo, token = self._scheduler_context()
+        head_sha = expected_head
+        if not head_sha:
+            pr = self._request_json(
+                f"/repos/{repo}/pulls/{int(pr_number)}",
+                token=token,
+                error_prefix="pr_read_failed",
+            )
+            head_sha = (pr.get("head") or {}).get("sha")
+        if not head_sha:
+            return "pending"
+        result = self._request_json(
+            f"/repos/{repo}/commits/{head_sha}/check-runs",
+            token=token,
+            error_prefix="ci_read_failed",
+        )
+        checks = result.get("check_runs") or []
+        if not checks:
+            return "pending"
+        failure_conclusions = {
+            "failure", "cancelled", "timed_out", "action_required",
+            "startup_failure", "stale",
+        }
+        if any(
+            str(check.get("conclusion") or "").lower()
+            in failure_conclusions
+            for check in checks
+        ):
+            return "failure"
+        successful = {"success", "neutral", "skipped"}
+        if all(
+            str(check.get("status") or "").lower() == "completed"
+            and str(check.get("conclusion") or "").lower() in successful
+            for check in checks
+        ):
+            return "success"
+        return "pending"
+
+    def add_label(self, pr_number: int, label: str) -> None:
+        repo, token = self._scheduler_context()
+        self._request_json(
+            f"/repos/{repo}/issues/{int(pr_number)}/labels",
+            token=token,
+            method="POST",
+            payload={"labels": [label]},
+            error_prefix="label_add_failed",
+        )

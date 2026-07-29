@@ -18,6 +18,8 @@ credentials/
 # Session / build artifacts
 # ============================================================
 hermes-eng-auto-architect.zip
+.pi-subagents/
+.playwright-cli/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -33,3 +35,5 @@ runtime/events.db
 runtime/events.db-wal
 runtime/events.db-shm
 runtime/runs/
+runtime/*-CURRENT.*
+runtime/secret_scan_review.json

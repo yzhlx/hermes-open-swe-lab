@@ -12,13 +12,132 @@ lease-ownership checks.
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import time
 import sqlite3
 import functools
 from typing import Optional
 
 from .db import init_db, hash_token
-from .constants import HOST_WORKER_ACTIVE_STATES, HOST_WORKER_TERMINAL_STATES
+from .constants import (
+    HOST_WORKER_ACTIVE_STATES,
+    HOST_WORKER_TERMINAL_STATES,
+    ROLE_SCHEDULER,
+)
+from .redact import redact
+
+
+TRUSTED_EVENT_CHANNELS = {
+    "task_created": "control-room",
+    "pause_requested": "control-room",
+    "paused": "control-room",
+    "resumed": "control-room",
+    "plan_created": "planning",
+    "operator_requirements_added": "planning",
+    "progress": "implementation",
+    "agent_run": "implementation",
+    "review": "review",
+    "head_mismatch": "review",
+    "ci_passed": "qa",
+    "ci_fail": "qa",
+    "pr_created": "release",
+    "draft_pr": "release",
+    "push": "release",
+    "round2_push": "release",
+    "round2_label": "release",
+    "await_user": "user-action-required",
+    "operator_approved": "user-action-required",
+    "operator_rejected": "user-action-required",
+    "escalated": "user-action-required",
+}
+_RESERVED_EVENT_PAYLOAD_KEYS = {
+    "source_type",
+    "source_id",
+    "actor_role",
+    "role",
+    "channel",
+}
+_WORKER_RESERVED_EVENT_TYPES = (
+    set(TRUSTED_EVENT_CHANNELS)
+    - {"plan_created", "progress", "agent_run"}
+    | {"pr_create_started"}
+)
+_PRIVATE_KEY_BLOCK_RE = re.compile(
+    r"-----BEGIN (?P<label>(?:[A-Z0-9]+ )*PRIVATE KEY)-----"
+    r".*?"
+    r"-----END (?P=label)-----",
+    re.DOTALL,
+)
+
+
+def _redact_persisted_value(value):
+    """Recursively scrub credential-shaped text before durable storage."""
+    if isinstance(value, str):
+        clean = redact(value)
+        return _PRIVATE_KEY_BLOCK_RE.sub(
+            "[REDACTED PRIVATE KEY BLOCK]",
+            clean,
+        )
+    if isinstance(value, dict):
+        return {
+            key: _redact_persisted_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_persisted_value(item) for item in value]
+    return value
+
+
+def trusted_event_channel(event_type: str) -> str:
+    if event_type in TRUSTED_EVENT_CHANNELS:
+        return TRUSTED_EVENT_CHANNELS[event_type]
+    if isinstance(event_type, str) and event_type.startswith("ci_"):
+        return "qa"
+    return "control-room"
+
+
+def trusted_event_type(event_type: str) -> bool:
+    return (
+        event_type in TRUSTED_EVENT_CHANNELS
+        or isinstance(event_type, str)
+        and event_type.startswith("ci_")
+    )
+
+
+def is_trusted_scheduler_event(
+    event: dict,
+    event_type: str,
+    actor_role: str,
+) -> bool:
+    """Return whether an event carries server-derived Scheduler provenance."""
+    return (
+        event.get("event_type") == event_type
+        and event.get("source_type") == "scheduler"
+        and event.get("source_id") == ROLE_SCHEDULER
+        and event.get("actor_role") == actor_role
+        and event.get("display_trust") == "trusted"
+    )
+
+
+def _sanitize_event_payload(payload):
+    if not isinstance(payload, dict):
+        return _redact_persisted_value(payload)
+    return _redact_persisted_value({
+        key: value
+        for key, value in payload.items()
+        if key not in _RESERVED_EVENT_PAYLOAD_KEYS
+    })
+
+
+def _request_fingerprint(value) -> str:
+    canonical = json.dumps(
+        _redact_persisted_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ControlPlaneError(Exception):
@@ -122,6 +241,7 @@ class ControlPlane:
     # ---------------- jobs ----------------
     def create_job(self, payload: dict, task_id=None, issue_number=None,
                    pr_number=None, role=None, model=None, repo=None) -> int:
+        payload = _redact_persisted_value(payload)
         cur = self.conn.execute(
             """INSERT INTO jobs(task_id, repo, issue_number, pr_number, state, role, model,
                payload, retries, created_at)
@@ -130,6 +250,87 @@ class ControlPlane:
              json.dumps(payload), 0, self._now()))
         self.conn.commit()
         return cur.lastrowid
+
+    def create_job_idempotent(self, payload: dict, task_id: str,
+                              repo=None, role=None, model=None) -> tuple[int, bool]:
+        """Create one durable job per deterministic task id.
+
+        The SQLite write lock serializes the read-then-insert sequence across
+        HTTP request connections, so request replay does not depend on process
+        memory.
+        """
+        if not task_id:
+            raise ControlPlaneError("task_id_required")
+        payload = _redact_persisted_value(payload)
+        request_fingerprint = _request_fingerprint({
+            "task_id": task_id,
+            "repo": repo,
+            "role": role,
+            "model": model,
+            "payload": payload,
+        })
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM jobs WHERE task_id=? ORDER BY id ASC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row:
+                existing = dict(row)
+                stored_fingerprint = existing.get("request_fingerprint")
+                if not stored_fingerprint:
+                    try:
+                        stored_payload = json.loads(
+                            existing.get("payload") or "{}"
+                        )
+                    except (TypeError, ValueError):
+                        raise ControlPlaneError("idempotency_conflict")
+                    stored_fingerprint = _request_fingerprint({
+                        "task_id": existing.get("task_id"),
+                        "repo": existing.get("repo"),
+                        "role": existing.get("role"),
+                        "model": existing.get("model"),
+                        "payload": stored_payload,
+                    })
+                    self.conn.execute(
+                        "UPDATE jobs SET request_fingerprint=? "
+                        "WHERE id=? AND request_fingerprint IS NULL",
+                        (stored_fingerprint, existing["id"]),
+                    )
+                if stored_fingerprint != request_fingerprint:
+                    raise ControlPlaneError("idempotency_conflict")
+                self.conn.execute("COMMIT")
+                return existing["id"], False
+            cur = self.conn.execute(
+                """INSERT INTO jobs(
+                   task_id, repo, state, role, model, payload,
+                   request_fingerprint, retries, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    task_id,
+                    repo,
+                    "pending",
+                    role,
+                    model,
+                    json.dumps(payload),
+                    request_fingerprint,
+                    0,
+                    self._now(),
+                ),
+            )
+            self.conn.execute("COMMIT")
+            return cur.lastrowid, True
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
+    def get_job_by_task_id(self, task_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM jobs WHERE task_id=? ORDER BY id ASC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def record_delivery(self, delivery_id: str, now=None) -> bool:
         """Record a webhook delivery id.
@@ -176,6 +377,7 @@ class ControlPlane:
         existing = self.get_job_by_issue(repo, issue_number)
         if existing is not None:
             return existing, False
+        payload = _redact_persisted_value(payload)
         try:
             cur = self.conn.execute(
                 """INSERT INTO jobs(repo, issue_number, state, role, model,
@@ -205,10 +407,243 @@ class ControlPlane:
             list(fields.values()) + [job_id])
         self.conn.commit()
 
+    def record_round2_signal(self, job_id: int, pr_number: int) -> None:
+        """Atomically persist the scheduler's round-2 authorization."""
+        event_id = f"round2-label:{job_id}:{pr_number}:2"
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "UPDATE jobs SET round=2 WHERE id=?",
+                (job_id,),
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO events("
+                "job_id, event_type, seq, event_id, ts, payload, "
+                "source_type, source_id, actor_role, channel, display_trust) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    "round2_label",
+                    0,
+                    event_id,
+                    self._now(),
+                    json.dumps({"pr_number": pr_number}),
+                    "scheduler",
+                    "scheduler",
+                    "scheduler",
+                    trusted_event_channel("round2_label"),
+                    "trusted",
+                ),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
     def set_state(self, job_id: int, state: str) -> None:
         """Move a job to an explicit state (agent_done / in_review / await_user / escalated)."""
+        if isinstance(state, str) and state.upper() == "FINAL_ACCEPTANCE":
+            raise ControlPlaneError("final_acceptance_requires_evidence")
         self.conn.execute("UPDATE jobs SET state=? WHERE id=?", (state, job_id))
         self.conn.commit()
+
+    def apply_operator_action(
+        self,
+        job_id: int,
+        action: str,
+        *,
+        request_id: str = None,
+        expected_version: int = None,
+        reason: str = None,
+        requirements=None,
+    ) -> dict:
+        """Apply one durable, versioned operator command.
+
+        Request-id replay is resolved before optimistic-version validation.
+        Forbidden commands never create an event, action record, or job update.
+        """
+        if request_id is None:
+            # Backward-compatible deterministic key for the original pause /
+            # resume contract. New HTTP callers always supply a request id.
+            request_id = f"legacy:{job_id}:{action}"
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ControlPlaneError("request_id_required")
+        request_id = request_id.strip()
+        request_key = "sha256:" + hashlib.sha256(
+            request_id.encode("utf-8")
+        ).hexdigest()
+        display_request_id = _redact_persisted_value(request_id)
+        reason = _redact_persisted_value(reason)
+        requirements = _redact_persisted_value(requirements)
+        request_fingerprint = _request_fingerprint({
+            "action": action,
+            "reason": reason,
+            "requirements": requirements,
+        })
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            replay = self.conn.execute(
+                "SELECT action, request_fingerprint, result "
+                "FROM operator_actions "
+                "WHERE job_id=? AND request_id=?",
+                (job_id, request_key),
+            ).fetchone()
+            if replay:
+                stored_fingerprint = replay["request_fingerprint"]
+                if (
+                    stored_fingerprint
+                    and stored_fingerprint != request_fingerprint
+                ) or (
+                    not stored_fingerprint
+                    and replay["action"] != action
+                ):
+                    raise ControlPlaneError("idempotency_conflict")
+                result = json.loads(replay["result"])
+                self.conn.execute("COMMIT")
+                return result
+
+            if action in {"merge", "auto_merge", "complete"}:
+                raise ControlPlaneError("operator_action_not_allowed")
+            if action not in {
+                "pause", "resume", "supplement", "reject", "approve"
+            }:
+                raise ControlPlaneError("operator_action_not_allowed")
+
+            job = self._get_job(job_id)
+            version = job.get("version") or 0
+            if expected_version is not None and expected_version != version:
+                raise ControlPlaneError("version_conflict")
+
+            current_control = job.get("control_state") or "active"
+            state = job["state"]
+            next_state = state
+            next_control = current_control
+            next_requirements = job.get("requirements")
+            requirements_revision = job.get("requirements_revision") or 0
+            operator_events = []
+
+            if action == "pause":
+                if state != "pending":
+                    raise ControlPlaneError(
+                        "operator_action_requires_pending_job"
+                    )
+                next_control = "paused"
+                if current_control != "paused":
+                    operator_events = ["pause_requested", "paused"]
+            elif action == "resume":
+                if state != "pending":
+                    raise ControlPlaneError(
+                        "operator_action_requires_pending_job"
+                    )
+                next_control = "active"
+                if current_control != "active":
+                    operator_events = ["resumed"]
+            elif action == "supplement":
+                empty_requirements = requirements is None
+                if isinstance(requirements, str):
+                    empty_requirements = not requirements.strip()
+                elif hasattr(requirements, "__len__"):
+                    empty_requirements = len(requirements) == 0
+                if empty_requirements:
+                    raise ControlPlaneError("requirements_required")
+                requirements_revision += 1
+                next_requirements = json.dumps(
+                    requirements, ensure_ascii=False, separators=(",", ":")
+                )
+                operator_events = ["operator_requirements_added"]
+            elif action == "reject":
+                if state not in {"await_user", "ready_for_manual_merge"}:
+                    raise ControlPlaneError("reject_not_allowed_in_state")
+                next_state = "agent_done"
+                operator_events = ["operator_rejected"]
+            elif action == "approve":
+                if state != "await_user":
+                    raise ControlPlaneError("approve_not_allowed_in_state")
+                next_state = "ready_for_manual_merge"
+                operator_events = ["operator_approved"]
+
+            next_version = version + 1
+            self.conn.execute(
+                "UPDATE jobs SET state=?, control_state=?, version=?, "
+                "requirements=?, requirements_revision=? WHERE id=?",
+                (
+                    next_state,
+                    next_control,
+                    next_version,
+                    next_requirements,
+                    requirements_revision,
+                    job_id,
+                ),
+            )
+
+            now = self._now()
+            request_fragment = request_key.removeprefix("sha256:")[:24]
+            event_payload = {
+                "action": action,
+                "request_id": display_request_id,
+                "version": next_version,
+            }
+            if reason is not None:
+                event_payload["reason"] = reason
+            if action == "supplement":
+                event_payload["requirements"] = requirements
+                event_payload["requirements_revision"] = requirements_revision
+            for event_type in operator_events:
+                self.conn.execute(
+                    "INSERT INTO events("
+                    "job_id, event_type, seq, event_id, ts, payload, "
+                    "source_type, source_id, actor_role, channel, display_trust) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        job_id,
+                        event_type,
+                        0,
+                        f"operator:{job_id}:{request_fragment}:{event_type}",
+                        now,
+                        json.dumps(
+                            event_payload,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        "operator",
+                        "human_owner",
+                        "human_owner",
+                        trusted_event_channel(event_type),
+                        "trusted" if trusted_event_type(event_type)
+                        else "unverified",
+                    ),
+                )
+
+            result = {
+                "ok": True,
+                "action": action,
+                "request_id": display_request_id,
+                "state": next_state,
+                "control_state": next_control,
+                "version": next_version,
+                "requirements_revision": requirements_revision,
+            }
+            self.conn.execute(
+                "INSERT INTO operator_actions("
+                "job_id, request_id, action, request_fingerprint, "
+                "result, created_at) VALUES (?,?,?,?,?,?)",
+                (
+                    job_id,
+                    request_key,
+                    action,
+                    request_fingerprint,
+                    json.dumps(result, separators=(",", ":")),
+                    now,
+                ),
+            )
+            self.conn.execute("COMMIT")
+            return result
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
 
     def store_agent_result(self, job_id: int, result: dict) -> None:
         """Record agent output fields without finalizing the job (allows rework).
@@ -221,7 +656,7 @@ class ControlPlane:
                   "command", "commit_sha", "ci_status", "model", "role", "pr_number",
                   "round", "exit_code", "error"):
             if k in result and result[k] is not None:
-                v = result[k]
+                v = _redact_persisted_value(result[k])
                 if k in ("modified_files", "token_usage") and not isinstance(v, str):
                     v = json.dumps(v)
                 upd[k] = v
@@ -289,7 +724,9 @@ class ControlPlane:
         placeholders = ",".join("?" for _ in owned_states)
         cur = self.conn.execute(
             f"SELECT id FROM jobs WHERE state IN ({placeholders}) "
-            "AND worker_token_hash=? LIMIT 1", (*owned_states, h))
+            "AND worker_token_hash=? "
+            "AND COALESCE(control_state, 'active')='active' LIMIT 1",
+            (*owned_states, h))
         row = cur.fetchone()
         if row:
             job = self._get_job(row["id"])
@@ -308,7 +745,8 @@ class ControlPlane:
         cur = self.conn.execute(
             """UPDATE jobs SET state='running', worker_token_hash=?, lease_expires=?, started_at=?
                WHERE id = (SELECT id FROM jobs WHERE state IN ('pending','agent_done')
-                           ORDER BY created_at ASC LIMIT 1)
+                            AND COALESCE(control_state, 'active')='active'
+                            ORDER BY created_at ASC LIMIT 1)
                RETURNING id""",
             (h, lease, self._now()))
         row = cur.fetchone()
@@ -326,6 +764,8 @@ class ControlPlane:
         h = self._check_token(token)
         self.reap_expired_leases()
         job = self._get_job(job_id)
+        if (job.get("control_state") or "active") != "active":
+            raise ControlPlaneError("job_paused")
         if job["worker_token_hash"] == h and job["state"] in (
             "claimed", "agent_done", *HOST_WORKER_ACTIVE_STATES
         ):
@@ -359,29 +799,87 @@ class ControlPlane:
         job = self._get_job(job_id)
         if job["worker_token_hash"] != h:
             raise ControlPlaneError("job_not_owned_by_worker")
+        worker = self.conn.execute(
+            "SELECT worker_id FROM workers WHERE token_hash=?",
+            (h,),
+        ).fetchone()
+        if not worker:
+            raise ControlPlaneError("unknown_worker_token")
+        worker_id = worker["worker_id"]
+        actor_role = job.get("role") or "worker"
+        for event in events:
+            event_type = event.get("type")
+            if (
+                event_type in _WORKER_RESERVED_EVENT_TYPES
+                or isinstance(event_type, str)
+                and event_type.startswith("ci_")
+            ):
+                raise ControlPlaneError("worker_event_type_forbidden")
         seq = 0
         accepted = 0
-        for ev in events:
-            etype = ev.get("type")
-            eid = ev.get("id")
-            payload = json.dumps(ev.get("payload", {}))
-            try:
-                if eid:
-                    self.conn.execute(
-                        "INSERT INTO events(job_id, event_type, seq, event_id, ts, payload) "
-                        "VALUES (?,?,?,?,?,?)",
-                        (job_id, etype, seq, eid, self._now(), payload))
-                else:
-                    self.conn.execute(
-                        "INSERT INTO events(job_id, event_type, seq, ts, payload) "
-                        "VALUES (?,?,?,?,?)",
-                        (job_id, etype, seq, self._now(), payload))
-                accepted += 1
-            except sqlite3.IntegrityError:
-                pass  # duplicate event_id -> idempotent no-op
-            seq += 1
-        self.conn.commit()
-        return {"ok": True, "accepted": accepted}
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for ev in events:
+                etype = ev.get("type")
+                eid = ev.get("id")
+                payload = json.dumps(
+                    _sanitize_event_payload(ev.get("payload", {}))
+                )
+                channel = trusted_event_channel(etype)
+                display_trust = (
+                    "trusted" if trusted_event_type(etype)
+                    else "unverified"
+                )
+                try:
+                    if eid:
+                        self.conn.execute(
+                            "INSERT INTO events("
+                            "job_id, event_type, seq, event_id, ts, payload, "
+                            "source_type, source_id, actor_role, channel, "
+                            "display_trust) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                job_id,
+                                etype,
+                                seq,
+                                eid,
+                                self._now(),
+                                payload,
+                                "worker",
+                                worker_id,
+                                actor_role,
+                                channel,
+                                display_trust,
+                            ),
+                        )
+                    else:
+                        self.conn.execute(
+                            "INSERT INTO events("
+                            "job_id, event_type, seq, ts, payload, source_type, "
+                            "source_id, actor_role, channel, display_trust) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                job_id,
+                                etype,
+                                seq,
+                                self._now(),
+                                payload,
+                                "worker",
+                                worker_id,
+                                actor_role,
+                                channel,
+                                display_trust,
+                            ),
+                        )
+                    accepted += 1
+                except sqlite3.IntegrityError:
+                    pass  # duplicate event_id -> idempotent no-op
+                seq += 1
+            self.conn.execute("COMMIT")
+            return {"ok": True, "accepted": accepted}
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
 
     def append_event(self, job_id: int, event: dict) -> None:
         """Internal event append (no worker-auth) for routing follow-ups.
@@ -393,12 +891,32 @@ class ControlPlane:
         job = self._get_job(job_id)
         etype = event.get("type")
         eid = event.get("id")
-        payload = json.dumps(event.get("payload", {}))
+        payload = json.dumps(
+            _sanitize_event_payload(event.get("payload", {}))
+        )
+        source_type = event.get("source_type") or "legacy"
+        if source_type == "legacy":
+            source_id = "unverified"
+            actor_role = None
+        elif source_type == "operator":
+            source_id = "human_owner"
+            actor_role = "human_owner"
+        else:
+            source_id = event.get("source_id") or "unverified"
+            actor_role = event.get("actor_role")
+        channel = trusted_event_channel(etype)
+        display_trust = (
+            "trusted"
+            if source_type != "legacy" and trusted_event_type(etype)
+            else "unverified"
+        )
         try:
             self.conn.execute(
-                "INSERT INTO events(job_id, event_type, seq, event_id, ts, payload) "
-                "VALUES (?,?,?,?,?,?)",
-                (job_id, etype, 0, eid, self._now(), payload))
+                "INSERT INTO events(job_id, event_type, seq, event_id, ts, payload, "
+                "source_type, source_id, actor_role, channel, display_trust) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, etype, 0, eid, self._now(), payload,
+                 source_type, source_id, actor_role, channel, display_trust))
         except sqlite3.IntegrityError:
             pass  # duplicate follow-up id -> idempotent no-op
         self.conn.commit()
@@ -417,8 +935,15 @@ class ControlPlane:
         ]
         params = [final_state, self._now()]
         for key, value in updates.items():
+            clean_value = _redact_persisted_value(value)
+            if isinstance(clean_value, (dict, list, tuple)):
+                clean_value = json.dumps(
+                    clean_value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
             assignments.append(f"{key}=?")
-            params.append(value)
+            params.append(clean_value)
         params.append(job_id)
         self.conn.execute(
             f"UPDATE jobs SET {', '.join(assignments)} WHERE id=?", params)
@@ -477,6 +1002,51 @@ class ControlPlane:
             "SELECT * FROM events WHERE job_id=? ORDER BY seq ASC, id ASC", (jid,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_events_after(self, job_id: int, after_id: int, limit: int) -> list:
+        """Return an event cursor page ordered by the durable event row id."""
+        if limit <= 0:
+            return []
+        rows = self.conn.execute(
+            "SELECT * FROM events WHERE job_id=? AND id>? "
+            "ORDER BY id ASC LIMIT ?",
+            (job_id, after_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_task_projection(self, job_id: int,
+                            heartbeat_stale_after: float) -> dict:
+        """Project workflow, operator control, and live connection separately."""
+        job = self._get_job(job_id)
+        last_heartbeat = None
+        connection_state = "agent_not_started"
+        worker_hash = job.get("worker_token_hash")
+        if worker_hash:
+            row = self.conn.execute(
+                "SELECT last_heartbeat FROM workers WHERE token_hash=?",
+                (worker_hash,),
+            ).fetchone()
+            last_heartbeat = row["last_heartbeat"] if row else None
+            if last_heartbeat is None:
+                connection_state = "disconnected"
+            elif self._now() - last_heartbeat > heartbeat_stale_after:
+                connection_state = "disconnected"
+            else:
+                connection_state = "online"
+        elif job["state"] != "pending":
+            connection_state = "disconnected"
+
+        return {
+            "state": job["state"],
+            "control_state": job.get("control_state") or "active",
+            "version": int(job.get("version") or 0),
+            "requirements_revision": int(
+                job.get("requirements_revision") or 0
+            ),
+            "connection_state": connection_state,
+            "is_cached": False,
+            "last_heartbeat_at": last_heartbeat,
+        }
 
     def list_jobs(self, state: Optional[str] = None) -> list:
         if state:
