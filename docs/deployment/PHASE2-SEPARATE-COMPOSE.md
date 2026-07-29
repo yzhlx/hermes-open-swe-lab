@@ -32,7 +32,7 @@ This document describes the local artifacts for a future isolated Hermes Open SW
 The cloud container:
 
 - runs as UID/GID `10001:10001`;
-- publishes only `127.0.0.1:18080:8080`;
+- binds container port 8080 to `0.0.0.0` only when explicit `HERMES_CONTAINER_MODE=1` is set, while Compose publishes the host side only at `127.0.0.1:18080`;
 - is not privileged;
 - drops all Linux capabilities;
 - enables `no-new-privileges`;

@@ -15,6 +15,9 @@ def test_phase2_compose_isolated_loopback_and_bounded():
     lowered = text.lower()
 
     assert "127.0.0.1:18080:8080" in text
+    assert "HERMES_LISTEN_HOST: 0.0.0.0" in text
+    assert 'HERMES_CONTAINER_MODE: "1"' in text
+    assert "0.0.0.0:18080" not in text
     assert "/var/lib/hermes-open-swe-lab-phase2:/data" in text
     assert "restart: \"no\"" in text or "restart: 'no'" in text
     assert "read_only: true" in lowered
@@ -27,7 +30,7 @@ def test_phase2_compose_isolated_loopback_and_bounded():
 
     assert "/opt/hermes-cloud" not in text
     assert "docker.sock" not in lowered
-    assert "0.0.0.0" not in text
+    assert "0.0.0.0:18080" not in text
     assert "sanbox_type" not in lowered
     assert "sandbox_type" not in lowered
     assert "provider_api_key" not in lowered

@@ -21,9 +21,10 @@ services:
       HERMES_DB_PATH: /data/events.db
       HERMES_RUNTIME_DIR: /data
       HERMES_LOG_DIR: /data/logs
-      HERMES_LISTEN_HOST: 127.0.0.1
+      HERMES_LISTEN_HOST: 0.0.0.0
       HERMES_LISTEN_PORT: "8080"
       HERMES_LOCALHOST_TEST: "0"
+      HERMES_CONTAINER_MODE: "1"
       HERMES_WORKER_TOKEN_HASHES_FILE: /run/secrets/worker_token_hashes
       HERMES_HOST_WORKER_TOKEN_HASHES_FILE: /run/secrets/host_worker_token_hashes
       HERMES_GITHUB_APP_ID_FILE: /run/secrets/github_app_id

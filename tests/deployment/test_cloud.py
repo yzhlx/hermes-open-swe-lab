@@ -154,6 +154,24 @@ def test_production_host_worker_hashes_must_be_allowlisted_subset(
         cpa.run_server(cfg)
 
 
+def test_app_allows_wildcard_only_inside_explicit_container_mode(monkeypatch):
+    monkeypatch.setattr(cpa.os, "geteuid", lambda: 1, raising=False)
+    safe_container = {
+        "host": "0.0.0.0",
+        "port": 8080,
+        "container_mode": True,
+    }
+    cpa.guard_startup(safe_container)
+
+    for cfg in (
+        {"host": "0.0.0.0", "port": 8080, "container_mode": False},
+        {"host": "192.0.2.10", "port": 8080, "container_mode": True},
+    ):
+        with __import__("pytest").raises(SystemExit) as error:
+            cpa.guard_startup(cfg)
+        assert error.value.code == 3
+
+
 # --------------------------------------------------------------------------
 # Health + restart (real subprocess)
 # --------------------------------------------------------------------------

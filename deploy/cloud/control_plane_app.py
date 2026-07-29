@@ -29,6 +29,7 @@ def load_config() -> dict:
         "host": _env("HERMES_LISTEN_HOST", "127.0.0.1"),
         "port": int(_env("HERMES_LISTEN_PORT", "8080")),
         "localhost_test": _env("HERMES_LOCALHOST_TEST", "0") == "1",
+        "container_mode": _env("HERMES_CONTAINER_MODE", "0") == "1",
         "log_dir": _env("HERMES_LOG_DIR", "logs"),
         "worker_hashes_file": _env("HERMES_WORKER_TOKEN_HASHES_FILE"),
         "host_worker_hashes_file": _env(
@@ -54,9 +55,12 @@ def guard_startup(cfg: dict) -> None:
             raise SystemExit(2)
     except AttributeError:
         pass
-    if cfg["host"] not in LOOPBACK_HOSTS:
+    container_mode = bool(cfg.get("container_mode", False))
+    if cfg["host"] not in LOOPBACK_HOSTS and not (
+        container_mode and cfg["host"] == "0.0.0.0"
+    ):
         print(
-            "SECURITY: refusing to bind a non-loopback host",
+            "SECURITY: refusing unsafe listen host",
             file=sys.stderr,
         )
         raise SystemExit(3)
