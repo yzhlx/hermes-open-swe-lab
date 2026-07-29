@@ -44,6 +44,15 @@ def test_phase2_dockerfile_runs_non_root_minimal_control_plane():
         text,
         re.MULTILINE,
     )
+    normalized = " ".join(text.split())
+    assert (
+        'pip install --no-cache-dir "PyJWT[crypto]==2.10.1"'
+        in normalized
+    )
+    assert (
+        'pip install --no-cache-dir "PyJWT[crypto]==2.10.1" .'
+        not in normalized
+    )
     assert "user 10001:10001" in lowered
     assert "python" in lowered
     assert "-m" in lowered
