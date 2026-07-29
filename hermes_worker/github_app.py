@@ -277,6 +277,8 @@ class RealAppApiClient(AppApiClient):
                 "contents": "write",
                 "metadata": "read",
                 "pull_requests": "write",
+                "checks": "read",
+                "issues": "write",
             },
         }).encode("utf-8")
         request = urllib.request.Request(

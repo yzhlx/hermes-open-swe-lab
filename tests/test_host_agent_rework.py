@@ -19,7 +19,11 @@ from hermes_worker.host_agent_job_runner import (
 from hermes_worker.control_plane import ControlPlane, ControlPlaneError
 from hermes_worker.db import hash_token
 from hermes_worker.docker_sandbox import DockerTestResult
-from hermes_worker.github_app import FakeAppApiClient, GitHubAppTokenBroker
+from hermes_worker.github_app import (
+    FakeAppApiClient,
+    GitHubAppTokenBroker,
+    RealAppApiClient,
+)
 from hermes_worker.github_client import GitHubRestClient
 from hermes_worker.repository import (
     CommandResult,
@@ -1160,6 +1164,41 @@ def test_idempotent_replay_rejects_a_different_registered_worker():
         assert github.pr_calls == 1
         assert len(control_plane.get_events(job_id)) == event_count
         control_plane.conn.close()
+
+
+def test_real_app_exchange_requests_exact_runtime_permissions():
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 45
+        requests.append(request)
+        return JsonResponse({"token": "offline-installation-token"})
+
+    api = RealAppApiClient(api_base="https://api.example.invalid")
+    with mock.patch(
+        "hermes_worker.github_app.urllib.request.urlopen",
+        side_effect=fake_urlopen,
+    ):
+        token = api.exchange_installation_token(
+            jwt="offline-jwt",
+            installation_id="offline-installation",
+            repositories=[REPO],
+            ttl_seconds=3600,
+        )
+
+    assert token == "offline-installation-token"
+    assert len(requests) == 1
+    payload = json.loads(requests[0].data.decode("utf-8"))
+    assert payload == {
+        "repositories": ["hermes-open-swe-smoke-test"],
+        "permissions": {
+            "contents": "write",
+            "metadata": "read",
+            "pull_requests": "write",
+            "checks": "read",
+            "issues": "write",
+        },
+    }
 
 
 def test_app_scope_attestation_accepts_normalized_single_smoke_repo():
