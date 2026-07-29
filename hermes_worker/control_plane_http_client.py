@@ -18,7 +18,7 @@ _HOST_EVENT_TYPES = {"pr_create_started"}
 
 
 class ControlPlaneHttpClient:
-    """Expose the ControlPlane subset required by ``CodexJobRunner``.
+    """Expose the ControlPlane subset required by ``HostAgentJobRunner``.
 
     The worker token is retained in process memory only. Every request carries a
     fresh nonce/timestamp and errors expose only stable error codes, never
@@ -127,11 +127,12 @@ class ControlPlaneHttpClient:
             raise ControlPlaneError("remote_invalid_response")
         return value
 
-    def register(self, name: str = "host-codex-worker", capabilities=None) -> dict:
+    def register(self, name: str = "host-pi-worker", capabilities=None) -> dict:
         return self._post("/worker/register", {
             "name": name,
             "capabilities": capabilities or [
-                "host-codex",
+                "host-pi",
+                "contained-workspace-tools",
                 "docker-sandbox",
                 "draft-pr",
             ],

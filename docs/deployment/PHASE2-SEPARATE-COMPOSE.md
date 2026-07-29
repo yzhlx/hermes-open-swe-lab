@@ -25,7 +25,7 @@ This document describes the local artifacts for a future isolated Hermes Open SW
 - `deploy/cloud/control_plane_app.py`: loopback/non-root adapter using the hardened Worker API handler.
 - `hermes_worker/control_plane_http_client.py`: nonce-protected, value-safe Host Worker HTTP client.
 - `hermes_worker/remote_token_broker.py`: lease-gated Installation Token endpoint adapter.
-- `deploy/worker/codex_worker_runner.py`: dedicated single-job `CodexJobRunner` entry point with no echo/mock/local fallback.
+- `deploy/worker/pi_worker_runner.py`: dedicated single-job `HostAgentJobRunner` entry point using `PiCliRunner`, with no echo/mock/local fallback.
 
 ## Security Contract
 
@@ -39,7 +39,7 @@ The cloud container:
 - uses a read-only root filesystem and bounded tmpfs;
 - is limited to 0.5 CPU, 512 MiB memory, and 128 PIDs;
 - mounts only the separate `/var/lib/hermes-open-swe-lab-phase2` data directory;
-- has no Docker socket, Codex state, Host credential directory, or target repository mount;
+- has no Docker socket, Pi state, Host credential directory, or target repository mount;
 - receives only restricted Secret files under `/run/secrets`;
 - does not receive Provider credentials.
 
@@ -50,8 +50,11 @@ The local Host Worker:
 - reads the Worker token from a restricted local file;
 - sends a unique nonce and timestamp on every authenticated request;
 - is separately allowlisted for privileged Host job routes by worker-token hash;
-- runs Codex only with workspace-write/ephemeral/stdin boundaries enforced by `CodexCliRunner`;
-- runs target commands only in `HermesDockerSandboxBackend`;
+- runs Pi in JSON/no-session mode with task transport over stdin and explicit Provider/Model/thinking;
+- disables all Pi built-in tools and discovered project/user extensions, skills, prompts, context files, and project trust;
+- exposes only workspace-contained `read`, `write`, `edit`, `ls`, `find`, `grep`, and terminating `submit_result` tools from the trusted extension;
+- gives Pi no bash, Git, GitHub, Docker, network, Worker-token, or Installation-token tool;
+- runs target test commands only in `HermesDockerSandboxBackend`;
 - requests Installation Tokens only for the active lease;
 - performs Host-owned commit, push, and Draft PR creation;
 - has no Merge or Auto-merge capability.
@@ -89,27 +92,33 @@ Dedicated runner dry-run:
 $env:HERMES_CLOUD_URL = "http://127.0.0.1:18080"
 $env:HERMES_LOCALHOST_TEST = "1"
 $env:HERMES_WORKER_TOKEN_FILE = "C:\Windows\Temp\hermes-c1-synthetic-worker-token"
-python -m deploy.worker.codex_worker_runner `
+$env:HERMES_PI_PROVIDER = "not-authorized"
+$env:HERMES_PI_MODEL = "not-authorized"
+$env:HERMES_PI_THINKING = "off"
+$env:HERMES_PI_AGENT_DIR = "C:\Users\user\.pi\agent"
+python -m deploy.worker.pi_worker_runner `
   --job-id 1 `
   --repo yzhlx/hermes-open-swe-smoke-test `
   --base main `
   --task "synthetic dry run" `
-  --delivery-id c1-local-contract `
+  --delivery-id pi-local-contract `
   --test-command "python -m pytest -q" `
   --dry-run
 ```
 
-Expected: JSON reports `runner=CodexJobRunner`, `sandbox=HermesDockerSandboxBackend`, `github_writes=false`, and `cloud_writes=false`. Dry-run must not read the token file or contact cloud/GitHub.
+Expected: JSON reports `runner=HostAgentJobRunner`, `agent=PiCliRunner`, `sandbox=HermesDockerSandboxBackend`, `github_writes=false`, `cloud_writes=false`, and `provider_calls=false`. Dry-run must not read the token file, read Pi credential content, or contact cloud/GitHub/Provider.
 
 ## Test Matrix
 
 ```text
 python -B -m pytest -q -p no:cacheprovider \
   tests/test_control_plane_http_client.py \
-  tests/test_codex_worker_runner.py \
+  tests/test_pi_cli_runner.py \
+  tests/test_pi_worker_runner.py \
   tests/deployment/test_phase2_compose_contract.py
 
-python -B -m pytest -q -p no:cacheprovider tests/test_codex_host_rework.py
+node --test tests/node/pi_workspace_guard.test.mjs
+python -B -m pytest -q -p no:cacheprovider tests/test_host_agent_rework.py
 python -B -m pytest -q -p no:cacheprovider tests/deployment
 python -B -m pytest -q -p no:cacheprovider --ignore=tests/deployment
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/acceptance/run-workbench.ps1

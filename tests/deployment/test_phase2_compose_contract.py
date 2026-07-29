@@ -62,6 +62,8 @@ def test_phase2_dockerfile_runs_non_root_minimal_control_plane():
     assert "deploy.cloud.control_plane_app" in lowered
     assert "healthcheck" in lowered
     assert "/healthz" in lowered
+    assert "copy deploy/cloud ./deploy/cloud" in lowered
+    assert "copy deploy ./deploy" not in lowered
 
     assert "docker" not in "\n".join(
         line for line in lowered.splitlines()
@@ -85,7 +87,7 @@ def test_phase2_build_context_is_allowlisted_and_secret_safe():
         "!README.md",
         "!hermes_worker/**",
         "!hermes_open_swe_relay/**",
-        "!deploy/**",
+        "!deploy/cloud/**",
         "**/.git/**",
         "**/.env.*",
         "**/*.pem",
@@ -98,6 +100,9 @@ def test_phase2_build_context_is_allowlisted_and_secret_safe():
         "CODEX-FINAL-HANDOFF.md",
     ):
         assert required in lines
+
+    assert "!deploy/**" not in lines
+    assert "!deploy/worker/**" not in lines
 
     last_include = max(
         index for index, line in enumerate(lines) if line.startswith("!")

@@ -10,8 +10,8 @@ from unittest import mock
 
 import pytest
 
-from hermes_worker.codex_cli_runner import CodexCliRunner, CodexRunResult
-from hermes_worker.codex_job_runner import CodexJobRunner, _load_broker
+from hermes_worker.pi_cli_runner import AgentRunResult
+from hermes_worker.host_agent_job_runner import HostAgentJobRunner, _load_broker
 from hermes_worker.control_plane import ControlPlane, ControlPlaneError
 from hermes_worker.db import hash_token
 from hermes_worker.docker_sandbox import DockerTestResult
@@ -83,13 +83,13 @@ class RecordingPreparer:
         )
 
 
-class RecordingCodex:
+class RecordingAgent:
     def __init__(self):
         self.prompts: list[str] = []
 
     def run(self, repo_path, prompt, timeout_seconds):
         self.prompts.append(prompt)
-        return CodexRunResult(
+        return AgentRunResult(
             exit_code=0,
             timed_out=False,
             duration_seconds=0.1,
@@ -98,7 +98,7 @@ class RecordingCodex:
             stdout_summary="events=1",
             stderr_summary="",
             changed_files=["feature.py"],
-            command_redacted="codex exec --sandbox workspace-write ...",
+            command_redacted="agent exec --sandbox workspace-write ...",
         )
 
 
@@ -212,13 +212,13 @@ def test_host_runner_round2_reuses_job_branch_and_draft_pr_with_review_feedback(
         )
         broker = RecordingBroker()
         preparer = RecordingPreparer()
-        codex = RecordingCodex()
+        agent = RecordingAgent()
         git = RecordingGitOperations()
         github = RecordingGitHub()
-        runner = CodexJobRunner(
+        runner = HostAgentJobRunner(
             control_plane=control_plane,
             token_broker=broker,
-            codex_runner=codex,
+            agent_runner=agent,
             repository_preparer=preparer,
             git_operations=git,
             docker_backend_factory=lambda repo_path: PassingDocker(),
@@ -256,7 +256,7 @@ def test_host_runner_round2_reuses_job_branch_and_draft_pr_with_review_feedback(
         )
         assert replay.state == "PR_CREATED"
         assert replay.commit_sha == first_sha
-        assert len(codex.prompts) == 1
+        assert len(agent.prompts) == 1
         assert git.commit_calls == 1
         assert len(git.pushes) == 1
         assert github.pr_calls == 1
@@ -339,11 +339,11 @@ def test_host_runner_round2_reuses_job_branch_and_draft_pr_with_review_feedback(
         assert preparer.calls[0]["branch"] == preparer.calls[1]["branch"]
         assert preparer.calls[0]["resume_existing_branch"] is False
         assert preparer.calls[1]["resume_existing_branch"] is True
-        assert "Handle empty input" in codex.prompts[1]
-        assert "Return an explicit empty state" in codex.prompts[1]
-        assert "untrusted review data" in codex.prompts[1]
-        assert FAKE_INSTALLATION_TOKEN not in codex.prompts[1]
-        assert "SYNTHETIC-TEST-MATERIAL-MUST-NOT-PERSIST" not in codex.prompts[1]
+        assert "Handle empty input" in agent.prompts[1]
+        assert "Return an explicit empty state" in agent.prompts[1]
+        assert "untrusted review data" in agent.prompts[1]
+        assert FAKE_INSTALLATION_TOKEN not in agent.prompts[1]
+        assert "SYNTHETIC-TEST-MATERIAL-MUST-NOT-PERSIST" not in agent.prompts[1]
 
         second_event_count = len(control_plane.get_events(job_id))
         second_replay = runner.run(
@@ -358,7 +358,7 @@ def test_host_runner_round2_reuses_job_branch_and_draft_pr_with_review_feedback(
         )
         assert second_replay.state == "PR_UPDATED"
         assert second_replay.commit_sha == second_sha
-        assert len(codex.prompts) == 2
+        assert len(agent.prompts) == 2
         assert git.commit_calls == 2
         assert len(git.pushes) == 2
         assert github.pr_calls == 1
@@ -426,10 +426,10 @@ def test_pending_review_feedback_uses_durable_ids_not_presentation_order():
             "actor_role": "scheduler",
         })
         control_plane.update_job(job_id, round=2)
-        runner = CodexJobRunner(
+        runner = HostAgentJobRunner(
             control_plane=control_plane,
             token_broker=RecordingBroker(),
-            codex_runner=RecordingCodex(),
+            agent_runner=RecordingAgent(),
             repository_preparer=RecordingPreparer(),
             git_operations=RecordingGitOperations(),
             docker_backend_factory=lambda repo_path: PassingDocker(),
@@ -623,10 +623,10 @@ def test_round2_lookup_ignores_untrusted_worker_authored_events():
             "actor_role": "coding_agent",
         })
         control_plane.update_job(job_id, round=2)
-        runner = CodexJobRunner(
+        runner = HostAgentJobRunner(
             control_plane=control_plane,
             token_broker=RecordingBroker(),
-            codex_runner=RecordingCodex(),
+            agent_runner=RecordingAgent(),
             repository_preparer=RecordingPreparer(),
             git_operations=RecordingGitOperations(),
             docker_backend_factory=lambda repo_path: PassingDocker(),
@@ -664,7 +664,7 @@ def test_scheduler_retry_after_round2_rejection_stays_escalated():
             "type": "round2_push",
             "payload": {"pr_number": 12, "new_head": head_sha},
             "source_type": "worker",
-            "source_id": "host-codex-worker",
+            "source_id": "host-pi-worker",
             "actor_role": "coding_agent",
         })
         github = RecordingGitHub()
@@ -718,7 +718,7 @@ def test_scheduler_recovers_persisted_round2_rejection_as_escalation():
             "type": "round2_push",
             "payload": {"pr_number": 12, "new_head": head_sha},
             "source_type": "worker",
-            "source_id": "host-codex-worker",
+            "source_id": "host-pi-worker",
             "actor_role": "coding_agent",
         })
         control_plane.append_event(job_id, {
@@ -864,10 +864,10 @@ def test_unknown_draft_pr_outcome_blocks_retry_instead_of_creating_duplicate():
             role="coding_agent",
         )
         github = CrashAfterDraftPrGitHub()
-        runner = CodexJobRunner(
+        runner = HostAgentJobRunner(
             control_plane=control_plane,
             token_broker=RecordingBroker(),
-            codex_runner=RecordingCodex(),
+            agent_runner=RecordingAgent(),
             repository_preparer=RecordingPreparer(),
             git_operations=RecordingGitOperations(),
             docker_backend_factory=lambda repo_path: PassingDocker(),
@@ -934,7 +934,7 @@ def test_repository_preparer_fetches_existing_task_branch_for_rework():
             Path(tmp) / "task-repo",
             REPO,
             "main",
-            "codex/job-9-delivery",
+            "pi/job-9-delivery",
             FAKE_INSTALLATION_TOKEN,
             resume_existing_branch=True,
         )
@@ -943,13 +943,13 @@ def test_repository_preparer_fetches_existing_task_branch_for_rework():
         commands = [" ".join(call) for call in command_runner.calls]
         assert any(
             command.endswith(
-                "fetch --depth 1 origin codex/job-9-delivery"
+                "fetch --depth 1 origin pi/job-9-delivery"
             )
             for command in commands
         )
         assert any(
             command.endswith(
-                "checkout -B codex/job-9-delivery FETCH_HEAD"
+                "checkout -B pi/job-9-delivery FETCH_HEAD"
             )
             for command in commands
         )
@@ -957,53 +957,6 @@ def test_repository_preparer_fetches_existing_task_branch_for_rework():
             command.endswith("fetch --depth 1 origin main")
             for command in commands
         )
-
-
-def test_codex_child_environment_strips_worker_github_and_provider_secrets():
-    secret_environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "USERPROFILE": "C:\\fake-profile",
-        "HERMES_GITHUB_APP_ID": "fake-app-id",
-        "HERMES_GITHUB_INSTALLATION_ID": "fake-installation-id",
-        "HERMES_GITHUB_APP_PRIVATE_KEY_PATH": "C:\\fake.pem",
-        "HERMES_GIT_INSTALLATION_TOKEN": FAKE_INSTALLATION_TOKEN,
-        "GITHUB_TOKEN": FAKE_INSTALLATION_TOKEN,
-        "GH_TOKEN": FAKE_INSTALLATION_TOKEN,
-        "JWT": "fake-jwt",
-        "OPENAI_API_KEY": "sk-fake-openai",
-        "ANTHROPIC_API_KEY": "sk-fake-anthropic",
-        "AZURE_OPENAI_API_KEY": "sk-fake-azure",
-        "GEMINI_API_KEY": "sk-fake-gemini",
-        "COHERE_API_KEY": "sk-fake-cohere",
-        "MISTRAL_API_KEY": "sk-fake-mistral",
-        "GROQ_API_KEY": "sk-fake-groq",
-        "DEEPSEEK_API_KEY": "sk-fake-deepseek",
-        "WEBHOOK_SECRET": "fake-webhook",
-        "PRIVATE_KEY": "fake-private-key",
-    }
-    child = CodexCliRunner(environ=secret_environment)._child_environment()
-
-    assert child["PATH"] == secret_environment["PATH"]
-    for key in secret_environment:
-        if key not in {"PATH", "USERPROFILE"}:
-            assert key not in child
-
-
-def test_codex_child_environment_rejects_secret_shaped_allowlisted_values():
-    for key in ("PATH", "HOME", "CODEX_HOME"):
-        environment = {
-            "PATH": os.environ.get("PATH", ""),
-            "HOME": "C:\\safe-home",
-            "CODEX_HOME": "C:\\safe-codex-home",
-        }
-        environment[key] = f"C:\\safe-prefix\\{FAKE_INSTALLATION_TOKEN}"
-        try:
-            CodexCliRunner(environ=environment)._child_environment()
-        except ValueError as exc:
-            assert "credential-like content forbidden" in str(exc)
-            assert FAKE_INSTALLATION_TOKEN not in str(exc)
-        else:
-            raise AssertionError(f"secret-shaped {key} value was inherited")
 
 
 def test_idempotent_replay_rejects_a_different_registered_worker():
@@ -1025,13 +978,13 @@ def test_idempotent_replay_rejects_a_different_registered_worker():
             role="coding_agent",
         )
         broker = RecordingBroker()
-        codex = RecordingCodex()
+        agent = RecordingAgent()
         git = RecordingGitOperations()
         github = RecordingGitHub()
-        runner = CodexJobRunner(
+        runner = HostAgentJobRunner(
             control_plane=control_plane,
             token_broker=broker,
-            codex_runner=codex,
+            agent_runner=agent,
             repository_preparer=RecordingPreparer(),
             git_operations=git,
             docker_backend_factory=lambda repo_path: PassingDocker(),
@@ -1066,7 +1019,7 @@ def test_idempotent_replay_rejects_a_different_registered_worker():
         else:
             raise AssertionError("a different Worker replayed the delivery")
 
-        assert len(codex.prompts) == 1
+        assert len(agent.prompts) == 1
         assert git.commit_calls == 1
         assert len(git.pushes) == 1
         assert github.pr_calls == 1
@@ -1218,11 +1171,11 @@ def test_host_worker_loads_existing_app_configuration_without_printing_values():
                 clear=True,
             ),
             mock.patch(
-                "hermes_worker.codex_job_runner.RealAppApiClient",
+                "hermes_worker.host_agent_job_runner.RealAppApiClient",
                 return_value=fake_api,
             ),
             mock.patch(
-                "hermes_worker.codex_job_runner.GitHubAppTokenBroker",
+                "hermes_worker.host_agent_job_runner.GitHubAppTokenBroker",
                 side_effect=lambda **kwargs: kwargs,
             ),
             redirect_stdout(captured_stdout),

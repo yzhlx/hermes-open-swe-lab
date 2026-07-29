@@ -952,7 +952,7 @@ class ControlPlane:
 
     def finish_state(self, token: str, job_id: int, state: str,
                      result: dict = None, error: str = None) -> dict:
-        """Finish a Host Codex job in an explicit terminal state and release its lease."""
+        """Finish a Host Agent job in an explicit terminal state and release its lease."""
         if state not in HOST_WORKER_TERMINAL_STATES:
             raise ControlPlaneError("invalid_terminal_state")
         updates = {}

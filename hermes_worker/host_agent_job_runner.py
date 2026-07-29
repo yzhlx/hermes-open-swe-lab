@@ -1,19 +1,16 @@
-"""Host Worker orchestration for Codex edits followed by Docker-only tests."""
+"""Host Worker orchestration for Pi Agent edits followed by Docker-only tests."""
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
-import shutil
-import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .codex_cli_runner import CodexCliRunner
+from .pi_cli_runner import PiCliRunner
 from .constants import (
     ALLOWED_GITHUB_REPOS,
     ROLE_CODING_AGENT,
@@ -25,15 +22,13 @@ from .control_plane import (
     ControlPlaneError,
     is_trusted_scheduler_event,
 )
-from .docker_sandbox import HermesDockerSandboxBackend
 from .github_app import GitHubAppTokenBroker, RealAppApiClient
-from .github_client import GitHubRestClient
 from .redact import redact
 from .repository import HostGitOperations, RepositoryPreparer
 
 
 @dataclass(frozen=True)
-class CodexJobResult:
+class HostAgentJobResult:
     state: str
     job_id: int
     repo_path: Optional[str] = None
@@ -64,7 +59,7 @@ def _redact_untrusted_text(value: str) -> str:
     )
 
 
-class CodexJobRunner:
+class HostAgentJobRunner:
     """Execute one already-created Job without creating duplicate GitHub objects."""
 
     def __init__(
@@ -72,7 +67,7 @@ class CodexJobRunner:
         *,
         control_plane: ControlPlane,
         token_broker,
-        codex_runner: CodexCliRunner,
+        agent_runner: PiCliRunner,
         repository_preparer: RepositoryPreparer,
         git_operations: HostGitOperations,
         docker_backend_factory: Callable,
@@ -82,7 +77,7 @@ class CodexJobRunner:
     ):
         self.cp = control_plane
         self.broker = token_broker
-        self.codex = codex_runner
+        self.agent = agent_runner
         self.preparer = repository_preparer
         self.git = git_operations
         self.docker_backend_factory = docker_backend_factory
@@ -115,7 +110,7 @@ class CodexJobRunner:
         commit_sha: Optional[str] = None,
         pr_number: Optional[int] = None,
         pr_url: Optional[str] = None,
-    ) -> CodexJobResult:
+    ) -> HostAgentJobResult:
         clean_error = redact(error or "") or None
         self.cp.append_event(job_id, {
             "type": state,
@@ -132,7 +127,7 @@ class CodexJobRunner:
             result=result or {},
             error=clean_error,
         )
-        return CodexJobResult(
+        return HostAgentJobResult(
             state=state,
             job_id=job_id,
             repo_path=str(repo_path) if repo_path else None,
@@ -303,7 +298,7 @@ class CodexJobRunner:
         commit_sha: str,
         pr_number: int,
         pr_url: Optional[str] = None,
-    ) -> CodexJobResult:
+    ) -> HostAgentJobResult:
         """Finish only the Worker phase; keep the product task reviewable.
 
         ``PR_CREATED``/``PR_UPDATED`` are phase results, not terminal product
@@ -320,7 +315,7 @@ class CodexJobRunner:
             "type": event_type,
             "payload": event_payload,
             "source_type": "worker",
-            "source_id": "host-codex-worker",
+            "source_id": "host-pi-worker",
             "actor_role": ROLE_CODING_AGENT,
         }
         if handoff is not None:
@@ -335,7 +330,7 @@ class CodexJobRunner:
             self.cp.append_event(job_id, event)
             self.cp.set_state(job_id, "agent_done")
             self.cp.update_job(job_id, lease_expires=None)
-        return CodexJobResult(
+        return HostAgentJobResult(
             state=result_state,
             job_id=job_id,
             repo_path=str(repo_path),
@@ -352,7 +347,7 @@ class CodexJobRunner:
         task: str,
         test_command: str,
         timeout_seconds: int,
-    ) -> CodexJobResult:
+    ) -> HostAgentJobResult:
         """Run an existing local-fixture Job without GitHub delivery actions."""
         repo_path = Path(repo_path).resolve()
         if not repo_path.is_dir() or not (repo_path / ".git").is_dir():
@@ -368,33 +363,33 @@ class CodexJobRunner:
         keepalive.start()
 
         try:
-            self._transition(job_id, worker_token, "CODEX_RUNNING")
-            codex_result = self.codex.run(
+            self._transition(job_id, worker_token, "AGENT_RUNNING")
+            agent_result = self.agent.run(
                 repo_path, task, timeout_seconds
             )
             self.cp.append_event(job_id, {
-                "type": "codex_result",
+                "type": "agent_result",
                 "payload": {
-                    "exit_code": codex_result.exit_code,
-                    "timed_out": codex_result.timed_out,
-                    "duration_seconds": codex_result.duration_seconds,
-                    "stdout_summary": codex_result.stdout_summary,
-                    "stderr_summary": codex_result.stderr_summary,
-                    "changed_files": codex_result.changed_files,
-                    "command": codex_result.command_redacted,
+                    "exit_code": agent_result.exit_code,
+                    "timed_out": agent_result.timed_out,
+                    "duration_seconds": agent_result.duration_seconds,
+                    "stdout_summary": agent_result.stdout_summary,
+                    "stderr_summary": agent_result.stderr_summary,
+                    "changed_files": agent_result.changed_files,
+                    "command": agent_result.command_redacted,
                 },
             })
-            if codex_result.exit_code != 0:
+            if agent_result.exit_code != 0:
                 return self._finish(
-                    job_id, worker_token, "CODEX_FAILED",
+                    job_id, worker_token, "AGENT_FAILED",
                     repo_path=repo_path,
                     result={
-                        "exit_code": codex_result.exit_code,
-                        "modified_files": codex_result.changed_files,
-                        "command": codex_result.command_redacted,
+                        "exit_code": agent_result.exit_code,
+                        "modified_files": agent_result.changed_files,
+                        "command": agent_result.command_redacted,
                         "role": ROLE_CODING_AGENT,
                     },
-                    error=codex_result.stderr_summary or "codex_failed",
+                    error=agent_result.stderr_summary or "agent_failed",
                 )
 
             changed_files = self.git.changed_files(repo_path)
@@ -404,12 +399,12 @@ class CodexJobRunner:
             })
             if not changed_files:
                 return self._finish(
-                    job_id, worker_token, "CODEX_NO_CHANGES",
+                    job_id, worker_token, "AGENT_NO_CHANGES",
                     repo_path=repo_path,
                     result={
                         "exit_code": 0,
                         "modified_files": [],
-                        "command": codex_result.command_redacted,
+                        "command": agent_result.command_redacted,
                         "role": ROLE_CODING_AGENT,
                     },
                 )
@@ -478,7 +473,7 @@ class CodexJobRunner:
                 },
             })
             self.cp.complete(worker_token, job_id, result)
-            return CodexJobResult(
+            return HostAgentJobResult(
                 state="completed",
                 job_id=job_id,
                 repo_path=str(repo_path),
@@ -503,7 +498,7 @@ class CodexJobRunner:
         delivery_id: str,
         test_command: str,
         timeout_seconds: int,
-    ) -> CodexJobResult:
+    ) -> HostAgentJobResult:
         if repo not in ALLOWED_GITHUB_REPOS:
             raise ControlPlaneError("repo_not_allowed")
         job = self.cp.get_job(job_id)
@@ -536,7 +531,7 @@ class CodexJobRunner:
             if job.get("worker_token_hash") != hash_token(worker_token):
                 raise ControlPlaneError("worker_identity_mismatch")
             self.cp.heartbeat(worker_token)
-            return CodexJobResult(
+            return HostAgentJobResult(
                 state=self._delivered_result_state(events),
                 job_id=job_id,
                 commit_sha=previous_commit_sha,
@@ -569,7 +564,7 @@ class CodexJobRunner:
 
         self.work_root.mkdir(parents=True, exist_ok=True)
         task_branch = (
-            f"codex/job-{job_id}-{_safe_delivery_fragment(delivery_id)}"
+            f"pi/job-{job_id}-{_safe_delivery_fragment(delivery_id)}"
         )
         repo_path = self.work_root / f"job-{job_id}-{uuid.uuid4().hex}"
         stop = threading.Event()
@@ -622,37 +617,37 @@ class CodexJobRunner:
                     error=prepared.stderr_summary or "repository_prepare_failed",
                 )
 
-            self._transition(job_id, worker_token, "CODEX_RUNNING")
+            self._transition(job_id, worker_token, "AGENT_RUNNING")
             effective_task = (
                 self._review_feedback_prompt(task, pending_feedback)
                 if is_rework else task
             )
-            codex_result = self.codex.run(
+            agent_result = self.agent.run(
                 prepared.repo_path, effective_task, timeout_seconds
             )
             self.cp.append_event(job_id, {
-                "type": "codex_result",
+                "type": "agent_result",
                 "payload": {
-                    "exit_code": codex_result.exit_code,
-                    "timed_out": codex_result.timed_out,
-                    "duration_seconds": codex_result.duration_seconds,
-                    "stdout_summary": codex_result.stdout_summary,
-                    "stderr_summary": codex_result.stderr_summary,
-                    "changed_files": codex_result.changed_files,
-                    "command": codex_result.command_redacted,
+                    "exit_code": agent_result.exit_code,
+                    "timed_out": agent_result.timed_out,
+                    "duration_seconds": agent_result.duration_seconds,
+                    "stdout_summary": agent_result.stdout_summary,
+                    "stderr_summary": agent_result.stderr_summary,
+                    "changed_files": agent_result.changed_files,
+                    "command": agent_result.command_redacted,
                 },
             })
-            if codex_result.exit_code != 0:
+            if agent_result.exit_code != 0:
                 return self._finish(
-                    job_id, worker_token, "CODEX_FAILED",
+                    job_id, worker_token, "AGENT_FAILED",
                     repo_path=prepared.repo_path,
                     result={
-                        "exit_code": codex_result.exit_code,
-                        "modified_files": codex_result.changed_files,
-                        "command": codex_result.command_redacted,
+                        "exit_code": agent_result.exit_code,
+                        "modified_files": agent_result.changed_files,
+                        "command": agent_result.command_redacted,
                         "role": ROLE_CODING_AGENT,
                     },
-                    error=codex_result.stderr_summary or "codex_failed",
+                    error=agent_result.stderr_summary or "agent_failed",
                 )
 
             changed_files = self.git.changed_files(prepared.repo_path)
@@ -662,12 +657,12 @@ class CodexJobRunner:
             })
             if not changed_files:
                 return self._finish(
-                    job_id, worker_token, "CODEX_NO_CHANGES",
+                    job_id, worker_token, "AGENT_NO_CHANGES",
                     repo_path=prepared.repo_path,
                     result={
                         "exit_code": 0,
                         "modified_files": [],
-                        "command": codex_result.command_redacted,
+                        "command": agent_result.command_redacted,
                         "role": ROLE_CODING_AGENT,
                     },
                 )
@@ -733,7 +728,7 @@ class CodexJobRunner:
                 commit_message,
             )
             if not committed.created:
-                state = "CODEX_NO_CHANGES" if committed.exit_code == 0 else "BLOCKED"
+                state = "AGENT_NO_CHANGES" if committed.exit_code == 0 else "BLOCKED"
                 return self._finish(
                     job_id, worker_token, state,
                     repo_path=prepared.repo_path,
@@ -820,7 +815,7 @@ class CodexJobRunner:
                         "commit_sha": committed.commit_sha,
                     },
                     "source_type": "worker",
-                    "source_id": "host-codex-worker",
+                    "source_id": "host-pi-worker",
                     "actor_role": ROLE_CODING_AGENT,
                 })
                 pr = self.github.create_draft_pr(
@@ -829,7 +824,7 @@ class CodexJobRunner:
                     base,
                     f"Hermes job {job_id}",
                     (
-                        f"Automated Codex implementation for job {job_id}. "
+                        f"Automated Pi Agent implementation for job {job_id}. "
                         "Tests ran in HermesDockerSandboxBackend. No merge performed."
                     ),
                     pr_token,
@@ -880,18 +875,6 @@ class CodexJobRunner:
             keepalive.join(timeout=2)
 
 
-def _load_worker_token() -> str:
-    direct = os.environ.get("HERMES_WORKER_TOKEN", "").strip()
-    if direct:
-        return direct
-    path = os.environ.get("HERMES_WORKER_TOKEN_FILE", "").strip()
-    if path:
-        return Path(path).read_text(encoding="utf-8").strip()
-    raise RuntimeError(
-        "HERMES_WORKER_TOKEN or HERMES_WORKER_TOKEN_FILE is required"
-    )
-
-
 def _load_broker() -> GitHubAppTokenBroker:
     app_id = os.environ.get("HERMES_GITHUB_APP_ID", "").strip()
     installation_id = os.environ.get(
@@ -915,114 +898,3 @@ def _load_broker() -> GitHubAppTokenBroker:
         private_key_pem=private_key,
         app_api=RealAppApiClient(),
     )
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run one existing Hermes Job through host Codex, Docker tests, "
-            "Host Worker commit/push, and Draft PR creation."
-        )
-    )
-    parser.add_argument("--repo", required=True)
-    parser.add_argument("--base", required=True)
-    parser.add_argument("--task", required=True)
-    parser.add_argument("--job-id", required=True, type=int)
-    parser.add_argument("--delivery-id", required=True)
-    parser.add_argument("--test-command", required=True)
-    parser.add_argument("--codex-binary", default="codex")
-    parser.add_argument("--timeout", type=int, default=1200)
-    parser.add_argument("--db", default=os.environ.get("HERMES_DB_PATH", "runtime/jobs.sqlite"))
-    parser.add_argument("--work-root", default=os.environ.get(
-        "HERMES_TASK_WORK_ROOT",
-        str(Path(tempfile.gettempdir()) / "hermes-task-worktrees"),
-    ))
-    parser.add_argument("--docker-image", default=os.environ.get(
-        "HERMES_DOCKER_IMAGE", "python:3.11-slim"
-    ))
-    parser.add_argument("--dry-run", action="store_true")
-    return parser
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.repo not in ALLOWED_GITHUB_REPOS:
-        print(json.dumps({"ok": False, "error": "repo_not_allowed"}))
-        return 2
-    if args.dry_run:
-        plan = {
-            "ok": True,
-            "dry_run": True,
-            "job_id": args.job_id,
-            "delivery_id": args.delivery_id,
-            "repo": args.repo,
-            "base": args.base,
-            "codex": {
-                "binary_present": bool(shutil.which(args.codex_binary)
-                                       or Path(args.codex_binary).is_file()),
-                "sandbox": "workspace-write",
-                "ephemeral": True,
-                "prompt_transport": "stdin",
-            },
-            "steps": [
-                "claim_existing_job",
-                "git_init_authenticated_fetch",
-                "host_codex_exec",
-                "docker_test",
-                "host_commit",
-                "token_broker_push",
-                "draft_pr",
-            ],
-            "github_writes": False,
-        }
-        print(json.dumps(plan, ensure_ascii=False))
-        return 0
-
-    worker_token = _load_worker_token()
-    cp = ControlPlane(args.db)
-    broker = _load_broker()
-    flow = CodexJobRunner(
-        control_plane=cp,
-        token_broker=broker,
-        codex_runner=CodexCliRunner(args.codex_binary),
-        repository_preparer=RepositoryPreparer(),
-        git_operations=HostGitOperations(),
-        docker_backend_factory=lambda repo_path: HermesDockerSandboxBackend(
-            image=args.docker_image,
-            workdir=str(repo_path),
-            keep_workdir=True,
-        ),
-        github_client=GitHubRestClient(
-            repo=args.repo,
-            token_provider=lambda: broker.get_token_for_job(
-                cp,
-                args.job_id,
-                worker_token,
-            ),
-        ),
-        work_root=Path(args.work_root),
-    )
-    result = flow.run(
-        job_id=args.job_id,
-        worker_token=worker_token,
-        repo=args.repo,
-        base=args.base,
-        task=args.task,
-        delivery_id=args.delivery_id,
-        test_command=args.test_command,
-        timeout_seconds=args.timeout,
-    )
-    print(json.dumps({
-        "state": result.state,
-        "job_id": result.job_id,
-        "repo_path": result.repo_path,
-        "commit_sha": result.commit_sha,
-        "pr_number": result.pr_number,
-        "pr_url": result.pr_url,
-        "error": result.error,
-    }, ensure_ascii=False))
-    return 0 if result.state in {"PR_CREATED", "PR_UPDATED"} else 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

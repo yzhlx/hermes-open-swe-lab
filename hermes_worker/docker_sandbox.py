@@ -20,7 +20,7 @@ Architecture (per ADR-002 and the MVP-0 isolation contract):
 Runtime dependency: only the ``docker`` CLI is required (called as a
 subprocess). No Docker SDK, no LangSmith, no cloud SDK.
 
-GitHub and Codex credentials are forbidden in the container. Repository
+GitHub and coding-Agent credentials are forbidden in the container. Repository
 preparation, commit, push, and Draft PR creation are Host Worker operations;
 this backend executes target dependency/build/test commands only.
 
@@ -296,7 +296,7 @@ class HermesDockerSandboxBackend(SandboxBackend):
     def run_tests(self, command: str, timeout: int = 1200) -> DockerTestResult:
         """Run the target repository test command in a real Docker container.
 
-        The host worktree is the only bind mount. No GitHub/Codex credential is
+        The host worktree is the only bind mount. No GitHub/coding-Agent credential is
         injected. Cleanup and a residual-container query run on every outcome.
         """
         try:

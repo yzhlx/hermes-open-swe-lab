@@ -5,7 +5,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY hermes_worker ./hermes_worker
 COPY hermes_open_swe_relay ./hermes_open_swe_relay
-COPY deploy ./deploy
+COPY deploy/cloud ./deploy/cloud
 
 RUN python -m pip install --no-cache-dir "PyJWT[crypto]==2.10.1" \
     && mkdir -p /data /tmp/runtime \

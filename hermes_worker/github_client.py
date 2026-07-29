@@ -141,7 +141,7 @@ class RealGitHubClient(GitHubClient):
     """Legacy D3 client retained for CI/review compatibility.
 
     Repository preparation, push, and Draft PR creation fail closed here. The
-    host Codex architecture uses ``RepositoryPreparer``, ``HostGitOperations``,
+    Host Agent architecture uses ``RepositoryPreparer``, ``HostGitOperations``,
     and ``GitHubRestClient`` so it cannot fall back to clone or ``gh auth``.
     """
     def __init__(self, gh_bin: str = "gh", git_bin: str = "git",

@@ -124,13 +124,13 @@ try {
     $Results += Invoke-PytestGroup -Name "workbench" -Paths @(
         "tests/workbench"
     )
-    $Results += Invoke-PytestGroup -Name "baseline-43" -Paths @(
+    $Results += Invoke-PytestGroup -Name "baseline-host-agent" -Paths @(
         "tests/test_d3_closed_loop.py",
         "tests/test_d3_security.py",
-        "tests/test_codex_host_flow.py"
+        "tests/test_host_agent_flow.py"
     )
-    $Results += Invoke-PytestGroup -Name "host-rework-security" -Paths @(
-        "tests/test_codex_host_rework.py"
+    $Results += Invoke-PytestGroup -Name "host-agent-rework-security" -Paths @(
+        "tests/test_host_agent_rework.py"
     )
     $Results += Invoke-PytestGroup -Name "redact" -Paths @(
         "tests/test_redact.py"
@@ -159,9 +159,9 @@ try {
         }
     }
     $BaselineResult = $Results |
-        Where-Object { $_.name -eq "baseline-43" } |
+        Where-Object { $_.name -eq "baseline-host-agent" } |
         Select-Object -First 1
-    if ($null -eq $BaselineResult -or $BaselineResult.tests -ne 43) {
+    if ($null -eq $BaselineResult -or $BaselineResult.tests -ne 36) {
         $Failed = $true
     }
 

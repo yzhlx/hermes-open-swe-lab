@@ -105,16 +105,18 @@
 
 - 当前状态已统一记录在第 10 节；本节不再维护重复事实，避免出现相互矛盾的当前态。
 
-## 15. Phase 2 C1 / C2 独立 Compose 状态
+## 15. Phase 2 Pi Agent / C2C / C3 状态
 
-- 状态：`C1_LOCAL_OFFLINE_TEST_PASS / C2_NOT_AUTHORIZED`
-- 当前事实：C1 已实现独立远程 ControlPlane client、专用 Host Codex runner、强化 cloud adapter 与隔离 Compose contract；本地窄测、回归、acceptance、Secret scan 当前全绿。
-- C1 当前：独立 Haiku review 已完成且无 BLOCKING / IMPORTANT finding；仍需 staged Secret/diff 门禁和本地 Commit。Push 继续需要再次确认。
-- C2 仍阻塞：没有精确 C1 Commit SHA 对应的 immutable image tag/digest、tracked-source archive hash、Secret Store path、cloud backup/build/up/rollback 命令和影响窗口授权。
-- 现有云应用：`/opt/hermes-cloud` 及 `hermes-cloud-hermes-cloud-1` 不属于 C1/C2 写入范围，禁止同步、覆盖、build、restart、stop、exec 或读取业务/Secret 内容。
-- Smoke 仍阻塞：未请求 Installation Token，未创建 smoke Issue/branch/PR，未完成真实 CI/Review/rework；不得升级为 `GITHUB_REAL_WRITE_PASS`。
-- 解锁条件：C1 独立 review 无 BLOCKING finding，记录精确 Commit/测试/Secret scan；随后 Human Owner 批准新的 C2 exact-operation request。
-- 禁止替代：不得把 Compose config、dry-run、旧 cloud 容器健康或离线 HTTP 测试升级为云端部署/真实 GitHub/端到端 PASS。
+- 状态：`PI_LOCAL_IMPLEMENTATION_IN_PROGRESS / CLOUD_NOT_DEPLOYED / LIVE_PROVIDER_NOT_AUTHORIZED`
+- 当前事实：C2A local image/synthetic smoke 和 C2B isolated cloud synthetic rehearsal 已 PASS；C2B 已强制 rollback，云端隔离资源零残留，受保护应用 baseline 未变化。
+- Agent supersession：Human Owner 已指示使用 Pi Agent，不再依赖 Codex。contained `PiCliRunner`、provider-neutral `HostAgentJobRunner` 和 dedicated `pi_worker_runner` 已通过本地完整回归、acceptance、Secret scan 与独立 review；legacy Codex state 仅作历史 SQLite/event replay 兼容。
+- Image 阻塞：旧 C2A/C2B image/tar 对应 superseded source Commit `577765e`。新 Dockerfile/context check 已 PASS，但尚未对 Pi migration 最终 Commit build/package 新 immutable image；不得复用旧 tar 进行 C2C。
+- Provider 阻塞：Pi executable/version 已验证，但 Host Worker Provider、Model、thinking 与专用 `PI_CODING_AGENT_DIR` 尚未获得 value-free readiness 和 live-call 授权。不得沿用 parent session model 作为隐式授权。
+- Secret 阻塞：独立 `/etc/hermes-open-swe-lab-phase2/secrets` 尚未由 Human Owner 预置真实五类 file-based inputs；不得读取或复用 `/opt/hermes-cloud` Secret。
+- 现有云应用：`/opt/hermes-cloud`、`/var/lib/hermes-cloud` 与 `hermes-cloud-hermes-cloud-1` 继续禁止 write/build/restart/stop/exec 或读取业务/Secret 内容。
+- Smoke 阻塞：未请求 Installation Token，未创建 smoke Issue/job/branch/PR，未执行真实 Pi Provider call、CI/Review/rework；不得升级为 `GITHUB_REAL_WRITE_PASS` 或 `END_TO_END_VERIFIED`。
+- 解锁条件：本地 Pi migration 完整 tests/Secret scan/independent review/Commit；Human Owner 完成 value-free Secret/Pi auth/model readiness；随后分别批准 C2C persistent deployment、C3 registration-only 和 C4 bounded live smoke。
+- 禁止替代：不得把 offline extension load、dry-run、synthetic cloud rehearsal、parent session model 或历史 Codex evidence升级为真实部署/Provider/GitHub/end-to-end PASS。
 
 ## 阻塞处理规则
 

@@ -95,7 +95,7 @@
 | BLOCKED_SCOPE_PACKAGING | `pyproject.toml` 尚未包含 `hermes_workbench` package。 |
 | BLOCKED_SCOPE | 无 Merge 硬边界仍需同时处理 `hermes_worker/github_client.py` 与旧合同 `tests/test_d3_closed_loop.py`。 |
 | BLOCKED_NO_READ | 真实同一 Job、同一 PR 的 Host 返工测试尚未新增；本批没有获得读取相关生产实现的授权。 |
-| BLOCKED_SCOPE | 同一 PR 返工仍需处理 `hermes_worker/codex_job_runner.py` 与 `hermes_worker/repository.py`，并补齐专用 Host Runner wiring。 |
+| BLOCKED_SCOPE | 当时同一 PR 返工仍需处理旧 Host job runner 与 `hermes_worker/repository.py`，并补齐专用 Host Runner wiring。 |
 | NOT STARTED | `web/**` 已在 UI 白名单内，但 Hallmark/SKILL 读取仍为 `BLOCKED_SKILL_ACCESS`，因此 UI 仍是 `NOT STARTED`；没有网页、截图、Playwright 或视觉验收证据。 |
 
 当前结论：Operator Runtime 与版本化人工动作已有局部绿色证据，但候选整体仍为 `FAIL/BLOCKED`，不是可交付 MVP；GitHub 继续是唯一工程事实源，Merge 继续只能由 Human Owner 手工执行。
@@ -144,8 +144,8 @@
 
 | 状态 | 当前实跑证据 |
 |---|---|
-| OFFLINE_TEST_PASS | 新增 value-safe `ControlPlaneHttpClient`、lease-gated `RemoteTokenBroker` 与专用 `codex_worker_runner`；privileged Host routes 使用独立 worker-token-hash allowlist，普通 Worker 不能调用。 |
-| OFFLINE_TEST_PASS | `CodexJobRunner` 保留本地 SQLite 路径，并可通过能力检测使用远程 transition、线程安全 keepalive 与受信 handoff。 |
+| OFFLINE_TEST_PASS | 当时新增 value-safe `ControlPlaneHttpClient`、lease-gated `RemoteTokenBroker` 与专用 Host runner；privileged Host routes 使用独立 worker-token-hash allowlist，普通 Worker 不能调用。 |
+| OFFLINE_TEST_PASS | 当时 Host job runner 保留本地 SQLite 路径，并可通过能力检测使用远程 transition、线程安全 keepalive 与受信 handoff。 |
 | OFFLINE_TEST_PASS | 新增隔离 `Dockerfile.phase2` / `docker-compose.phase2.yml` contract：独立路径、`127.0.0.1:18080`、非 root、无 privileged/Docker socket/Provider/target-repo mount、restart=no。 |
 | OFFLINE_TEST_PASS | C1 narrow：`14 passed`，Exit `0`。 |
 | OFFLINE_TEST_PASS | Host rework、D1/D3 security、cloud/worker deployment compatibility：`78 passed`，Exit `0`。 |
@@ -159,3 +159,20 @@
 | PASS | Independent Haiku C1 review 完成：无 BLOCKING / IMPORTANT finding；artifact：`.pi-subagents/reviews/phase2-c1-final-haiku-review.md`。此前 Haiku/GPT-5.5 quota 403 失败运行仅保留为历史，不计入最终 review。 |
 | NOT_TESTED | C1 未 build image、未运行新 container、未部署、未请求 Installation Token、未写 smoke repo、未执行 Provider live。 |
 | BLOCKED_C2_AUTHORIZATION | 只有 C1 完成独立 review、Commit SHA、镜像/源包计划和新的 C2 精确授权后，才允许创建独立云端路径/镜像/容器。现有 `/opt/hermes-cloud` 必须保持不变。 |
+
+## 2026-07-29 Phase 2 最新状态：Pi Agent supersession
+
+本节晚于上方 C1 记录，代表当前权威状态。
+
+| 状态 | 当前实跑证据 |
+|---|---|
+| PASS | A3 已将现有 Draft PR #14 fast-forward 到 `577765eb4d79e1ffe404770ab02a0d427d5bbe8d`，PR 保持 OPEN/DRAFT；无 Merge/Ready/Force Push。 |
+| CLOUD_SYNTHETIC_REHEARSAL_PASS | C2B 使用 exact source/image 在隔离云路径完成 synthetic up/health/runtime/SSH-forward 验证并强制 rollback；受保护 `/opt/hermes-cloud` baseline 前中后完全一致，隔离资源零残留。 |
+| LOCAL_IMPLEMENTATION_TESTED | Human Owner 指示以 Pi Agent 替代 Codex。已新增 contained workspace guard/extension、`PiCliRunner`、provider-neutral `HostAgentJobRunner` 与 `pi_worker_runner`；Codex CLI runtime 已从当前代码删除。 |
+| OFFLINE_TEST_PASS | Pi workspace guard Node tests：`5 passed`；Pi/Host focused：`63 passed`；full non-deployment：`217 passed`；deployment：`27 passed`。均无 live Provider call。 |
+| OFFLINE_TEST_PASS | Unified acceptance：Workbench `63`、baseline-host-agent `36`、host-agent-rework-security `26`、redact `10`；全部 PASS，Secret scan `32` candidates、`0` violations/errors。 |
+| PASS | Pi CLI `0.82.1` 存在；contained extension 以 `PI_OFFLINE=1 --list-models` 成功加载；dedicated runner dry-run 报告 `provider_calls=false / github_writes=false / cloud_writes=false`。 |
+| PASS | Independent Haiku full review 与 metadata-only incremental review 均无 BLOCKING / IMPORTANT finding。 |
+| IMAGE_REBUILD_REQUIRED | C2A/C2B 的旧 image/tar 对应 Commit `577765e`，已被 Pi migration source supersede。Dockerfile/context 已收紧为只 COPY `deploy/cloud`；`docker build --check` PASS，但未 build 新 image。 |
+| MODEL_NOT_AUTHORIZED | Parent session 观察值为 `deepkey/gpt-5.6-sol`、reasoning `high`，仅记录事实，不是 Host Worker 模型授权。Host Worker Provider/Model/thinking 必须显式批准。 |
+| CLOUD_NOT_DEPLOYED | C2B 已 rollback；真实 file-based Secrets、持久 Control Plane、Host Pi Worker registration、Installation Token、smoke write 和 end-to-end 仍未执行。 |

@@ -6,7 +6,11 @@ import time
 
 import pytest
 
-from hermes_worker.codex_job_runner import CodexJobRunner
+from hermes_worker.host_agent_job_runner import HostAgentJobRunner
+from hermes_worker.constants import (
+    HOST_WORKER_ACTIVE_STATES,
+    HOST_WORKER_TERMINAL_STATES,
+)
 from hermes_worker.control_plane import ControlPlane, ControlPlaneError
 from hermes_worker.control_plane_http_client import ControlPlaneHttpClient
 from hermes_worker.remote_token_broker import RemoteTokenBroker
@@ -62,6 +66,37 @@ def _client(base_url, token=WORKER_TOKEN, **kwargs):
     )
 
 
+def test_pi_states_are_primary_while_legacy_codex_states_remain_replayable():
+    assert "AGENT_RUNNING" in HOST_WORKER_ACTIVE_STATES
+    assert "AGENT_FAILED" in HOST_WORKER_TERMINAL_STATES
+    assert "AGENT_NO_CHANGES" in HOST_WORKER_TERMINAL_STATES
+    assert "CODEX_RUNNING" in HOST_WORKER_ACTIVE_STATES
+    assert "CODEX_FAILED" in HOST_WORKER_TERMINAL_STATES
+    assert "CODEX_NO_CHANGES" in HOST_WORKER_TERMINAL_STATES
+
+
+def test_default_registration_uses_pi_worker_identity_and_contained_capability():
+    client = _client("http://127.0.0.1:1")
+    captured = {}
+
+    def record(path, body=None):
+        captured["path"] = path
+        captured["body"] = body
+        return {"ok": True}
+
+    client._post = record
+    client.register()
+
+    assert captured["path"] == "/worker/register"
+    assert captured["body"]["name"] == "host-pi-worker"
+    assert captured["body"]["capabilities"] == [
+        "host-pi",
+        "contained-workspace-tools",
+        "docker-sandbox",
+        "draft-pr",
+    ]
+
+
 def test_remote_client_claim_transition_handoff_and_snapshot(tmp_path):
     seed, server, thread, base_url = _start_server(tmp_path)
     try:
@@ -74,7 +109,7 @@ def test_remote_client_claim_transition_handoff_and_snapshot(tmp_path):
             role="coding_agent",
         )
         client = _client(base_url)
-        client.register(name="phase2-codex-worker")
+        client.register(name="phase2-agent-worker")
 
         snapshot = client.get_job(job_id)
         assert snapshot["id"] == job_id
@@ -85,16 +120,16 @@ def test_remote_client_claim_transition_handoff_and_snapshot(tmp_path):
         client.transition_job(
             WORKER_TOKEN,
             job_id,
-            "CODEX_RUNNING",
-            {"phase": "codex"},
+            "AGENT_RUNNING",
+            {"phase": "agent"},
         )
         client.append_event(job_id, {
             "id": "phase2-event-1",
-            "type": "codex_result",
+            "type": "agent_result",
             "payload": {"exit_code": 0},
         })
         assert any(
-            event["event_type"] == "codex_result"
+            event["event_type"] == "agent_result"
             for event in client.get_events(job_id)
         )
 
@@ -129,7 +164,7 @@ def test_replayed_nonce_and_unknown_worker_fail_closed(tmp_path):
         nonce = lambda: "fixed-synthetic-nonce"
         now = int(time.time())
         client = _client(base_url, nonce_factory=nonce, clock=lambda: now)
-        client.register(name="phase2-codex-worker")
+        client.register(name="phase2-agent-worker")
         with pytest.raises(ControlPlaneError, match="replay_detected"):
             client.heartbeat(WORKER_TOKEN)
 
@@ -150,7 +185,7 @@ def test_remote_token_broker_requires_same_client_identity_and_active_lease(tmp_
             role="coding_agent",
         )
         client = _client(base_url)
-        client.register(name="phase2-codex-worker")
+        client.register(name="phase2-agent-worker")
         remote_broker = RemoteTokenBroker(client)
 
         with pytest.raises(ControlPlaneError, match="job_not_owned_by_worker"):
@@ -195,7 +230,7 @@ def test_non_host_worker_cannot_claim_privileged_job(tmp_path):
         _stop(seed, server, thread)
 
 
-def test_codex_job_runner_remote_transition_and_handoff_are_idempotent(tmp_path):
+def test_host_agent_job_runner_remote_transition_and_handoff_are_idempotent(tmp_path):
     seed, server, thread, base_url = _start_server(tmp_path)
     try:
         job_id = seed.create_job(
@@ -204,12 +239,12 @@ def test_codex_job_runner_remote_transition_and_handoff_are_idempotent(tmp_path)
             role="coding_agent",
         )
         client = _client(base_url)
-        client.register(name="phase2-codex-worker")
+        client.register(name="phase2-agent-worker")
         client.claim_job(WORKER_TOKEN, job_id)
-        runner = CodexJobRunner(
+        runner = HostAgentJobRunner(
             control_plane=client,
             token_broker=object(),
-            codex_runner=object(),
+            agent_runner=object(),
             repository_preparer=object(),
             git_operations=object(),
             docker_backend_factory=lambda _path: object(),
@@ -219,7 +254,7 @@ def test_codex_job_runner_remote_transition_and_handoff_are_idempotent(tmp_path)
         runner._transition(
             job_id,
             WORKER_TOKEN,
-            "CODEX_RUNNING",
+            "AGENT_RUNNING",
             {"phase": "remote"},
         )
         for _ in range(2):
@@ -280,7 +315,7 @@ def test_http_client_error_never_echoes_response_secret(monkeypatch):
         WORKER_TOKEN,
     )
     with pytest.raises(ControlPlaneError) as caught:
-        client.register(name="phase2-codex-worker")
+        client.register(name="phase2-agent-worker")
     rendered = str(caught.value)
     assert "synthetic-sensitive-value" not in rendered
     assert "Bearer" not in rendered

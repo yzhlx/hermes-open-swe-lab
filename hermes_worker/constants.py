@@ -26,11 +26,13 @@ ROUND2_LABEL = "round-2"
 # Maximum rework rounds before the loop stops and escalates to the user.
 MAX_ROUNDS = 2
 
-# Host Codex Worker lifecycle. These states retain an active lease until a
-# terminal state is written through ``ControlPlane.finish_state``.
+# Host Agent Worker lifecycle. New runs use AGENT_* names. Legacy CODEX_*
+# states remain accepted only so older SQLite/event evidence can be replayed
+# without corrupting lease or terminal-state handling.
 HOST_WORKER_ACTIVE_STATES = (
     "running",
     "REPOSITORY_PREPARING",
+    "AGENT_RUNNING",
     "CODEX_RUNNING",
     "TESTING",
     "COMMITTING",
@@ -38,6 +40,8 @@ HOST_WORKER_ACTIVE_STATES = (
 )
 
 HOST_WORKER_TERMINAL_STATES = (
+    "AGENT_FAILED",
+    "AGENT_NO_CHANGES",
     "CODEX_FAILED",
     "CODEX_NO_CHANGES",
     "TEST_FAILED",
