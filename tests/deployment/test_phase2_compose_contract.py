@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +39,11 @@ def test_phase2_dockerfile_runs_non_root_minimal_control_plane():
     text = DOCKERFILE.read_text(encoding="utf-8")
     lowered = text.lower()
 
+    assert re.search(
+        r"^FROM python:3\.11-slim@sha256:[0-9a-f]{64}$",
+        text,
+        re.MULTILINE,
+    )
     assert "user 10001:10001" in lowered
     assert "python" in lowered
     assert "-m" in lowered
