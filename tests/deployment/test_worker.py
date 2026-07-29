@@ -37,8 +37,12 @@ def test_token_file_missing():
 
 
 def test_token_file_perm_too_open(monkeypatch):
-    monkeypatch.setattr(wm.os, "stat", lambda p: _FakeStat(0o644))
     monkeypatch.setattr(wm.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(
+        wm,
+        "_token_permissions_restricted",
+        lambda path: False,
+    )
     try:
         wm.load_token("/x/worker_token", strict=True)
         assert False, "group/other-accessible token file must be refused"
@@ -49,9 +53,89 @@ def test_token_file_perm_too_open(monkeypatch):
 def test_token_file_perm_ok(monkeypatch, tmp_path):
     f = tmp_path / "tok"
     f.write_text("secret-token")
-    monkeypatch.setattr(wm.os, "stat", lambda p: _FakeStat(0o600))
+    monkeypatch.setattr(
+        wm,
+        "_token_permissions_restricted",
+        lambda path: True,
+    )
     tok = wm.load_token(str(f), strict=True)
     assert tok == "secret-token"
+
+
+def test_posix_permission_gate_preserves_mode_check(monkeypatch):
+    monkeypatch.setattr(wm.os, "stat", lambda path: _FakeStat(0o644))
+    assert not wm._token_permissions_restricted("/restricted/token", platform="posix")
+    monkeypatch.setattr(wm.os, "stat", lambda path: _FakeStat(0o600))
+    assert wm._token_permissions_restricted("/restricted/token", platform="posix")
+
+
+def test_windows_permission_gate_uses_acl_not_posix_mode(monkeypatch):
+    calls = []
+
+    def acl_check(path):
+        calls.append(path)
+        return True
+
+    monkeypatch.setattr(wm, "_windows_acl_restricted", acl_check)
+    monkeypatch.setattr(
+        wm.os,
+        "stat",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError("Windows strict mode must not inspect POSIX mode bits")
+        ),
+    )
+
+    assert wm._token_permissions_restricted(
+        r"C:\restricted\worker_token",
+        platform="nt",
+    )
+    assert calls == [r"C:\restricted\worker_token"]
+
+
+def test_windows_acl_validator_requires_value_free_pass(monkeypatch):
+    class _Result:
+        returncode = 0
+        stdout = "ACL_OK\n"
+        stderr = ""
+
+    captured = {}
+
+    def run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return _Result()
+
+    monkeypatch.setattr(wm.subprocess, "run", run)
+
+    path = r"C:\restricted\worker_token"
+    assert wm._windows_acl_restricted(path)
+    assert captured["command"][0].lower().endswith(
+        r"\windows\system32\windowspowershell\v1.0\powershell.exe"
+    )
+    assert captured["command"][-1] == wm._WINDOWS_ACL_CHECK
+    assert set(captured["kwargs"]["env"]) == {
+        "SystemRoot",
+        "WINDIR",
+        "HERMES_WORKER_TOKEN_ACL_PATH",
+    }
+    assert captured["kwargs"]["env"]["HERMES_WORKER_TOKEN_ACL_PATH"] == path
+    assert captured["kwargs"]["capture_output"] is True
+    assert captured["kwargs"]["text"] is True
+
+
+def test_windows_acl_validator_rejects_nonzero_or_unexpected_output(monkeypatch):
+    class _Result:
+        returncode = 3
+        stdout = ""
+        stderr = "access denied"
+
+    monkeypatch.setattr(
+        wm.subprocess,
+        "run",
+        lambda *args, **kwargs: _Result(),
+    )
+
+    assert not wm._windows_acl_restricted(r"C:\broad\worker_token")
 
 
 # --------------------------------------------------------------------------

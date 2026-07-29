@@ -92,14 +92,87 @@ def _mode_too_open(mode: int) -> bool:
     return bool(stat.S_IMODE(mode) & 0o077)
 
 
+_WINDOWS_ACL_CHECK = r"""
+$ErrorActionPreference = 'Stop'
+$path = $env:HERMES_WORKER_TOKEN_ACL_PATH
+if ([string]::IsNullOrWhiteSpace($path)) { exit 6 }
+$item = Get-Item -LiteralPath $path -Force
+if ($item.PSIsContainer) { exit 4 }
+if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { exit 4 }
+$acl = Get-Acl -LiteralPath $path
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$ownerSid = (New-Object Security.Principal.NTAccount($acl.Owner)).Translate(
+    [Security.Principal.SecurityIdentifier]
+).Value
+$allowed = @($currentSid, $ownerSid, 'S-1-5-18')
+foreach ($rule in $acl.Access) {
+    if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+        continue
+    }
+    $sid = $rule.IdentityReference.Translate(
+        [Security.Principal.SecurityIdentifier]
+    ).Value
+    if ($allowed -notcontains $sid) { exit 3 }
+}
+Write-Output 'ACL_OK'
+"""
+
+
+def _windows_acl_restricted(path: str) -> bool:
+    """Return only a value-free ACL decision for a Windows token file."""
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+    if not system_root:
+        return False
+    powershell = os.path.join(
+        system_root,
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+    )
+    child_env = {
+        "SystemRoot": system_root,
+        "WINDIR": system_root,
+        "HERMES_WORKER_TOKEN_ACL_PATH": path,
+    }
+    try:
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                _WINDOWS_ACL_CHECK,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env=child_env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "ACL_OK"
+
+
+def _token_permissions_restricted(
+    path: str,
+    *,
+    platform: str | None = None,
+) -> bool:
+    platform = os.name if platform is None else platform
+    if platform == "nt":
+        return _windows_acl_restricted(path)
+    return not _mode_too_open(os.stat(path).st_mode)
+
+
 def load_token(path: str, strict: bool) -> str:
     if not os.path.exists(path):
         die("worker token file not found: %s" % path)
-    if strict or os.name == "posix":
-        st = os.stat(path)
-        if _mode_too_open(st.st_mode):
-            die("worker token file '%s' is group/other-accessible; "
-                "run: chmod 600 %s" % (path, path))
+    if (strict or os.name == "posix") and not _token_permissions_restricted(path):
+        die(
+            "worker token file permissions are not restricted: %s" % path
+        )
     with open(path, "r") as f:
         tok = f.read().strip()
     if not tok:
