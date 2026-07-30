@@ -124,6 +124,96 @@ def submit_event(status="completed", summary="done") -> str:
     })
 
 
+
+def test_windows_resolve_binary_prefers_cmd_sibling_for_posix_shim():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        shim = root / "pi"
+        cmd = root / "pi.cmd"
+        bat = root / "pi.bat"
+        exe = root / "pi.exe"
+        shim.write_text("#!/bin/sh\n", encoding="utf-8")
+        cmd.write_text("@echo off\r\n", encoding="utf-8")
+        with (
+            mock.patch("hermes_worker.pi_cli_runner.os.name", "nt"),
+            mock.patch(
+                "hermes_worker.pi_cli_runner.shutil.which",
+                return_value=str(shim),
+            ),
+        ):
+            assert PiCliRunner.resolve_binary(str(shim)) == str(cmd.resolve())
+            cmd.unlink()
+            bat.write_text("@echo off\r\n", encoding="utf-8")
+            assert PiCliRunner.resolve_binary(str(shim)) == str(bat.resolve())
+            bat.unlink()
+            exe.write_text("launcher\n", encoding="utf-8")
+            assert PiCliRunner.resolve_binary(str(shim)) == str(exe.resolve())
+
+
+def test_resolve_binary_keeps_bare_suffixed_and_non_windows_semantics():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        shim = root / "pi"
+        cmd = root / "pi.cmd"
+        exe = root / "custom.exe"
+        for path in (shim, cmd, exe):
+            path.write_text("launcher\n", encoding="utf-8")
+
+        with (
+            mock.patch("hermes_worker.pi_cli_runner.os.name", "nt"),
+            mock.patch(
+                "hermes_worker.pi_cli_runner.shutil.which",
+                return_value=str(cmd),
+            ) as which,
+        ):
+            assert PiCliRunner.resolve_binary("pi") == str(cmd.resolve())
+            which.assert_called_once_with("pi")
+
+        with (
+            mock.patch("hermes_worker.pi_cli_runner.os.name", "nt"),
+            mock.patch(
+                "hermes_worker.pi_cli_runner.shutil.which",
+                return_value=str(exe),
+            ),
+        ):
+            assert PiCliRunner.resolve_binary(str(exe)) == str(exe.resolve())
+
+        with (
+            mock.patch("hermes_worker.pi_cli_runner.os") as runner_os,
+            mock.patch(
+                "hermes_worker.pi_cli_runner.shutil.which",
+                return_value=str(shim),
+            ),
+        ):
+            runner_os.name = "posix"
+            assert PiCliRunner.resolve_binary(str(shim)) == str(shim.resolve())
+
+
+def test_windows_cmd_launch_is_wrapped_by_comspec():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo = init_repo(root)
+        fake = FakePopen(stdout=submit_event())
+        runner, binary = runner_fixture(root, fake, {
+            "PATH": os.environ.get("PATH", ""),
+            "COMSPEC": r"C:\Windows\System32\cmd.exe",
+        })
+        with mock.patch("hermes_worker.pi_cli_runner.os.name", "nt"):
+            result = runner.run(repo, "prompt stays on stdin", 10)
+        assert result.exit_code == 0
+        assert fake.args[:4] == [
+            r"C:\Windows\System32\cmd.exe", "/d", "/s", "/c",
+        ]
+        assert fake.args[4] == str(binary.resolve())
+        bat_command = runner._command(str(binary.with_suffix(".bat")))
+        assert bat_command[:4] == [
+            r"C:\Windows\System32\cmd.exe", "/d", "/s", "/c",
+        ]
+        assert bat_command[4] == str(binary.with_suffix(".bat"))
+        assert "prompt stays on stdin" not in fake.args
+        assert fake.stdin == "prompt stays on stdin"
+
+
 def test_command_stdin_environment_and_sanitized_success_artifacts():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

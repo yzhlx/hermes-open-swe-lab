@@ -207,10 +207,15 @@ class PiCliRunner:
 
     @staticmethod
     def resolve_binary(binary: str) -> str:
+        path = Path(binary)
+        if os.name == "nt" and path.suffix == "" and path.parent != Path("."):
+            for suffix in (".cmd", ".bat", ".exe"):
+                windows_launcher = path.with_suffix(suffix)
+                if windows_launcher.is_file():
+                    return str(windows_launcher.resolve())
         candidate = shutil.which(binary)
         if candidate:
             return str(Path(candidate).resolve())
-        path = Path(binary)
         if path.is_file():
             return str(path.resolve())
         raise RuntimeError("pi_binary_unavailable")
