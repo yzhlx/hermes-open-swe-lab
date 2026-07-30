@@ -275,5 +275,7 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  pi.setActiveTools(TOOL_NAMES);
+  pi.on("session_start", () => {
+    pi.setActiveTools(TOOL_NAMES);
+  });
 }

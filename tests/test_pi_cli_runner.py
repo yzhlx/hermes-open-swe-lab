@@ -312,6 +312,10 @@ def test_extension_contract_has_no_shell_or_network_tool():
     for name in ("read", "write", "edit", "ls", "find", "grep", "submit_result"):
         assert f'name: "{name}"' in text
     assert "terminate: true" in text
+    assert 'pi.on("session_start"' in text
+    session_start_index = text.index('pi.on("session_start"')
+    set_active_index = text.index("pi.setActiveTools(TOOL_NAMES)")
+    assert set_active_index > session_start_index
 
 
 def test_extension_loads_offline_without_provider_call():
