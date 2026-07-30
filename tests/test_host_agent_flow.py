@@ -20,6 +20,8 @@ from hermes_worker.repository import (
     CommitResult,
     RepositoryPrepareResult,
     RepositoryPreparer,
+    HostGitOperations,
+    _is_transient_git_failure,
 )
 
 
@@ -70,6 +72,165 @@ class RepositoryPreparerTests(unittest.TestCase):
             self.assertFalse(Path(fetch[2]["GIT_ASKPASS"]).exists())
             serialized = json.dumps(result.commands) + result.stderr_summary
             self.assertNotIn(FAKE_TOKEN, serialized)
+
+    def test_fetch_retries_transient_network_errors_with_same_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "task-repo"
+            calls = []
+            outcomes = iter([
+                CommandResult(128, "", "OpenSSL SSL_read: Connection was reset"),
+                CommandResult(128, "", "Failed to connect: timed out"),
+                CommandResult(0, "", ""),
+            ])
+
+            def runner(args, *, cwd, env, timeout):
+                args = list(args)
+                calls.append((args, dict(env)))
+                if args[1:] == ["init"]:
+                    (Path(cwd) / ".git" / "info").mkdir(parents=True, exist_ok=True)
+                if "fetch" in args:
+                    return next(outcomes)
+                return CommandResult(0, "", "")
+
+            result = RepositoryPreparer(
+                command_runner=runner,
+                sleeper=lambda _seconds: None,
+                environ={"PATH": os.environ.get("PATH", "")},
+            ).prepare(destination, REPO, "main", "pi/job-9", FAKE_TOKEN)
+
+            self.assertTrue(result.ok)
+            fetches = [call for call in calls if "fetch" in call[0]]
+            self.assertEqual(len(fetches), 3)
+            self.assertTrue(all(
+                "http.version=HTTP/1.1" in call[0] for call in fetches
+            ))
+            self.assertTrue(all(
+                call[1]["HERMES_GIT_INSTALLATION_TOKEN"] == FAKE_TOKEN
+                for call in fetches
+            ))
+
+    def test_push_retries_transient_network_error_with_same_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "task-repo"
+            repo.mkdir()
+            calls = []
+            outcomes = iter([
+                CommandResult(128, "", "RPC failed: connection was reset"),
+                CommandResult(0, "", ""),
+            ])
+
+            def runner(args, *, cwd, env, timeout):
+                calls.append((list(args), dict(env)))
+                return next(outcomes)
+
+            result = HostGitOperations(
+                command_runner=runner,
+                sleeper=lambda _seconds: None,
+                environ={"PATH": os.environ.get("PATH", "")},
+            ).push(repo, "pi/job-9", FAKE_TOKEN)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(
+                "http.version=HTTP/1.1" in call[0] for call in calls
+            ))
+            self.assertTrue(all(
+                call[1]["HERMES_GIT_INSTALLATION_TOKEN"] == FAKE_TOKEN
+                for call in calls
+            ))
+
+    def test_fetch_does_not_retry_http_403_even_with_rpc_failed_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "task-repo"
+            calls = []
+
+            def runner(args, *, cwd, env, timeout):
+                args = list(args)
+                if args[1:] == ["init"]:
+                    (Path(cwd) / ".git" / "info").mkdir(parents=True, exist_ok=True)
+                if "fetch" in args:
+                    calls.append(args)
+                    return CommandResult(
+                        128,
+                        "",
+                        "The requested URL returned error: 403; connection was reset",
+                    )
+                return CommandResult(0, "", "")
+
+            result = RepositoryPreparer(
+                command_runner=runner,
+                sleeper=lambda _seconds: None,
+                environ={"PATH": os.environ.get("PATH", "")},
+            ).prepare(destination, REPO, "main", "pi/job-9", FAKE_TOKEN)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(len(calls), 1)
+
+    def test_git_failure_classifier_handles_common_curl_permission_and_ref_formats(self):
+        permanent = (
+            "HTTP 403 Forbidden; connection was reset",
+            "The requested URL returned error: 403; connection was reset",
+            "Permission to org/repo.git denied to user; remote end hung up",
+            "src refspec missing does not match any; connection was reset",
+            "rejected (non-fast-forward); remote end hung up",
+        )
+        transient = (
+            "The requested URL returned error: 502",
+            "HTTP/2 stream was reset",
+            "OpenSSL SSL_read: connection was reset",
+            "OpenSSL SSL_connect: SSL_ERROR_SYSCALL",
+            "GnuTLS recv error (-110): The TLS connection was non-properly terminated",
+        )
+        for message in permanent:
+            self.assertFalse(_is_transient_git_failure(
+                CommandResult(128, "", message)
+            ))
+        for message in transient:
+            self.assertTrue(_is_transient_git_failure(
+                CommandResult(128, "", message)
+            ))
+
+    def test_push_does_not_retry_non_fast_forward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "task-repo"
+            repo.mkdir()
+            calls = []
+
+            def runner(args, *, cwd, env, timeout):
+                calls.append(list(args))
+                return CommandResult(
+                    1,
+                    "",
+                    "rejected (non-fast-forward); remote end hung up",
+                )
+
+            result = HostGitOperations(
+                command_runner=runner,
+                sleeper=lambda _seconds: None,
+                environ={"PATH": os.environ.get("PATH", "")},
+            ).push(repo, "pi/job-9", FAKE_TOKEN)
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertEqual(len(calls), 1)
+
+    def test_push_transient_failures_stop_after_three_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "task-repo"
+            repo.mkdir()
+            calls = []
+
+            def runner(args, *, cwd, env, timeout):
+                calls.append(list(args))
+                return CommandResult(128, "", "connection was reset")
+
+            result = HostGitOperations(
+                command_runner=runner,
+                sleeper=lambda _seconds: None,
+                environ={"PATH": os.environ.get("PATH", "")},
+            ).push(repo, "pi/job-9", FAKE_TOKEN)
+
+            self.assertEqual(result.exit_code, 128)
+            self.assertEqual(len(calls), 3)
 
     def test_fetch_failure_is_redacted_and_directory_is_cleaned(self):
         with tempfile.TemporaryDirectory() as tmp:

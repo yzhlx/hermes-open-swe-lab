@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,42 @@ _GIT_ENV_ALLOWLIST = (
     "GIT_SSL_CAINFO",
 )
 _SAFE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_HTTP_4XX_RE = re.compile(
+    r"(?:http(?:/[0-9.]+)?\s+|returned error:\s*)4[0-9]{2}\b",
+    re.IGNORECASE,
+)
+_HTTP_5XX_RE = re.compile(
+    r"(?:http(?:/[0-9.]+)?\s+|returned error:\s*)5[0-9]{2}\b",
+    re.IGNORECASE,
+)
+_PERMANENT_GIT_FAILURE_RE = re.compile(
+    r"authentication failed|authorization failed|"
+    r"permission\b.*\bdenied|access denied|forbidden|not authorized|"
+    r"repository not found|non-fast-forward|\brejected\b|"
+    r"remote ref .* not found|couldn'?t find remote ref|"
+    r"src refspec .* does not match any|cannot lock ref",
+    re.IGNORECASE,
+)
+_TRANSIENT_GIT_NETWORK_RE = re.compile(
+    r"connection was reset|failed to connect|timed? out|"
+    r"ssl_(?:read|connect)|ssl_error|ssl error|"
+    r"tls handshake|tls connection .* terminated|"
+    r"gnutls .*?(?:recv error|terminated)|"
+    r"http/2 stream|remote end hung up|connection closed|"
+    r"recv failure|unexpected disconnect",
+    re.IGNORECASE,
+)
+
+
+def _is_transient_git_failure(result: CommandResult) -> bool:
+    combined = f"{result.stdout}\n{result.stderr}"
+    if _HTTP_4XX_RE.search(combined):
+        return False
+    if _PERMANENT_GIT_FAILURE_RE.search(combined):
+        return False
+    if _HTTP_5XX_RE.search(combined):
+        return True
+    return bool(_TRANSIENT_GIT_NETWORK_RE.search(combined))
 
 
 @dataclass(frozen=True)
@@ -117,10 +154,12 @@ class _GitHost:
         *,
         command_runner: Callable = _default_command_runner,
         environ: Optional[Mapping[str, str]] = None,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         self.git_binary = git_binary
         self._command_runner = command_runner
         self._environ = dict(os.environ if environ is None else environ)
+        self._sleep = sleeper
 
     def _base_env(self) -> dict[str, str]:
         by_upper = {key.upper(): value for key, value in self._environ.items()}
@@ -242,11 +281,27 @@ class RepositoryPreparer(_GitHost):
         destination.mkdir()
         url = f"https://github.com/{repo}.git"
 
-        def execute(args: list[str], env: Optional[dict[str, str]] = None) -> bool:
+        def execute(
+            args: list[str],
+            env: Optional[dict[str, str]] = None,
+            *,
+            network_retries: int = 0,
+        ) -> bool:
             nonlocal last
-            commands.append(redact(subprocess.list2cmdline([self.git_binary, *args])))
-            last = self._run(args, cwd=destination, env=env)
-            return last.exit_code == 0
+            for attempt in range(network_retries + 1):
+                commands.append(redact(subprocess.list2cmdline(
+                    [self.git_binary, *args]
+                )))
+                last = self._run(args, cwd=destination, env=env)
+                if last.exit_code == 0:
+                    return True
+                if (
+                    attempt >= network_retries
+                    or not _is_transient_git_failure(last)
+                ):
+                    return False
+                self._sleep(2 ** attempt)
+            return False
 
         try:
             if not execute(["init"]):
@@ -271,6 +326,8 @@ class RepositoryPreparer(_GitHost):
                         "credential.helper=",
                         "-c",
                         "credential.useHttpPath=true",
+                        "-c",
+                        "http.version=HTTP/1.1",
                         "fetch",
                         "--depth",
                         "1",
@@ -278,6 +335,7 @@ class RepositoryPreparer(_GitHost):
                         fetch_ref,
                     ],
                     git_env,
+                    network_retries=2,
                 ):
                     raise RuntimeError("git_fetch_failed")
             askpass_cleaned = helper_path is None or not helper_path.exists()
@@ -376,19 +434,28 @@ class HostGitOperations(_GitHost):
         if not _SAFE_REF_RE.fullmatch(branch) or ".." in branch:
             return CommandResult(2, "", "invalid_git_ref")
         with self._askpass(repo_path.parent, token) as (git_env, _helper):
-            result = self._run(
-                [
-                    "-c",
-                    "credential.helper=",
-                    "-c",
-                    "credential.useHttpPath=true",
-                    "push",
-                    "origin",
-                    f"HEAD:refs/heads/{branch}",
-                ],
-                cwd=repo_path,
-                env=git_env,
-            )
+            args = [
+                "-c",
+                "credential.helper=",
+                "-c",
+                "credential.useHttpPath=true",
+                "-c",
+                "http.version=HTTP/1.1",
+                "push",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+            ]
+            result = CommandResult(1, "", "push_not_attempted")
+            for attempt in range(3):
+                result = self._run(args, cwd=repo_path, env=git_env)
+                if result.exit_code == 0:
+                    break
+                if (
+                    attempt >= 2
+                    or not _is_transient_git_failure(result)
+                ):
+                    break
+                self._sleep(2 ** attempt)
         return CommandResult(
             result.exit_code,
             _summary(result.stdout),
