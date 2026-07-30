@@ -1,0 +1,39 @@
+# ============================================================
+# Secrets & credentials (AGENTS.md Section 7)
+# ============================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+
+# ============================================================
+# Local WorkBuddy memory (not project content, not for commit)
+# ============================================================
+.workbuddy/
+
+# ============================================================
+# Session / build artifacts
+# ============================================================
+hermes-eng-auto-architect.zip
+.pi-subagents/
+.playwright-cli/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# ============================================================
+# Runtime observability (Event Store + run logs) — generated at runtime
+# No secrets are stored here, but it is runtime state, not source.
+# runtime/.gitkeep is tracked on purpose to keep the directory.
+# ============================================================
+runtime/events.db
+runtime/events.db-wal
+runtime/events.db-shm
+runtime/runs/
+runtime/*-CURRENT.*
+runtime/secret_scan_review.json

@@ -1,0 +1,22 @@
+FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY hermes_worker ./hermes_worker
+COPY hermes_open_swe_relay ./hermes_open_swe_relay
+COPY deploy/cloud ./deploy/cloud
+
+RUN python -m pip install --no-cache-dir "PyJWT[crypto]==2.10.1" \
+    && mkdir -p /data /tmp/runtime \
+    && chown -R 10001:10001 /app /data /tmp/runtime
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+USER 10001:10001
+
+HEALTHCHECK --interval=15s --timeout=3s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"
+
+ENTRYPOINT ["python", "-m", "deploy.cloud.control_plane_app"]

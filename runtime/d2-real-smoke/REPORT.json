@@ -1,0 +1,90 @@
+{
+  "image": "hermes-d2-smoke:local",
+  "steps": {
+    "1_create": {
+      "workspace": "C:\\Windows\\Temp\\hermes-docker-xzno0iw4",
+      "container": "hermes-hermes-docker-xzno0iw4-1784979265272"
+    },
+    "2_health_check": {
+      "healthy": true
+    },
+    "3_execute": {
+      "exit_code": 0,
+      "stdout": "HERMES_OK\nroot\nGNU bash, version 5.2.37(1)-release (x86_64-pc-linux-gnu)\ngit version 2.47.3"
+    },
+    "7_git_clone": {
+      "exit_code": 0,
+      "stderr": "Cloning into 'repo'...\nwarning: You appear to have cloned an empty repository."
+    },
+    "4_write_file": {
+      "paths": [
+        "repo/README.md",
+        "repo/verify.sh"
+      ]
+    },
+    "5_read_file": {
+      "content": "# D2.5 real smoke"
+    },
+    "6_edit_file": {
+      "content": "# D2.5 real smoke (edited)"
+    },
+    "3b_execute_verify": {
+      "exit_code": 0,
+      "stdout": "verify: start\nverify: README present\nverify: done"
+    },
+    "8_git_status": {
+      "exit_code": 0,
+      "stdout": "On branch main\n\nNo commits yet\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tREADME.md\n\tverify.sh\n\nnothing added to commit but untracked files present (use \"git add\" to track)"
+    },
+    "9_git_diff": {
+      "exit_code": 0,
+      "stdout": ""
+    },
+    "10_git_commit": {
+      "exit_code": 0,
+      "stdout": "[main (root-commit) 534f862] add README and verify script\n 2 files changed, 5 insertions(+)\n create mode 100755 README.md\n create mode 100755 verify.sh"
+    },
+    "11_git_push": {
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "To file:///workspace/bare.git\n * [new branch]      main -> main"
+    },
+    "11b_bare_remote_log": {
+      "rc": 0,
+      "out": "534f862 add README and verify script"
+    },
+    "12a_stop": {
+      "alive_after_stop": false
+    },
+    "12b_delete": {
+      "container_after_delete": null
+    }
+  },
+  "inspect": {
+    "image": "hermes-d2-smoke:local",
+    "cpus": 1.0,
+    "memory_bytes": 2147483648,
+    "pids_limit": 256,
+    "privileged": false,
+    "network_mode": "bridge",
+    "auto_remove": true,
+    "mounts": [
+      {
+        "source": "C:\\Windows\\Temp\\hermes-docker-eibzgwpc",
+        "destination": "/workspace",
+        "type": "bind"
+      }
+    ]
+  },
+  "security": {
+    "no_docker_sock_or_ssh": "ls: cannot access '/var/run/docker.sock': No such file or directory\nls: cannot access '/root/.ssh': No such file or directory\nls: cannot access '/root/.ssh': No such file or directory",
+    "failed_exec_exit_code": 7,
+    "timeout_exit_code": 124,
+    "path_escape_rejected": true,
+    "no_secret_in_logs": true
+  },
+  "residual_containers": [],
+  "runtime_sec": 12.07,
+  "pass": true,
+  "container_redacted": "hermes-herme…"
+}

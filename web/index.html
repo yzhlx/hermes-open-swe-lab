@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="oklch(98.5% 0.004 250)">
+    <title>Hermes 智能体工程工作台</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/tokens.css">
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#thread">跳到任务线程</a>
+
+    <div class="workbench" data-ui="workbench">
+      <header class="topbar">
+        <div class="brand-block">
+          <span class="brand-mark" aria-hidden="true">H</span>
+          <div>
+            <p class="brand-name">Hermes</p>
+            <p class="brand-context">智能体工程工作台</p>
+          </div>
+        </div>
+
+        <div class="truth-strip" aria-label="系统连接状态">
+          <span class="truth-chip" data-ui="service-state" data-tone="pending">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span data-ui="service-state-label">正在连接</span>
+          </span>
+          <span class="truth-chip" data-ui="connection-state" data-tone="neutral">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span data-ui="connection-state-label">Agent 未启动</span>
+          </span>
+        </div>
+
+        <button class="search-trigger" type="button" data-ui="search-trigger" aria-haspopup="dialog">
+          <span class="search-glyph" aria-hidden="true"></span>
+          <span class="search-label">搜索任务与频道</span>
+          <kbd>Ctrl K</kbd>
+        </button>
+      </header>
+
+      <main class="workspace">
+        <aside class="task-rail" aria-label="任务与频道">
+          <section class="rail-intro">
+            <p class="machine-label">CONTROL PLANE</p>
+            <h1>一条目标，<br>一条证据链。</h1>
+            <p>任务、Agent 事件与 GitHub 事实来自同一个持久化工作流。</p>
+            <button class="button button--quiet" type="button" data-ui="focus-command">
+              下达新目标
+            </button>
+          </section>
+
+          <section class="rail-section" aria-labelledby="tasks-heading">
+            <div class="section-line">
+              <h2 id="tasks-heading">任务</h2>
+              <output class="count" data-ui="task-count">0</output>
+            </div>
+            <div class="task-list" data-ui="task-list" aria-live="polite" aria-busy="true">
+              <div class="skeleton-row" aria-hidden="true"></div>
+              <div class="skeleton-row skeleton-row--short" aria-hidden="true"></div>
+            </div>
+          </section>
+
+          <nav class="rail-section channel-nav" aria-labelledby="channels-heading">
+            <div class="section-line">
+              <h2 id="channels-heading">频道</h2>
+              <span class="source-note">Event Store</span>
+            </div>
+            <div class="channel-list" data-ui="channel-list"></div>
+          </nav>
+        </aside>
+
+        <section class="thread-panel" id="thread" aria-labelledby="thread-title">
+          <header class="thread-header">
+            <div class="thread-heading">
+              <p class="machine-label" data-ui="thread-stage">NO ACTIVE TASK</p>
+              <h2 id="thread-title" data-ui="thread-title">等待第一个真实任务</h2>
+              <p class="thread-summary" data-ui="thread-summary">
+                在下方输入开发目标。创建后，这里只展示持久化事件，不生成角色台词。
+              </p>
+            </div>
+
+            <div class="task-truth" aria-label="当前任务状态">
+              <div>
+                <span>工作流</span>
+                <strong data-ui="workflow-state">未开始</strong>
+              </div>
+              <div>
+                <span>控制</span>
+                <strong data-ui="control-state">活动</strong>
+              </div>
+              <div>
+                <span>版本</span>
+                <strong class="tnum" data-ui="task-version">—</strong>
+              </div>
+            </div>
+          </header>
+
+          <section class="operator-panel" data-ui="operator-actions" aria-labelledby="operator-heading">
+            <div class="section-line">
+              <h3 id="operator-heading">Human Owner 控制</h3>
+              <span class="source-note">版本冲突会拒绝写入</span>
+            </div>
+            <div class="action-row">
+              <button class="button button--quiet" type="button" data-action="pause" disabled>暂停</button>
+              <button class="button button--quiet" type="button" data-action="resume" disabled>继续</button>
+              <button class="button button--quiet" type="button" data-action="approve" disabled>批准交付</button>
+              <button class="button button--danger" type="button" data-action="reject" disabled>拒绝结果</button>
+            </div>
+            <details class="supplement-box">
+              <summary>补充要求</summary>
+              <div class="supplement-fields">
+                <label for="action-reason">说明</label>
+                <input id="action-reason" data-ui="action-reason" type="text" autocomplete="off" placeholder="例如：保留当前 PR，修复空数据状态">
+                <label for="action-requirements">新增验收要求</label>
+                <textarea id="action-requirements" data-ui="action-requirements" rows="3" placeholder="每行一条要求"></textarea>
+                <button class="button button--primary" type="button" data-action="supplement" disabled>
+                  发送补充要求
+                </button>
+              </div>
+            </details>
+            <p class="form-feedback" data-ui="action-feedback" aria-live="polite"></p>
+          </section>
+
+          <div class="stream-toolbar">
+            <div>
+              <h3 data-ui="channel-title">全部真实事件</h3>
+              <p data-ui="channel-description">按数据库游标排序；未验证来源会明确标记。</p>
+            </div>
+            <button class="button button--quiet button--compact" type="button" data-ui="refresh-events" disabled>
+              刷新证据
+            </button>
+          </div>
+
+          <ol class="event-stream" data-ui="event-stream" aria-live="polite" aria-busy="false">
+            <li class="empty-state" data-ui="event-empty">
+              <span class="empty-glyph" aria-hidden="true"></span>
+              <h3>还没有事件</h3>
+              <p>创建任务后，Human Owner 的原始命令会成为第一条持久化事件。</p>
+            </li>
+          </ol>
+        </section>
+
+        <aside class="evidence-panel" data-ui="evidence-panel" aria-labelledby="evidence-heading">
+          <div class="section-line">
+            <h2 id="evidence-heading">工程证据</h2>
+            <span class="truth-badge" data-ui="evidence-trust">无任务</span>
+          </div>
+
+          <dl class="evidence-list">
+            <div>
+              <dt>Task ID</dt>
+              <dd class="mono" data-ui="task-id">—</dd>
+            </div>
+            <div>
+              <dt>目标仓库</dt>
+              <dd data-ui="task-repo">—</dd>
+            </div>
+            <div>
+              <dt>Issue</dt>
+              <dd data-ui="issue-link">—</dd>
+            </div>
+            <div>
+              <dt>Commit</dt>
+              <dd class="mono" data-ui="commit-sha">—</dd>
+            </div>
+            <div>
+              <dt>Draft PR</dt>
+              <dd data-ui="pr-link">—</dd>
+            </div>
+            <div>
+              <dt>CI</dt>
+              <dd data-ui="ci-status">—</dd>
+            </div>
+            <div>
+              <dt>最后心跳</dt>
+              <dd class="tnum" data-ui="heartbeat-at">—</dd>
+            </div>
+            <div>
+              <dt>最近更新</dt>
+              <dd class="tnum" data-ui="updated-at">—</dd>
+            </div>
+          </dl>
+
+          <section class="truth-note">
+            <h3>事实边界</h3>
+            <p>Buzz 只显示 Control Plane 与 GitHub 事件。代码完成、CI 通过和 PR 状态必须有工程证据。</p>
+          </section>
+        </aside>
+      </main>
+
+      <section class="command-dock" data-ui="command-form" aria-labelledby="command-heading">
+        <form class="command-form">
+          <div class="command-copy">
+            <p class="machine-label">HUMAN OWNER COMMAND</p>
+            <h2 id="command-heading">下达开发目标</h2>
+            <p>目标会进入 Control Plane，并生成可追踪的 Task ID。</p>
+          </div>
+
+          <div class="command-fields">
+            <label for="goal">目标</label>
+            <textarea id="goal" name="goal" rows="3" required placeholder="描述要实现的真实功能，以及用户最终能看到或完成什么。"></textarea>
+
+            <details class="command-details">
+              <summary>工作范围与验收标准</summary>
+              <div class="detail-grid">
+                <div>
+                  <label for="repo">目标仓库</label>
+                  <select id="repo" name="repo">
+                    <option value="yzhlx/hermes-open-swe-smoke-test">yzhlx/hermes-open-swe-smoke-test</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="scope">工作范围</label>
+                  <input id="scope" name="scope" type="text" required placeholder="例如：主页空状态与对应测试">
+                </div>
+                <div class="detail-wide">
+                  <label for="acceptance">验收标准</label>
+                  <textarea id="acceptance" name="acceptance" rows="3" required placeholder="每行一条可验证标准"></textarea>
+                </div>
+              </div>
+            </details>
+          </div>
+
+          <div class="command-submit">
+            <button class="button button--primary button--submit" type="submit">
+              创建任务
+            </button>
+            <p class="form-feedback" data-ui="command-feedback" aria-live="polite">
+              不会自动合并。
+            </p>
+          </div>
+        </form>
+      </section>
+
+      <footer class="foot-line">
+        <p>
+          <span>数据源：SQLite Event Store + GitHub</span>
+          <span>本页缓存：<strong data-ui="cache-state">否</strong></span>
+          <span>身份：<strong data-ui="identity-mode">待确认</strong></span>
+        </p>
+      </footer>
+    </div>
+
+    <dialog class="command-palette" data-ui="command-palette" role="dialog" aria-modal="true" aria-labelledby="palette-title">
+      <form method="dialog" class="palette-shell">
+        <div class="palette-field">
+          <label class="visually-hidden" for="palette-search" id="palette-title">搜索任务与频道</label>
+          <span class="search-glyph" aria-hidden="true"></span>
+          <input id="palette-search" data-ui="palette-search" type="search" autocomplete="off" placeholder="搜索任务 ID、目标或频道">
+          <button class="palette-close" value="close" aria-label="关闭搜索">Esc</button>
+        </div>
+        <div class="palette-results" data-ui="palette-results" role="listbox"></div>
+        <p class="palette-hints">
+          <span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
+          <span><kbd>Enter</kbd> 打开</span>
+        </p>
+      </form>
+    </dialog>
+
+    <div class="toast-region" data-ui="toast-region" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>
