@@ -161,7 +161,7 @@ try {
     $BaselineResult = $Results |
         Where-Object { $_.name -eq "baseline-host-agent" } |
         Select-Object -First 1
-    if ($null -eq $BaselineResult -or $BaselineResult.tests -ne 42) {
+    if ($null -eq $BaselineResult -or $BaselineResult.tests -ne 43) {
         $Failed = $true
     }
 

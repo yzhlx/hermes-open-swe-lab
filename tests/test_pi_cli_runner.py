@@ -353,12 +353,14 @@ def test_changed_files_are_host_collected():
         repo = init_repo(root)
 
         def edit(worktree: Path):
-            (worktree / "feature.py").write_text("VALUE = 1\n", encoding="utf-8")
+            feature = worktree / "new-directory" / "feature.py"
+            feature.parent.mkdir()
+            feature.write_text("VALUE = 1\n", encoding="utf-8")
 
         fake = FakePopen(stdout=submit_event(), on_communicate=edit)
         runner, _ = runner_fixture(root, fake)
         result = runner.run(repo, "task", 10)
-        assert result.changed_files == ["feature.py"]
+        assert result.changed_files == ["new-directory/feature.py"]
 
 
 def test_rejects_secret_shaped_allowlisted_environment_value():

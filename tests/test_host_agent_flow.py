@@ -232,6 +232,27 @@ class RepositoryPreparerTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 128)
             self.assertEqual(len(calls), 3)
 
+    def test_changed_files_expands_untracked_directories_to_exact_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "task-repo"
+            repo.mkdir()
+            calls = []
+
+            def runner(args, *, cwd, env, timeout):
+                args = list(args)
+                calls.append(args)
+                output = (
+                    "?? automation-smoke-test/README.md\0"
+                    if "--untracked-files=all" in args
+                    else "?? automation-smoke-test/\0"
+                )
+                return CommandResult(0, output, "")
+
+            files = HostGitOperations(command_runner=runner).changed_files(repo)
+
+            self.assertEqual(files, ["automation-smoke-test/README.md"])
+            self.assertIn("--untracked-files=all", calls[0])
+
     def test_fetch_failure_is_redacted_and_directory_is_cleaned(self):
         with tempfile.TemporaryDirectory() as tmp:
             destination = Path(tmp) / "task-repo"

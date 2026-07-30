@@ -376,7 +376,7 @@ class RepositoryPreparer(_GitHost):
 class HostGitOperations(_GitHost):
     def changed_files(self, repo_path: Path) -> list[str]:
         result = self._run(
-            ["status", "--porcelain=v1", "-z"],
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=Path(repo_path),
         )
         if result.exit_code != 0:

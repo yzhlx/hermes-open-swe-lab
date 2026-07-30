@@ -269,7 +269,7 @@ class PiCliRunner:
     @staticmethod
     def _changed_files(repo_path: Path) -> list[str]:
         result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z"],
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=repo_path,
             capture_output=True,
             check=False,
