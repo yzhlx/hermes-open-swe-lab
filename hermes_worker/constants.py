@@ -19,6 +19,12 @@ ROLE_CODING_AGENT = "coding_agent"
 ROLE_REVIEWER = "reviewer"
 ROLE_SCHEDULER = "scheduler"
 
+# PB-1: the Release Agent is the ONLY production role permitted to call
+# ``DeliveryController.deliver()``. The Coding Worker (WorkerAgent) and any
+# other component must hand off to it; they must never push or open Draft PRs
+# directly.
+ROLE_RELEASE_AGENT = "release_agent"
+
 # The single PR label a round-2 rework is signalled with. ONLY the scheduler may
 # add it (D3-IMPLEMENTATION-PLAN.md §4.12).
 ROUND2_LABEL = "round-2"
