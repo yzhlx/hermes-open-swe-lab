@@ -1,6 +1,7 @@
 """PB-8 scheduler, reviewer, and acceptance-lifecycle gap coverage."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -151,13 +152,15 @@ class PB8LifecycleGapTests(unittest.TestCase):
         self.assertNotIn(constants.TASK_COMPLETED, self._event_types(job_id))
         self.assertNotEqual(self.cp.get_job(job_id)["state"], "completed")
 
-    def test_max_rounds_two_request_changes_escalates_currently_without_user_action(self):
-        """Gap 7: two blocking reviews stop at MAX_ROUNDS and expose its gap.
+    def test_max_rounds_two_request_changes_escalates_with_user_action(self):
+        """Gap 7 (closed by PB-7): two blocking reviews stop at MAX_ROUNDS and
+        raise ``USER_ACTION_REQUIRED`` / ``TASK_BLOCKED``.
 
-        The current Scheduler moves to ``escalated`` after two REQUEST_CHANGES,
-        but does not yet create the required ``USER_ACTION_REQUIRED`` /
-        ``TASK_BLOCKED`` escalation record.  This test preserves that observed
-        contract without modifying scheduler source.
+        After PB-7, the Scheduler moves to ``escalated`` after two
+        REQUEST_CHANGES AND records the required ``USER_ACTION_REQUIRED``
+        event with reason ``TASK_BLOCKED`` via the control plane.  This test
+        asserts the closed behavior (supersedes the PB-1..PB-6-era
+        ``currently_without_user_action`` variant).
         """
         job_id, _ = self._job_with_pr(round_number=1)
         reviewer = RequestChangesReviewer()
@@ -172,8 +175,12 @@ class PB8LifecycleGapTests(unittest.TestCase):
         self.assertEqual(reviewer.calls, constants.MAX_ROUNDS)
         self.assertEqual(self.cp.get_job(job_id)["state"], "escalated")
         self.assertIn("escalated", self._event_types(job_id))
-        self.assertNotEqual(self.cp.get_job(job_id)["state"],
-                            constants.USER_ACTION_REQUIRED)
+        # PB-7: USER_ACTION_REQUIRED(TASK_BLOCKED) is emitted on escalation.
+        uar_events = [e for e in self.cp.get_events(job_id)
+                      if e.get("event_type") == constants.USER_ACTION_REQUIRED]
+        self.assertEqual(len(uar_events), 1)
+        self.assertEqual(json.loads(uar_events[0]["payload"])["reason"],
+                         constants.TASK_BLOCKED)
 
     def test_failure_escalation_stops_orchestrator_after_max_rounds(self):
         """Gap 8: the loop stops at MAX_ROUNDS; Human Owner notice is missing.
