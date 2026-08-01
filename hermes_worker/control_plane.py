@@ -303,6 +303,29 @@ class ControlPlane:
         self._raw_set_state(job_id, constants.USER_ACTION_REQUIRED)
         return {"ok": True, "state": constants.USER_ACTION_REQUIRED}
 
+    def request_user_action(self, token: Optional[str], job_id: int,
+                            reason: str) -> dict:
+        """Request a human action outside the final-acceptance path.
+
+        Workers may supply a token, which is validated before the event is
+        recorded. Control-plane actors such as the Scheduler have no worker
+        lease token and pass ``None``; this keeps scheduler/release escalation
+        on the same event-gated path rather than bypassing it with ``set_state``.
+        Repeated requests for the same job and reason emit only one event.
+        """
+        if token is not None:
+            self._check_token(token)
+        self._get_job(job_id)
+        emitted = self._emit_once(
+            job_id,
+            constants.USER_ACTION_REQUIRED,
+            f"user-action-required:{job_id}:{reason}",
+            {"reason": reason},
+        )
+        self._raw_set_state(job_id, constants.USER_ACTION_REQUIRED)
+        return {"ok": True, "state": constants.USER_ACTION_REQUIRED,
+                "emitted": emitted}
+
     def final_accept(self, token: str, job_id: int) -> dict:
         """Human-Owner acceptance of the FINAL_ACCEPTANCE gate.
 

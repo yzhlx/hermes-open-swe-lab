@@ -48,7 +48,7 @@ from typing import Optional
 from .control_plane import ControlPlane, ControlPlaneError
 from .constants import (
     ALLOWED_GITHUB_REPOS, ROLE_CODING_AGENT, ROLE_SCHEDULER,
-    ROLE_RELEASE_AGENT, ROUND2_LABEL, MAX_ROUNDS,
+    ROLE_RELEASE_AGENT, ROUND2_LABEL, MAX_ROUNDS, TASK_BLOCKED,
 )
 from .agent_runner import AgentRunner, AgentEvidence
 from .reviewer import Reviewer, ReviewVerdict
@@ -268,8 +268,13 @@ class Scheduler:
         # REQUEST_CHANGES
         round_now = job.get("round") or 1
         if round_now >= MAX_ROUNDS:
+            # Escalation is event-gated and idempotent: the control plane emits
+            # USER_ACTION_REQUIRED once with the actionable reason, then the
+            # Scheduler retains its terminal ``escalated`` state for the loop.
+            self.cp.request_user_action(None, job_id, TASK_BLOCKED)
             self.cp.set_state(job_id, "escalated")
             self.cp.append_event(job_id, {"type": "escalated",
+                                          "id": f"escalated:{job_id}",
                                           "payload": {"pr_number": pr_number}})
             return {"action": "escalated", "verdict": verdict}
         self.add_round2_label(job_id, pr_number)

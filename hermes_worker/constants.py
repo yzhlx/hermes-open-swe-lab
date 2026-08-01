@@ -68,6 +68,10 @@ TASK_COMPLETED = "TASK_COMPLETED"
 # for the independent Human Owner to call ``final_accept()``.
 USER_ACTION_REQUIRED = "USER_ACTION_REQUIRED"
 
+# Reason emitted when the reviewer exhausts the permitted rework rounds and the
+# task must be handed back to a human owner.
+TASK_BLOCKED = "TASK_BLOCKED"
+
 # The distinct role used by the Human Owner acceptance gate. It is deliberately
 # separate from ROLE_CODING_AGENT / ROLE_REVIEWER / scheduler so those actors
 # can NEVER impersonate the Human Owner (requirement 6).
