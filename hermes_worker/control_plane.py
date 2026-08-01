@@ -64,14 +64,34 @@ class ControlPlane:
     def __init__(self, db_path: str, now: Optional[callable] = None,
                  lease_seconds: int = 1200,
                  allowed_token_hashes: Optional[set] = None,
-                 replay_window: int = 300):
+                 replay_window: int = 300,
+                 mode: str = "dev"):
+        """Control-plane task queue / worker registry.
+
+        ``mode`` selects the worker-token trust policy:
+
+        * ``"dev"`` (default) — ``allowed_token_hashes=None`` is treated as
+          allow-all. This preserves offline/test injectability and MUST NOT be
+          used in production.
+        * ``"production"`` — fail-closed. If ``allowed_token_hashes`` is ``None``
+          or empty, construction raises ``ControlPlaneError`` so the server
+          refuses to start instead of admitting any worker by default.
+
+        The production entry point (``worker_api_server.main``) always passes
+        ``mode="production"``.
+        """
         self.db_path = db_path
         self._now = now or time.time
         self.lease_seconds = lease_seconds
         # Server-side worker allowlist (D3 hardening, item 1). When set (non-
         # empty), only these token hashes may register. ``None`` = allow all
-        # (local/offline test convenience only; production MUST pass it).
+        # (dev/test convenience only; never in production).
         self.allowed_token_hashes = set(allowed_token_hashes) if allowed_token_hashes else None
+        self.mode = mode
+        if mode == "production" and self.allowed_token_hashes is None:
+            # Fail-closed: never start with an unconfigured worker allowlist.
+            # The message carries no token value.
+            raise ControlPlaneError("worker_tokens_not_configured_production")
         # Replay-protection window in seconds (D3 hardening, item 3).
         self.replay_window = replay_window
         self.conn = init_db(db_path)
