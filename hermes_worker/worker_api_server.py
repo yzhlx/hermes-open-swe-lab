@@ -29,9 +29,48 @@ from .control_plane import ControlPlane, ControlPlaneError
 from .db import hash_token
 
 
+class WorkerTokenConfigError(Exception):
+    """Raised when production worker-token configuration is missing/invalid.
+
+    This is a fail-closed signal only — it never carries the raw token value.
+    """
+    pass
+
+
+def resolve_production_worker_tokens(env_value):
+    """Validate ``ALLOWED_WORKER_TOKENS`` for production (fail-closed).
+
+    Returns a non-empty list of usable token strings. Raises
+    ``WorkerTokenConfigError`` when the value is unset, empty, yields no usable
+    tokens (malformed / invalid format), or contains control characters.
+
+    The caller hashes these tokens; they must never be logged or echoed.
+    """
+    if env_value is None:
+        raise WorkerTokenConfigError(
+            "ALLOWED_WORKER_TOKENS is not set; production requires an explicit "
+            "worker allowlist (fail-closed)")
+    tokens = [t.strip() for t in env_value.split(",") if t and t.strip()]
+    if not tokens:
+        raise WorkerTokenConfigError(
+            "ALLOWED_WORKER_TOKENS is empty or contains no usable tokens "
+            "(fail-closed)")
+    for t in tokens:
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in t):
+            raise WorkerTokenConfigError(
+                "ALLOWED_WORKER_TOKENS contains invalid control characters "
+                "(fail-closed)")
+    return tokens
+
+
 def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
-                lease_seconds: int = 1200, broker=None):
-    allowed_hashes = {hash_token(t) for t in (allowed_tokens or [])} or None
+                lease_seconds: int = 1200, broker=None, mode: str = "dev"):
+    parsed = [t.strip() for t in (allowed_tokens or []) if isinstance(t, str) and t.strip()]
+    allowed_hashes = {hash_token(t) for t in parsed} or None
+    if mode == "production" and not allowed_hashes:
+        # Fail-closed: refuse to build a handler that would allow any worker.
+        raise WorkerTokenConfigError(
+            "worker tokens not configured for production (fail-closed)")
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -39,7 +78,7 @@ def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
         def _cp(self) -> ControlPlane:
             return ControlPlane(db_path, allowed_token_hashes=allowed_hashes,
                                 replay_window=replay_window,
-                                lease_seconds=lease_seconds)
+                                lease_seconds=lease_seconds, mode=mode)
 
         def _send(self, code, obj):
             body = json.dumps(obj).encode("utf-8")
@@ -85,6 +124,19 @@ def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
                 elif path.startswith("/worker/jobs/") and path.endswith("/complete"):
                     jid = int(path.split("/")[-2])
                     res = cp.complete(tok, jid, body.get("result"))
+                elif path.startswith("/worker/jobs/") and path.endswith(
+                        "/request-final-acceptance"):
+                    # Open the gate (worker token; CI must already be green).
+                    jid = int(path.split("/")[-2])
+                    res = cp.request_final_acceptance(tok, jid)
+                elif path.startswith("/worker/jobs/") and path.endswith(
+                        "/final-accept"):
+                    # Human-Owner acceptance. The Human Owner token travels on a
+                    # DEDICATED header, never on X-Worker-Token, so a worker
+                    # token can never impersonate the Human Owner (PB-23 req 6).
+                    jid = int(path.split("/")[-2])
+                    res = cp.final_accept(
+                        self.headers.get("X-Human-Owner-Token", ""), jid)
                 elif path.startswith("/worker/jobs/") and path.endswith("/fail"):
                     jid = int(path.split("/")[-2])
                     res = cp.fail(tok, jid, body.get("error"))
@@ -120,21 +172,28 @@ def make_handler(db_path: str, allowed_tokens=None, replay_window: int = 300,
 
 def run_server(host="0.0.0.0", port=8080, db_path="runtime/events.db",
                allowed_tokens=None, replay_window=300, lease_seconds=1200,
-               broker=None):
+               broker=None, mode: str = "dev"):
     """Create and return the Worker API server WITHOUT blocking.
 
     The caller is responsible for starting the serve loop (e.g. in a daemon
     thread for tests, or ``serve_forever`` for the real control plane). This
     split keeps ``run_server`` usable as a library function and avoids the
     historical bug where it blocked forever and the test harness never returned.
+
+    ``mode`` is ``"dev"`` by default (allow-all when no tokens are supplied, for
+    offline tests). The production entry point ``main()`` always passes
+    ``mode="production"``, which makes the server fail-closed when no worker
+    tokens are configured.
     """
     return ThreadingHTTPServer(
         (host, port),
-        make_handler(db_path, allowed_tokens, replay_window, lease_seconds, broker))
+        make_handler(db_path, allowed_tokens, replay_window, lease_seconds,
+                     broker, mode))
 
 
 def main():
     import argparse
+    import sys
     ap = argparse.ArgumentParser(description="Hermes Worker API (control plane)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
@@ -142,11 +201,17 @@ def main():
     ap.add_argument("--replay-window", type=int, default=300)
     args = ap.parse_args()
     # Production MUST supply ALLOWED_WORKER_TOKENS (whitespace/comma separated).
-    # If unset, the control plane allows any registered token (local/test only).
-    allowed = [t for t in (os.environ.get("ALLOWED_WORKER_TOKENS") or "").split(",")
-               if t.strip()]
+    # Fail-closed: any misconfiguration aborts startup with a non-zero exit and
+    # the server never starts in an allow-all state. No raw token is logged.
+    try:
+        allowed = resolve_production_worker_tokens(
+            os.environ.get("ALLOWED_WORKER_TOKENS"))
+    except WorkerTokenConfigError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        sys.exit(2)
     srv = run_server(args.host, args.port, args.db,
-                     allowed_tokens=allowed, replay_window=args.replay_window)
+                     allowed_tokens=allowed, replay_window=args.replay_window,
+                     mode="production")
     print(f"Hermes Worker API listening on {args.host}:{args.port} (db={args.db})",
           flush=True)
     srv.serve_forever()

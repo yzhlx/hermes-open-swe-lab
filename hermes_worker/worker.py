@@ -14,11 +14,45 @@ import json
 import time
 import threading
 import uuid
+import subprocess
 import urllib.request
 import urllib.error
 
 from .echo_sandbox import EchoSandboxBackend
 from .redact import redact
+
+
+def _create_real_commit(workspace: str, message: str):
+    """Create a REAL local git commit in ``workspace`` and return its SHA.
+
+    PB-4 contract: a Coding Worker must never report the literal ``"simulated"``
+    (or any placeholder) as a deliverable commit. If a real commit cannot be
+    produced (no git, or nothing to commit), this returns ``None`` — never a
+    fake. The Demo path therefore always yields a genuine, existing git SHA.
+    """
+    try:
+        def _git(*args):
+            return subprocess.run(
+                ["git", "-C", workspace, *args],
+                capture_output=True, text=True, timeout=60)
+
+        if _git("rev-parse", "--is-inside-work-tree").returncode != 0:
+            if _git("init").returncode != 0:
+                return None
+        if _git("add", "-A").returncode != 0:
+            return None
+        # Nothing staged -> nothing to commit -> no fake SHA.
+        if _git("diff", "--cached", "--quiet").returncode == 0:
+            return None
+        r = _git("-c", "user.email=hermes-worker@local",
+                 "-c", "user.name=hermes-local-worker",
+                 "commit", "-m", message)
+        if r.returncode != 0:
+            return None
+        out = _git("rev-parse", "HEAD")
+        return out.stdout.strip() if out.returncode == 0 else None
+    except Exception:
+        return None
 
 
 class HermesWorker:
@@ -96,6 +130,8 @@ class HermesWorker:
                                     "# Smoke test\n")
             evs.append({"id": f"{job_id}-write", "type": "write_file",
                         "payload": {"path": "automation-smoke-test/README.md"}})
+            # PB-4: produce a REAL local commit (never a simulated placeholder).
+            commit_sha = _create_real_commit(ws, f"hermes worker job {job_id}")
             # stream events (batched)
             for i in range(0, len(evs), self.max_events_batch):
                 self._post(f"/worker/jobs/{job_id}/events",
@@ -105,7 +141,7 @@ class HermesWorker:
                 "command": redact(cmd),
                 "container_id": "echo-" + str(job_id),
                 "modified_files": ["automation-smoke-test/README.md"],
-                "commit_sha": "simulated",
+                "commit_sha": commit_sha,
                 "ci_status": "pending",
                 "token_usage": 0,
                 "tool_calls": len(evs),

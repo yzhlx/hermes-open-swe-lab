@@ -16,7 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-from .constants import ROLE_REVIEWER
+from .constants import ROLE_REVIEWER, ALLOWED_GITHUB_REPOS
+from .github_client import GitHubClientError, require_allowed_repo
 
 
 @dataclass
@@ -40,9 +41,16 @@ class ReviewVerdict:
 
 
 class Reviewer:
-    def __init__(self, decide: Optional[Callable] = None):
+    def __init__(self, decide: Optional[Callable] = None,
+                 repo: Optional[str] = None,
+                 allowed_repos=None):
         # decide(pr_state: dict, evidence: dict) -> ReviewVerdict
         self._decide = decide or self._default_decide
+        # PB-6: bind the reviewer to a single allowed repository so it can never
+        # read evidence or submit a review for a repo outside ALLOWED_GITHUB_REPOS.
+        self._repo = repo
+        self._allowed = set(allowed_repos) if allowed_repos is not None \
+            else set(ALLOWED_GITHUB_REPOS)
 
     @staticmethod
     def _default_decide(pr_state: dict, evidence: dict) -> ReviewVerdict:
@@ -68,6 +76,11 @@ class Reviewer:
         return ReviewVerdict(verdict, findings=findings, summary="auto verdict")
 
     def review(self, pr_state: dict, evidence: dict) -> ReviewVerdict:
+        # PB-6: before reading evidence or deciding, verify the bound repo is
+        # allow-listed. Unallowed / protected / unconfigured repos fail closed
+        # with repo_not_allowed and NEVER reach a model or a GitHub write.
+        if self._repo is not None:
+            require_allowed_repo(self._repo, allowed=self._allowed)
         v = self._decide(pr_state, evidence)
         v.role = ROLE_REVIEWER
         v.pr_number = pr_state.get("number")
