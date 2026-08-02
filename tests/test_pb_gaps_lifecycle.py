@@ -14,6 +14,7 @@ if ROOT not in sys.path:
 import hermes_worker.constants as constants
 from hermes_worker.agent_runner import AgentEvidence
 from hermes_worker.control_plane import ControlPlane, ControlPlaneError
+from hermes_worker.db import hash_token
 from hermes_worker.delivery import FakeGitHubRestClient
 from hermes_worker.echo_sandbox import EchoSandboxBackend
 from hermes_worker.reviewer import ReviewFinding, Reviewer, ReviewVerdict
@@ -234,3 +235,21 @@ class PB8LifecycleGapTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PBFinishNoResultRegression(unittest.TestCase):
+    """Regression: ``complete()`` with no result dict must not emit invalid SQL."""
+
+    def test_complete_without_result_after_final_acceptance(self):
+        cp = ControlPlane(tempfile.mktemp(suffix=".db"),
+                          allowed_token_hashes={hash_token(WORKER_TOKEN)})
+        cp.register(WORKER_TOKEN, name="w")
+        job_id = cp.create_job({"command": "x"}, repo=REPO,
+                               role=constants.ROLE_CODING_AGENT)
+        cp.claim(WORKER_TOKEN)
+        cp.store_agent_result(job_id, {"ci_status": "success"})
+        cp.request_final_acceptance(WORKER_TOKEN, job_id)
+        cp.final_accept(constants.HUMAN_OWNER_TOKEN, job_id)
+        out = cp.complete(WORKER_TOKEN, job_id)  # result=None
+        self.assertEqual(out["state"], "completed")
+        self.assertEqual(cp.get_job(job_id)["state"], "completed")

@@ -517,10 +517,14 @@ class ControlPlane:
             raise ControlPlaneError("job_not_owned_by_worker")
         if job["state"] in ("completed", "failed"):
             return {"ok": True, "already_finished": True, "state": job["state"]}
-        set_cols = ", ".join(f"{k}=?" for k in updates)
-        params = [final_state, self._now(), *updates.values(), job_id]
+        if updates:
+            set_cols = ", " + ", ".join(f"{k}=?" for k in updates)
+            params = [final_state, self._now(), *updates.values(), job_id]
+        else:
+            set_cols = ""
+            params = [final_state, self._now(), job_id]
         self.conn.execute(
-            f"UPDATE jobs SET state=?, ended_at=?, {set_cols} WHERE id=?", params)
+            f"UPDATE jobs SET state=?, ended_at=?{set_cols} WHERE id=?", params)
         self.conn.commit()
         return {"ok": True, "state": final_state}
 
