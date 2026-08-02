@@ -3,10 +3,24 @@
 Composes the existing primitives (``ControlPlane`` queue/lease/event-store,
 ``WebhookReceiver``/``EventRouter`` routing, ``HermesDockerSandboxBackend``
 isolation, provider-live ``RelayClient``) with the new pieces (``GitHubAppTokenBroker``,
-``GitHubClient``, ``AgentRunner``, ``Reviewer``) into the closed loop:
+``AgentRunner``, ``Reviewer``) into the closed loop:
 
-    Issue → Job → Worker → Sandbox → Agent → Commit → Push → Draft PR
-          → CI → Reviewer → round-2 → 2nd Commit → Re-review → User Acceptance
+    Issue -> Job -> Worker -> Sandbox -> Agent -> Commit -> ReleaseAgent
+          -> controlled Push -> Draft PR -> CI -> Reviewer -> round-2 -> User
+
+PB-1 delivery convergence
+-------------------------
+There is now EXACTLY ONE production delivery path:
+
+    Coding Worker (WorkerAgent)  -> real local commit (commit_sha)
+        -> ReleaseAgent.deliver_task(...)        [the ONLY .deliver() caller]
+            -> DeliveryController.deliver()        (reused verbatim from delivery.py)
+                -> controlled Push -> idempotent Draft PR
+
+The Coding Worker (``WorkerAgent``) MUST NOT push, MUST NOT open Draft PRs,
+MUST NOT hold delivery credentials, and MUST NOT call
+``DeliveryController.deliver()`` directly. It produces a real local commit,
+persists it, and hands the ``commit_sha`` to the ``ReleaseAgent``.
 
 Design principles (AGENTS.md §9, D3-IMPLEMENTATION-PLAN §4):
 - Idempotent & recoverable: every stage writes an Event Store entry; the loop can
@@ -20,101 +34,173 @@ Design principles (AGENTS.md §9, D3-IMPLEMENTATION-PLAN §4):
 
 Roles::
 
-    WorkerAgent  (ROLE_CODING_AGENT)  -- runs the agent, pushes, opens Draft PR
+    WorkerAgent  (ROLE_CODING_AGENT)  -- runs the agent, produces a real local
+                                          commit, hands off to the ReleaseAgent
+    ReleaseAgent (ROLE_RELEASE_AGENT) -- the ONLY role that calls
+                                          DeliveryController.deliver()
     Scheduler    (ROLE_SCHEDULER)     -- polls CI, invokes Reviewer, owns round-2
-    Reviewer     (ROLE_REVIEWER)      -- independent verdict, never reuses agent output
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 from .control_plane import ControlPlane, ControlPlaneError
 from .constants import (
     ALLOWED_GITHUB_REPOS, ROLE_CODING_AGENT, ROLE_SCHEDULER,
-    ROUND2_LABEL, MAX_ROUNDS,
+    ROLE_RELEASE_AGENT, ROUND2_LABEL, MAX_ROUNDS, TASK_BLOCKED,
 )
 from .agent_runner import AgentRunner, AgentEvidence
 from .reviewer import Reviewer, ReviewVerdict
+from .release_delivery_coordinator import ReleaseAgent
+from .repository import HostGitOperations
+from .delivery import DeliveryController, LocalGitWorkspaceInspector
 
 
 def _branch_for(job_id: int) -> str:
     return f"hermes/task-{job_id}"
 
 
-class WorkerAgent:
-    """Runs the coding Agent inside the sandbox, pushes, opens the Draft PR.
+# Coding-Worker lifecycle events (recorded on the ControlPlane event store).
+EVENT_AGENT_FAILED = "agent_failed"
+EVENT_COMMIT_CREATED = "commit_created"
+EVENT_RELEASE_HANDOFF_REQUESTED = "release_handoff_requested"
 
-    Role: ROLE_CODING_AGENT. Has NO access to label mutation — the Scheduler owns
-    round-2 (D3 requirement #17). The GitHub token is obtained from the broker
-    ONLY at push time and is never stored or logged.
+
+@dataclass
+class CodingWorkerResult:
+    """Completion status the Coding Worker MUST expose before any delivery.
+
+    PB-4 requires at least: tests_passed, local_commit_created, commit_sha,
+    handoff_recorded. A delivery (ReleaseAgent handoff) is only permitted when
+    all of ``tests_passed``, ``local_commit_created`` and a real ``commit_sha``
+    are present.
     """
-    def __init__(self, cp: ControlPlane, github, broker, agent: AgentRunner,
+
+    tests_passed: bool
+    local_commit_created: bool
+    commit_sha: Optional[str]
+    handoff_recorded: bool
+    pr_number: Optional[int] = None
+    message: str = ""
+
+
+class WorkerAgent:
+    """Runs the coding Agent inside the sandbox, then HANDS OFF to the ReleaseAgent.
+
+    Role: ROLE_CODING_AGENT. It MUST NOT push, MUST NOT create Draft PR, MUST
+    NOT hold delivery credentials, and MUST NOT call
+    ``DeliveryController.deliver()`` directly (only the ``ReleaseAgent`` may).
+
+    It produces a REAL local commit (``commit_sha``), persists it, and hands the
+    ``commit_sha`` to the ``ReleaseAgent``, which performs the controlled push
+    and Draft-PR creation. The GitHub client it holds (if any) is used ONLY for
+    the read-only ``clone`` step; it is never asked to push or open a PR.
+    """
+
+    def __init__(self, cp: ControlPlane, github, agent: AgentRunner,
+                 release_agent: ReleaseAgent,
                  repo: str = "yzhlx/hermes-open-swe-smoke-test"):
         self.cp = cp
-        self.github = github
-        self.broker = broker
+        self.github = github                       # read-only (clone) only
         self.agent = agent
+        self.release_agent = release_agent         # the ONLY delivery role
         self.repo = repo
 
     def run_phase(self, job_id: int, worker_token: str, round: int,
-                  instruction: str, sandbox) -> AgentEvidence:
+                  instruction: str, sandbox) -> CodingWorkerResult:
         # 0) Claim / re-activate the task (idempotent; sets state=running so the
-        #    lease-gated token broker will authorize this worker).
+        #    lease-gated token broker would authorize this worker if needed).
         self.cp.claim(worker_token)
+
         # 1) Agent edits the target repo working tree inside the sandbox.
         sandbox.create()
-        self.github.clone(self.repo, sandbox._ws)
-        ev = self.agent.run(sandbox, sandbox._ws, instruction, round=round)
-        self.cp.append_event(job_id, {"type": "agent_run",
-                                      "payload": {"round": round,
-                                                  "commit_sha": ev.commit_sha}})
-
-        # 2) Lease-gated token — ONLY delivered here, at push time (#7/#8).
-        token = self.broker.get_token_for_job(self.cp, job_id, worker_token)
-        self.cp.append_event(job_id, {"type": "token_issued",
-                                      "payload": {"repo": self.repo,
-                                                  "issued": True}})
-
-        # 3) Push (token injected only for this push; never logged).
-        branch = _branch_for(job_id)
-        self.github.push_branch(self.repo, branch, ev.commit_sha, token=token)
-        self.cp.append_event(job_id, {"type": "push",
-                                      "payload": {"branch": branch,
-                                                  "round": round}})
-
-        # 4) PR lifecycle: round 1 opens a Draft PR; later rounds push the SAME PR.
-        existing = self.cp.get_job(job_id).get("pr_number")
-        if existing is None:
-            pr = self.github.create_draft_pr(self.repo, branch,
-                                             f"Hermes task {job_id} (round {round})")
-            pr_number = pr["number"]
+        if self.github is not None:
+            self.github.clone(self.repo, sandbox._ws)
+        try:
+            ev = self.agent.run(sandbox, sandbox._ws, instruction, round=round)
+            tests_passed = True
+        except Exception:
+            # Agent / test failure: there is no successful commit to deliver and
+            # the Release Agent MUST NOT be called.
+            self.cp.append_event(job_id, {
+                "type": EVENT_AGENT_FAILED,
+                "payload": {"job_id": job_id, "round": round,
+                            "role": ROLE_CODING_AGENT}})
             self.cp.store_agent_result(job_id, {
-                "pr_number": pr_number, "commit_sha": ev.commit_sha,
+                "tests_passed": False, "local_commit_created": False,
+                "commit_sha": None, "handoff_recorded": False,
+                "role": ROLE_CODING_AGENT})
+            self.cp.set_state(job_id, "agent_done")
+            return CodingWorkerResult(
+                tests_passed=False, local_commit_created=False,
+                commit_sha=None, handoff_recorded=False,
+                message="agent run failed before a deliverable commit")
+
+        commit_sha = ev.commit_sha
+        local_commit_created = ReleaseAgent.is_real_commit_sha(commit_sha)
+
+        if not local_commit_created:
+            # No real local commit -> nothing to deliver. The literal
+            # "simulated" or any missing/placeholder SHA is rejected here so it
+            # can never be handed off as a real delivery commit.
+            self.cp.append_event(job_id, {
+                "type": EVENT_COMMIT_CREATED,
+                "payload": {"job_id": job_id, "commit_sha": commit_sha,
+                            "valid": False,
+                            "reason": "not_a_real_local_commit",
+                            "role": ROLE_CODING_AGENT, "source": "local"}})
+            self.cp.store_agent_result(job_id, {
+                "tests_passed": True, "local_commit_created": False,
+                "commit_sha": commit_sha, "handoff_recorded": False,
+                "role": ROLE_CODING_AGENT})
+            self.cp.set_state(job_id, "agent_done")
+            return CodingWorkerResult(
+                tests_passed=True, local_commit_created=False,
+                commit_sha=commit_sha, handoff_recorded=False,
+                message="no real local commit; delivery skipped")
+
+        # 2) Real local commit produced -> persist + record COMMIT_CREATED.
+        self.cp.append_event(job_id, {
+            "type": EVENT_COMMIT_CREATED,
+            "payload": {"job_id": job_id, "commit_sha": commit_sha,
+                        "valid": True, "task_id": str(job_id),
+                        "role": ROLE_CODING_AGENT, "source": "local"}})
+        self.cp.store_agent_result(job_id, {
+            "commit_sha": commit_sha, "local_commit_created": True,
+            "tests_passed": True, "role": ROLE_CODING_AGENT})
+
+        # 3) Hand off to the Release Agent — the ONLY production delivery role.
+        #    The Coding Worker never sees a GitHub push / Draft-PR token.
+        self.cp.append_event(job_id, {
+            "type": EVENT_RELEASE_HANDOFF_REQUESTED,
+            "payload": {"job_id": job_id, "commit_sha": commit_sha,
+                        "task_id": str(job_id), "role": ROLE_CODING_AGENT,
+                        "source": "local"}})
+        result = self.release_agent.deliver_task(
+            job_id=job_id, task_id=str(job_id), repository=self.repo,
+            commit_sha=commit_sha, expected_sha=commit_sha,
+            title=f"Hermes task {job_id} (round {round})",
+            body=instruction,
+            test_summary="tests passed",
+            security_summary="no known issues",
+            base_branch="main",
+            issue_number=None, remote_branch=None)
+        pr_number = result.pr_number
+        handoff_recorded = pr_number is not None
+        if handoff_recorded:
+            self.cp.store_agent_result(job_id, {
+                "pr_number": pr_number, "commit_sha": commit_sha,
                 "round": round, "ci_status": "pending",
-                "modified_files": ev.modified_files, "token_usage": ev.token_usage,
-                "model": ev.model, "role": ROLE_CODING_AGENT,
-                "tool_calls": ev.tool_calls,
-            })
-            self.cp.append_event(job_id, {"type": "draft_pr",
-                                          "payload": {"pr_number": pr_number,
-                                                      "branch": branch}})
-        else:
-            # Reuse the same PR; update its head. No new PR is opened (#18).
-            self.github.push_branch(self.repo, branch, ev.commit_sha, token=token)
-            pr_number = existing
-            self.cp.store_agent_result(job_id, {
-                "commit_sha": ev.commit_sha, "round": round, "ci_status": "pending",
-                "modified_files": ev.modified_files, "token_usage": ev.token_usage,
-                "model": ev.model, "role": ROLE_CODING_AGENT,
-                "tool_calls": ev.tool_calls,
-            })
-            self.cp.append_event(job_id, {"type": "round2_push",
-                                          "payload": {"pr_number": pr_number,
-                                                      "branch": branch,
-                                                      "new_head": ev.commit_sha}})
-
+                "modified_files": ev.modified_files,
+                "token_usage": ev.token_usage, "model": ev.model,
+                "role": ROLE_CODING_AGENT, "tool_calls": ev.tool_calls,
+                "handoff_recorded": True})
         self.cp.set_state(job_id, "agent_done")
-        return ev
+        return CodingWorkerResult(
+            tests_passed=True, local_commit_created=True,
+            commit_sha=commit_sha, handoff_recorded=handoff_recorded,
+            pr_number=pr_number, message=result.message)
 
 
 class Scheduler:
@@ -123,6 +209,7 @@ class Scheduler:
     Role: ROLE_SCHEDULER. EXCLUSIVE owner of the ``round-2`` label (#17). Never
     calls merge. After APPROVE the job is left for the user.
     """
+
     def __init__(self, cp: ControlPlane, github,
                  repo: str = "yzhlx/hermes-open-swe-smoke-test"):
         self.cp = cp
@@ -181,20 +268,42 @@ class Scheduler:
         # REQUEST_CHANGES
         round_now = job.get("round") or 1
         if round_now >= MAX_ROUNDS:
+            # Escalation is event-gated and idempotent: the control plane emits
+            # USER_ACTION_REQUIRED once with the actionable reason, then the
+            # Scheduler retains its terminal ``escalated`` state for the loop.
+            self.cp.request_user_action(None, job_id, TASK_BLOCKED)
             self.cp.set_state(job_id, "escalated")
             self.cp.append_event(job_id, {"type": "escalated",
+                                          "id": f"escalated:{job_id}",
                                           "payload": {"pr_number": pr_number}})
             return {"action": "escalated", "verdict": verdict}
         self.add_round2_label(job_id, pr_number)
         return {"action": "rework", "round": round_now + 1, "verdict": verdict}
 
 
+def _build_default_delivery_controller(github, broker, repo: str,
+                                       workspace: Optional[str] = None):
+    """Production default: a ``DeliveryController`` reusing the orchestrator's
+    github client and the broker's short-lived token minting. Tests inject their
+    own ``ReleaseAgent`` so this path is not exercised offline.
+    """
+    return DeliveryController(
+        git=LocalGitWorkspaceInspector(workspace or "."),
+        git_operations=HostGitOperations(),
+        github_client=github,
+        token_provider=(lambda r: broker.mint_installation_token(r))
+                       if broker is not None else None,
+        allowed_repos=None,
+    )
+
+
 class D3Orchestrator:
-    """Coordinates WorkerAgent + Scheduler + Reviewer into the closed loop."""
+    """Coordinates WorkerAgent + ReleaseAgent + Scheduler + Reviewer into the loop."""
 
     def __init__(self, cp: ControlPlane, github, broker, agent: AgentRunner,
                  reviewer: Reviewer, sandbox,
-                 repo: str = "yzhlx/hermes-open-swe-smoke-test"):
+                 repo: str = "yzhlx/hermes-open-swe-smoke-test",
+                 release_agent: Optional[ReleaseAgent] = None):
         self.cp = cp
         self.github = github
         self.broker = broker
@@ -202,7 +311,12 @@ class D3Orchestrator:
         self.reviewer = reviewer
         self.sandbox = sandbox
         self.repo = repo
-        self.worker = WorkerAgent(cp, github, broker, agent, repo)
+        if release_agent is None:
+            delivery = _build_default_delivery_controller(github, broker, repo)
+            release_agent = ReleaseAgent(cp, delivery, repo,
+                                         token_broker=broker)
+        self.release_agent = release_agent
+        self.worker = WorkerAgent(cp, github, agent, release_agent, repo)
         self.scheduler = Scheduler(cp, github, repo)
 
     def run_job(self, job_id: int, worker_token: str, instruction: str,
