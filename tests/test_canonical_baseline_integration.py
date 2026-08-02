@@ -188,12 +188,15 @@ class CanonicalBaselineIntegrationTests(unittest.TestCase):
                 call_files.add(fn)
             if fn == "repository.py" and re.search(r"def push\s*\(", text):
                 repo_has_push = True
-        # Only delivery.py (controlled DeliveryController) and scheduler.py
-        # (legacy, fail-closed in prod via RealGitHubClient) reference these
-        # methods in production code -- no second controller exists.
+        # PB-1: the dual delivery path is removed. The ONLY production call
+        # sites of push_branch / create_draft_pr must live in delivery.py
+        # (the controlled DeliveryController, which reuses HostGitOperations +
+        # GitHubRestClient). No other module -- notably NOT scheduler.py / the
+        # Coding Worker -- may push or open Draft PRs directly.
         self.assertTrue(
-            call_files.issubset({"delivery.py", "scheduler.py"}),
-            f"unexpected push/create_draft_pr call sites: {sorted(call_files)}",
+            call_files == {"delivery.py"},
+            f"push/create_draft_pr call sites must live ONLY in delivery.py; "
+            f"found: {sorted(call_files)}",
         )
         # The canonical git-push implementation lives in repository.py.
         self.assertTrue(repo_has_push)
