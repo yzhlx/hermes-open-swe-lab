@@ -85,3 +85,17 @@ ROLE_HUMAN_OWNER = "human_owner"
 import os as _os
 HUMAN_OWNER_TOKEN = _os.environ.get("HERMES_HUMAN_OWNER_TOKEN",
                                     "change-me-human-owner-token")
+
+# ---------------------------------------------------------------------------
+# Phase B production-wiring environment controls
+# ---------------------------------------------------------------------------
+# These controls are deliberately opt-in.  The offline Echo + fake-agent path
+# remains the default so tests and installations without relay/Docker access do
+# not silently gain production dependencies.
+HERMES_SANDBOX_BACKEND_ENV = "HERMES_SANDBOX_BACKEND"
+HERMES_AGENT_BACKEND_ENV = "HERMES_AGENT_BACKEND"
+HERMES_REVIEWER_LLM_ENV = "HERMES_REVIEWER_LLM"
+
+DEFAULT_HERMES_SANDBOX_BACKEND = "echo"
+DEFAULT_HERMES_AGENT_BACKEND = "fake"
+DEFAULT_HERMES_REVIEWER_LLM = "0"

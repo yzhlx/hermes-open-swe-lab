@@ -17,8 +17,11 @@ and is NOT_TESTED from this environment (needs relay credentials).
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+from .constants import HERMES_AGENT_BACKEND_ENV, DEFAULT_HERMES_AGENT_BACKEND
 
 
 @dataclass
@@ -43,7 +46,10 @@ class FakeAgentRunner(AgentRunner):
     assert round-2 yields a NEW head sha (D3 requirement #19).
     """
     def __init__(self, sha_fn=None, usage=None, model: str = "fake-agent"):
-        self._sha_fn = sha_fn or (lambda r: f"sha-round{r}")
+        # The default runner supplies no deliverable SHA.  The worker therefore
+        # creates a real local commit as its PB-4 fallback.  Tests that need a
+        # specific SHA inject ``sha_fn`` explicitly.
+        self._sha_fn = sha_fn or (lambda _r: None)
         self.usage = usage or {"prompt_tokens": 10, "completion_tokens": 5,
                                "total_tokens": 15}
         self.model = model
@@ -89,12 +95,43 @@ class RelayAgentRunner(AgentRunner):
         usage = self.relay.extract_usage(resp) or {}
         content = self.relay.extract_content(resp) or ""
         sandbox.write_file("automation-smoke-test/README.md", content)
-        sha = f"relay-{abs(hash(content)) % 10 ** 10}"
         ev = AgentEvidence(
-            commit_sha=sha,
+            # A chat response is not a git commit.  The worker turns the edit
+            # into a real local commit unless a future agent runtime supplies
+            # an actual SHA in AgentEvidence.
+            commit_sha=None,
             modified_files=["automation-smoke-test/README.md"],
             token_usage=usage, model=self.model or self.relay.config.model,
             tool_calls=1)
         if evidence_collector:
             evidence_collector(ev)
         return ev
+
+
+def build_relay_client():
+    """Build the configured RelayClient only for an explicitly live backend.
+
+    Importing and validating relay configuration is delayed until selection so
+    the default fake path stays fully offline.
+    """
+    from hermes_open_swe_relay.client import RelayClient
+    from hermes_open_swe_relay.config import load_relay_config
+
+    config = load_relay_config()
+    if config is None:
+        raise RuntimeError(
+            "relay agent backend requires OPEN_SWE_OPENAI_BASE_URL, "
+            "OPEN_SWE_OPENAI_API_KEY, and OPEN_SWE_OPENAI_MODEL")
+    return RelayClient(config)
+
+
+def build_agent_runner(backend: Optional[str] = None, relay_client=None) -> AgentRunner:
+    """Select the agent runner from the explicit, env-gated backend setting."""
+    selected = (backend or os.environ.get(
+        HERMES_AGENT_BACKEND_ENV, DEFAULT_HERMES_AGENT_BACKEND)).strip().lower()
+    if selected == "fake":
+        return FakeAgentRunner()
+    if selected == "relay":
+        return RelayAgentRunner(relay_client or build_relay_client())
+    raise ValueError(
+        f"unsupported {HERMES_AGENT_BACKEND_ENV}={selected!r}; expected fake or relay")

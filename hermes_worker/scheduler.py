@@ -50,11 +50,12 @@ from .constants import (
     ALLOWED_GITHUB_REPOS, ROLE_CODING_AGENT, ROLE_SCHEDULER,
     ROLE_RELEASE_AGENT, ROUND2_LABEL, MAX_ROUNDS, TASK_BLOCKED,
 )
-from .agent_runner import AgentRunner, AgentEvidence
+from .agent_runner import AgentRunner, AgentEvidence, build_agent_runner
 from .reviewer import Reviewer, ReviewVerdict
 from .release_delivery_coordinator import ReleaseAgent
 from .repository import HostGitOperations
 from .delivery import DeliveryController, LocalGitWorkspaceInspector
+from .worker import _create_real_commit, build_sandbox_backend
 
 
 def _branch_for(job_id: int) -> str:
@@ -98,20 +99,25 @@ class WorkerAgent:
     the read-only ``clone`` step; it is never asked to push or open a PR.
     """
 
-    def __init__(self, cp: ControlPlane, github, agent: AgentRunner,
+    def __init__(self, cp: ControlPlane, github, agent: Optional[AgentRunner],
                  release_agent: ReleaseAgent,
-                 repo: str = "yzhlx/hermes-open-swe-smoke-test"):
+                 repo: str = "yzhlx/hermes-open-swe-smoke-test",
+                 sandbox=None):
         self.cp = cp
         self.github = github                       # read-only (clone) only
-        self.agent = agent
+        self.agent = agent or build_agent_runner()
         self.release_agent = release_agent         # the ONLY delivery role
         self.repo = repo
+        # Tests may still inject a sandbox per phase.  Production construction
+        # selects this once from HERMES_SANDBOX_BACKEND (echo by default).
+        self.sandbox = sandbox or build_sandbox_backend()
 
     def run_phase(self, job_id: int, worker_token: str, round: int,
-                  instruction: str, sandbox) -> CodingWorkerResult:
+                  instruction: str, sandbox=None) -> CodingWorkerResult:
         # 0) Claim / re-activate the task (idempotent; sets state=running so the
         #    lease-gated token broker would authorize this worker if needed).
         self.cp.claim(worker_token)
+        sandbox = sandbox or self.sandbox
 
         # 1) Agent edits the target repo working tree inside the sandbox.
         sandbox.create()
@@ -137,7 +143,11 @@ class WorkerAgent:
                 commit_sha=None, handoff_recorded=False,
                 message="agent run failed before a deliverable commit")
 
-        commit_sha = ev.commit_sha
+        # A real runtime may return an actual commit SHA in AgentEvidence.  If
+        # it does not, preserve PB-4 by committing the agent's sandbox edits
+        # locally; never invent a simulated SHA.
+        commit_sha = ev.commit_sha or _create_real_commit(
+            sandbox._ws, f"hermes worker job {job_id} round {round}")
         local_commit_created = ReleaseAgent.is_real_commit_sha(commit_sha)
 
         if not local_commit_created:
@@ -300,23 +310,24 @@ def _build_default_delivery_controller(github, broker, repo: str,
 class D3Orchestrator:
     """Coordinates WorkerAgent + ReleaseAgent + Scheduler + Reviewer into the loop."""
 
-    def __init__(self, cp: ControlPlane, github, broker, agent: AgentRunner,
+    def __init__(self, cp: ControlPlane, github, broker, agent: Optional[AgentRunner],
                  reviewer: Reviewer, sandbox,
                  repo: str = "yzhlx/hermes-open-swe-smoke-test",
                  release_agent: Optional[ReleaseAgent] = None):
         self.cp = cp
         self.github = github
         self.broker = broker
-        self.agent = agent
+        self.agent = agent or build_agent_runner()
         self.reviewer = reviewer
-        self.sandbox = sandbox
+        self.sandbox = sandbox or build_sandbox_backend()
         self.repo = repo
         if release_agent is None:
             delivery = _build_default_delivery_controller(github, broker, repo)
             release_agent = ReleaseAgent(cp, delivery, repo,
                                          token_broker=broker)
         self.release_agent = release_agent
-        self.worker = WorkerAgent(cp, github, agent, release_agent, repo)
+        self.worker = WorkerAgent(cp, github, self.agent, release_agent, repo,
+                                  sandbox=self.sandbox)
         self.scheduler = Scheduler(cp, github, repo)
 
     def run_job(self, job_id: int, worker_token: str, instruction: str,
@@ -327,8 +338,7 @@ class D3Orchestrator:
         round_n = 1
         last_signal = None
         while True:
-            self.worker.run_phase(job_id, worker_token, round_n, instruction,
-                                  self.sandbox)
+            self.worker.run_phase(job_id, worker_token, round_n, instruction)
             signal = self.scheduler.review_phase(
                 job_id, ci_status, self.reviewer, evidence_extra)
             last_signal = signal
