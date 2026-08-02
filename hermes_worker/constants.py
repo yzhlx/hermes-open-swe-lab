@@ -19,6 +19,12 @@ ROLE_CODING_AGENT = "coding_agent"
 ROLE_REVIEWER = "reviewer"
 ROLE_SCHEDULER = "scheduler"
 
+# PB-1: the Release Agent is the ONLY production role permitted to call
+# ``DeliveryController.deliver()``. The Coding Worker (WorkerAgent) and any
+# other component must hand off to it; they must never push or open Draft PRs
+# directly.
+ROLE_RELEASE_AGENT = "release_agent"
+
 # The single PR label a round-2 rework is signalled with. ONLY the scheduler may
 # add it (D3-IMPLEMENTATION-PLAN.md §4.12).
 ROUND2_LABEL = "round-2"
@@ -43,3 +49,53 @@ HOST_WORKER_TERMINAL_STATES = (
     "PR_CREATED",
     "BLOCKED",
 )
+
+# ---------------------------------------------------------------------------
+# PB-23: Production Final Acceptance Gate (human-in-the-loop completion)
+# ---------------------------------------------------------------------------
+# CI statuses considered "green" (kept consistent with the demo runner's
+# CI_GREEN so ported logic behaves identically).
+CI_GREEN = ("success",)
+
+# Event types for the final-acceptance chain. The Event Store is the SOLE
+# source of truth — every completion-state transition is evidenced by one of
+# these events, never by the auxiliary ``jobs.state`` column alone.
+FINAL_ACCEPTANCE = "FINAL_ACCEPTANCE"
+FINAL_ACCEPTED = "FINAL_ACCEPTED"
+TASK_COMPLETED = "TASK_COMPLETED"
+
+# Job state entered after a green CI emits FINAL_ACCEPTANCE; the job then waits
+# for the independent Human Owner to call ``final_accept()``.
+USER_ACTION_REQUIRED = "USER_ACTION_REQUIRED"
+
+# Reason emitted when the reviewer exhausts the permitted rework rounds and the
+# task must be handed back to a human owner.
+TASK_BLOCKED = "TASK_BLOCKED"
+
+# The distinct role used by the Human Owner acceptance gate. It is deliberately
+# separate from ROLE_CODING_AGENT / ROLE_REVIEWER / scheduler so those actors
+# can NEVER impersonate the Human Owner (requirement 6).
+ROLE_HUMAN_OWNER = "human_owner"
+
+# The Human Owner acceptance token. It is a SECRET INDEPENDENT from worker
+# tokens: it must be supplied via a dedicated channel (never X-Worker-Token),
+# is compared only via ``hmac.compare_digest``, and is NEVER stored, logged, or
+# embedded in any event payload or error text. Production MUST set
+# HERMES_HUMAN_OWNER_TOKEN; the placeholder below exists only for offline tests.
+import os as _os
+HUMAN_OWNER_TOKEN = _os.environ.get("HERMES_HUMAN_OWNER_TOKEN",
+                                    "change-me-human-owner-token")
+
+# ---------------------------------------------------------------------------
+# Phase B production-wiring environment controls
+# ---------------------------------------------------------------------------
+# These controls are deliberately opt-in.  The offline Echo + fake-agent path
+# remains the default so tests and installations without relay/Docker access do
+# not silently gain production dependencies.
+HERMES_SANDBOX_BACKEND_ENV = "HERMES_SANDBOX_BACKEND"
+HERMES_AGENT_BACKEND_ENV = "HERMES_AGENT_BACKEND"
+HERMES_REVIEWER_LLM_ENV = "HERMES_REVIEWER_LLM"
+
+DEFAULT_HERMES_SANDBOX_BACKEND = "echo"
+DEFAULT_HERMES_AGENT_BACKEND = "fake"
+DEFAULT_HERMES_REVIEWER_LLM = "0"
